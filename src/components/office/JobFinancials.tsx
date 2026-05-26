@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useMemo } from 'react';
+import { useState, useEffect, useLayoutEffect, useRef, useMemo } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -74,6 +74,21 @@ import {
 import { CSS } from '@dnd-kit/utilities';
 import { cn } from '@/lib/utils';
 import { displayNumberForQuoteRow } from '@/lib/quoteDisplay';
+import {
+  fetchChangeOrderQuoteForJob,
+  fetchQuoteContractRow,
+  isMissingColumnError,
+  markCustomRowItemsNoQuoteIdColumn,
+  markCustomRowItemsNoWorkbookIdColumn,
+  shouldSkipCustomRowItemQuoteIdColumn,
+  shouldSkipCustomRowItemWorkbookFilter,
+} from '@/lib/quotesSchemaFallback';
+import {
+  filterLineItemsForActiveQuote,
+  jobHasMultipleFormalProposals,
+  realignMisassignedSheetLineItems,
+  sheetBelongsToQuote,
+} from '@/lib/proposalIsolation';
 
 interface CustomFinancialRow {
   id: string;
@@ -179,6 +194,21 @@ function isMissingCustomerEstimateLinesTableError(error: unknown): boolean {
   return msg.includes('customer_estimate_lines') && (msg.includes('does not exist') || msg.includes('schema cache'));
 }
 
+function isMissingCustomRowItemColumnError(error: unknown, col: string): boolean {
+  return isMissingColumnError(error, col);
+}
+
+function isMissingQuoteRemovedSectionsError(error: unknown): boolean {
+  const msg = String((error as any)?.message || '').toLowerCase();
+  const code = String((error as any)?.code || '');
+  return (
+    code === 'PGRST205' ||
+    code === '42P01' ||
+    (msg.includes('quote_removed_sections') &&
+      (msg.includes('does not exist') || msg.includes('schema cache') || msg.includes('not found')))
+  );
+}
+
 function getSubOptionalStorageKey(scopeId: string): string {
   return `jobfinancials_sub_optional_${scopeId}`;
 }
@@ -248,6 +278,11 @@ interface JobFinancialsProps {
   /** Split view: lift session "unlock for editing" so Materials uses the same read-only gate as this panel. */
   historicalUnlockedQuoteId?: string | null;
   onHistoricalUnlockedQuoteIdChange?: (id: string | null) => void;
+  /** When true, defer loadData until Materials finishes loadWorkbook for the active quote. */
+  materialsPanelActive?: boolean;
+  materialsWorkbookReady?: boolean;
+  /** Incremented on each proposal switch in split view — gates loadData until Materials settles. */
+  materialsSyncGen?: number;
 }
 
 /** Nested material_sheets select variants for cloning (most complete → oldest DBs). */
@@ -294,6 +329,394 @@ async function fetchMaterialWorkbooksFullForQuote(quoteId: string) {
     lastErr = res.error;
   }
   return { data: null, error: lastErr };
+}
+
+/** Pick one canonical workbook to clone (working preferred; labor + items break ties). */
+function pickWorkbookForProposalClone(workbooks: any[]): any | null {
+  if (!workbooks?.length) return null;
+  const score = (wb: any) => {
+    const sheets = ((wb.material_sheets as any[]) || []);
+    let itemCount = 0;
+    let laborCount = 0;
+    sheets.forEach((s) => {
+      itemCount += (s.material_items || []).length;
+      laborCount += (s.material_sheet_labor || []).length;
+    });
+    const statusBoost =
+      wb.status === 'working' ? 1_000_000 : wb.status === 'locked' ? 500_000 : 0;
+    return statusBoost + laborCount * 10_000 + itemCount * 100 + sheets.length;
+  };
+  return workbooks.reduce((best, wb) => (score(wb) > score(best) ? wb : best));
+}
+
+function laborMapTotal(laborMap: Record<string, any>): number {
+  return Object.values(laborMap).reduce((s: number, l: any) => {
+    const direct = Number(l?.total_labor_cost);
+    if (Number.isFinite(direct) && direct > 0) return s + direct;
+    return s + Number(l?.estimated_hours || 0) * Number(l?.hourly_rate || 0);
+  }, 0);
+}
+
+function normalizeLaborSheetName(v: unknown): string {
+  return String(v ?? '')
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, ' ');
+}
+
+/** Resolve sheet-linked line items when map keys drift (locked vs working workbook sheet ids). */
+function resolveCustomRowLineItemsForSheet(
+  customRowLineItems: Record<string, CustomRowLineItem[]>,
+  materialSheets: { id?: string; sheet_name?: string }[],
+  sectionSheetId: string,
+  sheetName?: string,
+  breakdownSheets?: { sheetId?: string; sheetName?: string; id?: string; sheet_name?: string }[],
+  sheetMetaById?: Record<string, string>,
+): CustomRowLineItem[] {
+  const direct = customRowLineItems[sectionSheetId];
+  if (direct?.length) return direct;
+  const targetName = normalizeLaborSheetName(sheetName);
+  if (!targetName) return direct || [];
+  const idToName = new Map<string, string>();
+  materialSheets.forEach((s) => {
+    const id = String(s?.id ?? '').trim();
+    if (id) idToName.set(id, normalizeLaborSheetName(s?.sheet_name));
+  });
+  (breakdownSheets || []).forEach((s) => {
+    const id = String(s?.sheetId ?? s?.id ?? '').trim();
+    if (id && !idToName.has(id)) {
+      idToName.set(id, normalizeLaborSheetName(s?.sheetName ?? s?.sheet_name));
+    }
+  });
+  if (sheetMetaById) {
+    Object.entries(sheetMetaById).forEach(([id, name]) => {
+      const sid = String(id).trim();
+      if (sid && !idToName.has(sid)) idToName.set(sid, normalizeLaborSheetName(name));
+    });
+  }
+  for (const [sid, items] of Object.entries(customRowLineItems)) {
+    if (sid === sectionSheetId || !items?.length) continue;
+    const keyName =
+      idToName.get(String(sid).trim()) ??
+      normalizeLaborSheetName((items[0] as { section_name?: string })?.section_name);
+    if (keyName === targetName) return items;
+  }
+  return direct || [];
+}
+
+function laborTotalFromLineItemsMap(map: Record<string, CustomRowLineItem[]>): number {
+  return Object.values(map).flat().reduce((sum, item) => {
+    if ((item.item_type || 'material') !== 'labor') return sum;
+    return sum + (Number(item.total_cost) || Number(item.quantity || 0) * Number(item.unit_cost || 0));
+  }, 0);
+}
+
+function extractSheetOnlyLineItems(
+  map: Record<string, CustomRowLineItem[]>,
+  rowIds: Set<string>,
+): Record<string, CustomRowLineItem[]> {
+  return Object.fromEntries(
+    Object.entries(map).filter(([k, items]) => {
+      if (rowIds.has(k)) return false;
+      return !(items || []).some((it) => it.row_id);
+    }),
+  );
+}
+
+type LaborSheetRef = { id: string; sheet_name?: string; order_index?: number };
+
+/** Map sheet-linked line items onto the workbook sheets currently displayed (match by sheet name). */
+function rekeySheetLineItemsToDisplayedSheets(
+  lineItemsMap: Record<string, CustomRowLineItem[]>,
+  displayedSheets: LaborSheetRef[],
+  sheetIdToName: Map<string, string>,
+): Record<string, CustomRowLineItem[]> {
+  const nativeDisplayedIds = new Set(
+    displayedSheets.map((s) => String(s?.id ?? '').trim()).filter(Boolean),
+  );
+  const nameToDisplayedId = new Map<string, string>();
+  displayedSheets.forEach((s) => {
+    const id = String(s?.id ?? '').trim();
+    const nk = normalizeLaborSheetName(s?.sheet_name);
+    if (id && nk && !nameToDisplayedId.has(nk)) nameToDisplayedId.set(nk, id);
+  });
+
+  const out: Record<string, CustomRowLineItem[]> = {};
+  const seenByTarget = new Map<string, Set<string>>();
+
+  const push = (targetId: string, item: CustomRowLineItem) => {
+    if (!targetId || !nativeDisplayedIds.has(targetId)) return;
+    const iid = String(item?.id ?? '').trim();
+    if (!out[targetId]) {
+      out[targetId] = [];
+      seenByTarget.set(targetId, new Set());
+    }
+    const seen = seenByTarget.get(targetId)!;
+    if (iid && seen.has(iid)) return;
+    if (iid) seen.add(iid);
+    out[targetId].push({ ...item, sheet_id: targetId });
+  };
+
+  for (const [parentId, items] of Object.entries(lineItemsMap)) {
+    if (items.some((item) => item.row_id)) {
+      out[parentId] = items.slice();
+      continue;
+    }
+    for (const item of items) {
+      if (item.row_id) continue;
+      const sid = String(item.sheet_id ?? parentId).trim();
+      if (nativeDisplayedIds.has(sid)) {
+        push(sid, item);
+        continue;
+      }
+      const nameKey = normalizeLaborSheetName(
+        sheetIdToName.get(sid) ?? sheetIdToName.get(String(parentId).trim()),
+      );
+      const targetId = nameKey ? nameToDisplayedId.get(nameKey) : undefined;
+      if (targetId) push(targetId, item);
+      else if (nativeDisplayedIds.has(String(parentId).trim())) push(String(parentId).trim(), item);
+    }
+  }
+  Object.keys(out).forEach((k) => {
+    out[k].sort((a, b) => (a.order_index ?? 0) - (b.order_index ?? 0));
+  });
+  return out;
+}
+
+/** Re-key labor onto the sheets currently displayed (locked vs working clones use different sheet ids). */
+function remapLaborPayloadToDisplayedSheets(
+  displayedSheets: LaborSheetRef[],
+  laborById: Record<string, any>,
+  laborByName?: Record<string, any>,
+): Record<string, any> {
+  const out: Record<string, any> = {};
+  const effectiveTotal = (lab: any) => {
+    const direct = Number(lab?.total_labor_cost);
+    if (Number.isFinite(direct) && direct > 0) return direct;
+    return Number(lab?.estimated_hours || 0) * Number(lab?.hourly_rate || 0);
+  };
+
+  displayedSheets.forEach((s) => {
+    const sid = String(s?.id ?? '').trim();
+    if (!sid) return;
+    const nameKey = normalizeLaborSheetName(s?.sheet_name);
+
+    let lab: any =
+      laborById[sid] ??
+      Object.entries(laborById).find(([k]) => String(k).trim() === sid)?.[1];
+    if (!lab && nameKey && laborByName?.[nameKey]) {
+      lab = laborByName[nameKey];
+    }
+    if (!lab || !(effectiveTotal(lab) > 0)) return;
+
+    const sourceSid = String(lab.labor_source_sheet_id ?? lab.sheet_id ?? sid).trim();
+    const remapped = {
+      ...lab,
+      sheet_id: sid,
+      labor_source_sheet_id: sourceSid || sid,
+    };
+    if (sourceSid !== sid) remapped.labor_mergetrusted = true;
+    out[sid] = remapped;
+  });
+
+  return out;
+}
+
+function agentDebugLog(payload: {
+  runId?: string;
+  hypothesisId?: string;
+  location: string;
+  message: string;
+  data?: Record<string, unknown>;
+}) {
+  const body = { sessionId: '458a80', timestamp: Date.now(), ...payload };
+  console.warn('[458a80]', body.message, body.data ?? {});
+  try {
+    const key = 'debug-458a80';
+    const prev = JSON.parse(sessionStorage.getItem(key) || '[]') as unknown[];
+    prev.push(body);
+    if (prev.length > 100) prev.splice(0, prev.length - 100);
+    sessionStorage.setItem(key, JSON.stringify(prev));
+  } catch {
+    // ignore
+  }
+  fetch('http://127.0.0.1:7264/ingest/38c719fd-41f2-436e-b178-2936be94ecc3', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '458a80' },
+    body: JSON.stringify(body),
+  }).catch(() => {});
+}
+
+/** Last resort: pull labor from every workbook/sheet for this quote onto displayed sections. */
+async function mergeLaborFromAllQuoteWorkbooks(
+  targetQuoteId: string,
+  displayedSheets: { id: string; sheet_name?: string; order_index?: number }[],
+  laborMap: Record<string, any>,
+): Promise<void> {
+  const normalizeSheetName = (v: unknown) =>
+    String(v ?? '')
+      .toLowerCase()
+      .trim()
+      .replace(/\s+/g, ' ');
+  const displayedByName = new Map<string, string>();
+  const displayedByOrder = new Map<number, string>();
+  displayedSheets.forEach((s) => {
+    const sid = String(s?.id ?? '').trim();
+    if (!sid) return;
+    const nameKey = normalizeSheetName(s.sheet_name);
+    if (nameKey && !displayedByName.has(nameKey)) displayedByName.set(nameKey, sid);
+    const oi = Number(s.order_index);
+    if (Number.isFinite(oi) && !displayedByOrder.has(oi)) displayedByOrder.set(oi, sid);
+  });
+  const { data: wbs } = await supabase.from('material_workbooks').select('id').eq('quote_id', targetQuoteId);
+  const wbIds = (wbs || []).map((w) => w.id).filter(Boolean);
+  if (wbIds.length === 0) return;
+  const { data: allSheets } = await supabase
+    .from('material_sheets')
+    .select('id, sheet_name, order_index')
+    .in('workbook_id', wbIds);
+  const allSheetRows = (allSheets || []) as { id: string; sheet_name?: string; order_index?: number }[];
+  const allSheetIds = allSheetRows.map((s) => s.id).filter(Boolean);
+  if (allSheetIds.length === 0) return;
+  const { data: allLaborRows } = await supabase
+    .from('material_sheet_labor')
+    .select('*')
+    .in('sheet_id', allSheetIds);
+  const metaBySheetId = new Map(allSheetRows.map((s) => [String(s.id), s]));
+  (allLaborRows || []).forEach((labor: any) => {
+    const sid = String(labor.sheet_id ?? '').trim();
+    const meta = metaBySheetId.get(sid);
+    if (!meta) return;
+    const byName = displayedByName.get(normalizeSheetName(meta.sheet_name));
+    const oi = Number(meta.order_index);
+    const byOrder = Number.isFinite(oi) ? displayedByOrder.get(oi) : undefined;
+    const mappedSheetId = byName || byOrder;
+    if (!mappedSheetId) return;
+    const total =
+      labor.total_labor_cost ??
+      (Number(labor.estimated_hours || 0) * Number(labor.hourly_rate || 0));
+    if (!(Number.isFinite(Number(total)) && Number(total) > 0)) return;
+    const existing = laborMap[mappedSheetId];
+    const existingTotal = existing ? laborMapTotal({ [mappedSheetId]: existing }) : 0;
+    if (Number(total) <= existingTotal) return;
+    laborMap[mappedSheetId] = {
+      ...labor,
+      sheet_id: mappedSheetId,
+      total_labor_cost: total,
+      labor_source_sheet_id: sid,
+      labor_mergetrusted: true,
+    };
+  });
+}
+
+/** Map labor from job workbooks (quote-scoped or legacy null quote_id) onto displayed sheets by name/order. */
+async function mergeLaborFromJobWorkbooksForQuote(
+  jobId: string,
+  targetQuoteId: string,
+  displayedSheets: LaborSheetRef[],
+  laborMap: Record<string, any>,
+): Promise<void> {
+  const normalizeSheetName = (v: unknown) =>
+    String(v ?? '')
+      .toLowerCase()
+      .trim()
+      .replace(/\s+/g, ' ');
+  const displayedByName = new Map<string, string>();
+  const displayedByOrder = new Map<number, string>();
+  displayedSheets.forEach((s) => {
+    const sid = String(s?.id ?? '').trim();
+    if (!sid) return;
+    const nameKey = normalizeSheetName(s.sheet_name);
+    if (nameKey && !displayedByName.has(nameKey)) displayedByName.set(nameKey, sid);
+    const oi = Number(s.order_index);
+    if (Number.isFinite(oi) && !displayedByOrder.has(oi)) displayedByOrder.set(oi, sid);
+  });
+  const { data: jobWbs } = await supabase
+    .from('material_workbooks')
+    .select('id, quote_id')
+    .eq('job_id', jobId);
+  const allowedWbIds = (jobWbs || [])
+    .filter((w: any) => {
+      const qid = String(w?.quote_id ?? '').trim();
+      return !qid || qid === targetQuoteId;
+    })
+    .map((w: any) => String(w?.id ?? '').trim())
+    .filter(Boolean);
+  if (allowedWbIds.length === 0) return;
+  const { data: jobSheets } = await supabase
+    .from('material_sheets')
+    .select('id, sheet_name, order_index, workbook_id')
+    .in('workbook_id', allowedWbIds);
+  const sheetRows = (jobSheets || []) as {
+    id: string;
+    sheet_name?: string;
+    order_index?: number;
+    workbook_id?: string;
+  }[];
+  const sheetIds = sheetRows.map((s) => s.id).filter(Boolean);
+  if (sheetIds.length === 0) return;
+  const { data: laborRows } = await supabase
+    .from('material_sheet_labor')
+    .select('*')
+    .in('sheet_id', sheetIds);
+  const metaBySheetId = new Map(sheetRows.map((s) => [String(s.id), s]));
+  (laborRows || []).forEach((labor: any) => {
+    const sid = String(labor.sheet_id ?? '').trim();
+    const meta = metaBySheetId.get(sid);
+    if (!meta) return;
+    const byName = displayedByName.get(normalizeSheetName(meta.sheet_name));
+    const oi = Number(meta.order_index);
+    const byOrder = Number.isFinite(oi) ? displayedByOrder.get(oi) : undefined;
+    const mappedSheetId = byName || byOrder;
+    if (!mappedSheetId) return;
+    const total =
+      labor.total_labor_cost ??
+      (Number(labor.estimated_hours || 0) * Number(labor.hourly_rate || 0));
+    if (!(Number.isFinite(Number(total)) && Number(total) > 0)) return;
+    const existing = laborMap[mappedSheetId];
+    const existingTotal = existing ? laborMapTotal({ [mappedSheetId]: existing }) : 0;
+    if (Number(total) <= existingTotal) return;
+    laborMap[mappedSheetId] = {
+      ...labor,
+      sheet_id: mappedSheetId,
+      total_labor_cost: total,
+      labor_source_sheet_id: sid,
+      labor_mergetrusted: true,
+    };
+  });
+}
+
+/** Clone inserts must not keep source quote_id / workbook_id (would tie proposals together). */
+function payloadForClonedLineItem(
+  source: Record<string, unknown>,
+  scope: {
+    row_id: string | null;
+    sheet_id: string | null;
+    quote_id: string;
+    workbook_id?: string | null;
+    section_name?: string | null;
+  },
+): Record<string, unknown> {
+  const {
+    id: _id,
+    row_id: _rid,
+    sheet_id: _sid,
+    quote_id: _qid,
+    workbook_id: _wb,
+    section_name: _sn,
+    created_at: _ca,
+    updated_at: _ua,
+    ...rest
+  } = source;
+  const out: Record<string, unknown> = {
+    ...rest,
+    row_id: scope.row_id,
+    sheet_id: scope.sheet_id,
+    quote_id: scope.quote_id,
+  };
+  if (scope.workbook_id !== undefined) out.workbook_id = scope.workbook_id;
+  if (scope.section_name !== undefined) out.section_name = scope.section_name;
+  return out;
 }
 
 /** Internal / crew workbooks — not shown in the proposal section list but share the same quote workbook. */
@@ -593,6 +1016,8 @@ function SortableRow({
     loadSubcontractorEstimates,
     customRows,
     savingMarkupsRef,
+    materialSheets = [],
+    sheetMetaById = {},
     emptyNotesById = {},
     setEmptyNotesById = () => {},
     emptyScopeById = {},
@@ -644,14 +1069,22 @@ function SortableRow({
           : 0;
       
       // Calculate labor from sheet line items (with markup, same as line item display)
-      const sheetLaborItems = customRowLineItems[sectionSheetId]?.filter((item: any) => (item.item_type || 'material') === 'labor') || [];
+      const resolvedSheetLineItems = resolveCustomRowLineItemsForSheet(
+        customRowLineItems,
+        materialSheets,
+        sectionSheetId,
+        sheet.sheetName,
+        materialsBreakdown?.sheetBreakdowns,
+        sheetMetaById,
+      );
+      const sheetLaborItems = resolvedSheetLineItems.filter((item: any) => (item.item_type || 'material') === 'labor') || [];
       const sheetLaborLineItemsTotal = sheetLaborItems.reduce((sum: number, item: any) => {
         const itemMarkup = item.markup_percent ?? 0;
         return sum + effectiveCustomRowLineItemBase(item) * (1 + itemMarkup / 100);
       }, 0);
 
       // Sheet-level material line items (Add Material Row from section) — include in section total
-      const sheetMaterialItems = customRowLineItems[sectionSheetId]?.filter((item: any) => (item.item_type || 'material') === 'material') || [];
+      const sheetMaterialItems = resolvedSheetLineItems.filter((item: any) => (item.item_type || 'material') === 'material') || [];
       const sheetMaterialLineItemsTotal = sheetMaterialItems.reduce((sum: number, item: any) => {
         const itemMarkup = item.markup_percent ?? 0;
         return sum + effectiveCustomRowLineItemBase(item) * (1 + itemMarkup / 100);
@@ -1100,6 +1533,10 @@ function SortableRow({
                                   }));
                                   
                                   try {
+                                    if (quote?.id && !(await sheetBelongsToQuote(supabase, sectionSheetId, quote.id))) {
+                                      toast.error('Cannot save markup: section does not belong to the selected proposal.');
+                                      return;
+                                    }
                                     // Mark this markup as being saved
                                     savingMarkupsRef.current.add(categoryKey);
                                     
@@ -1274,7 +1711,14 @@ function SortableRow({
 
               {/* Sheet-level Line Items (material + labor) - unified list so Add Labor appears in this section */}
               {(() => {
-                const sheetLineItems = (customRowLineItems[sectionSheetId] || [])
+                const sheetLineItems = resolveCustomRowLineItemsForSheet(
+                  customRowLineItems,
+                  materialSheets,
+                  sectionSheetId,
+                  sheet.sheetName,
+                  materialsBreakdown?.sheetBreakdowns,
+                  sheetMetaById,
+                )
                   .slice()
                   .sort((a: any, b: any) => (a.order_index ?? 0) - (b.order_index ?? 0));
                 if (sheetLineItems.length === 0) return null;
@@ -2958,8 +3402,16 @@ export function JobFinancials({
   externalJobWorkbookMaterialsTotal,
   historicalUnlockedQuoteId: historicalUnlockedQuoteIdProp,
   onHistoricalUnlockedQuoteIdChange,
+  materialsPanelActive = false,
+  materialsWorkbookReady = true,
+  materialsSyncGen = 0,
 }: JobFinancialsProps) {
   const { profile } = useAuth();
+  /** Always-fresh materials panel workbook view (loadMaterialsData runs async — closure would stay null after switch). */
+  const externalMaterialsWorkbookViewRef = useRef(externalMaterialsWorkbookView);
+  useEffect(() => {
+    externalMaterialsWorkbookViewRef.current = externalMaterialsWorkbookView;
+  }, [externalMaterialsWorkbookView]);
   const setProposalToolbar = useProposalToolbar();
   const proposalSummaryCtx = useProposalSummary();
   const undoApi = useUndo();
@@ -2967,6 +3419,11 @@ export function JobFinancials({
   const [initialDataLoaded, setInitialDataLoaded] = useState(false);
   const [customRows, setCustomRows] = useState<CustomFinancialRow[]>([]);
   const [customRowLineItems, setCustomRowLineItems] = useState<Record<string, CustomRowLineItem[]>>({});
+  /** Sheet-linked line items (section labor) — never cleared on proposal switch; isolated from row-linked items. */
+  const [sheetSectionLineItems, setSheetSectionLineItems] = useState<Record<string, CustomRowLineItem[]>>({});
+  /** React state mirror of DB sheet labor — guarantees re-render when refs alone do not. */
+  const [sheetLaborDisplayMap, setSheetLaborDisplayMap] = useState<Record<string, CustomRowLineItem[]>>({});
+  const sheetLaborDisplayLiveRef = useRef<Record<string, CustomRowLineItem[]>>({});
   const [laborPricing, setLaborPricing] = useState<LaborPricing | null>(null);
   const [showAddDialog, setShowAddDialog] = useState(false);
   const [customRowPanelPos, setCustomRowPanelPos] = useState({ x: 120, y: 72 });
@@ -3078,8 +3535,58 @@ export function JobFinancials({
   const siblingSheetRemapRef = useRef<Record<string, string>>({});
   /** Incremented on each full `loadData` so superseded async loads cannot overwrite materials/labor state. */
   const financialLoadCoopGenRef = useRef(0);
+  const lastFinancialLoadSyncGenRef = useRef(-1);
   const isFinancialLoadStale = (gen?: number) =>
     gen != null && gen !== financialLoadCoopGenRef.current;
+  /** True when async load still targets the proposal the user is viewing. */
+  const isLoadForActiveProposal = (targetQuoteId: string | null | undefined) => {
+    if (!targetQuoteId) return true;
+    return (
+      targetQuoteId === prevFinancialQuoteIdRef.current ||
+      targetQuoteId === userSelectedQuoteIdRef.current
+    );
+  };
+  const customRowsApplyAbortReason = (
+    targetQuoteId: string | null | undefined,
+    cooperativeGen?: number,
+  ): 'staleGen' | 'wrongQuote' | null => {
+    if (cooperativeGen != null && isFinancialLoadStale(cooperativeGen)) return 'staleGen';
+    if (targetQuoteId && !isLoadForActiveProposal(targetQuoteId)) return 'wrongQuote';
+    return null;
+  };
+  /** Last quote id applied to `customRowLineItems` — blocks optimistic merge across proposal switches. */
+  const lastCustomRowsQuoteIdRef = useRef<string | null>(null);
+  /** Last quote id applied to `sheetLabor` — blocks merging prior proposal labor on switch. */
+  const lastSheetLaborQuoteIdRef = useRef<string | null>(null);
+  /** Last successful sheetLabor payload per quote — recovers labor when a reload returns empty. */
+  const sheetLaborByQuoteRef = useRef<Record<string, Record<string, any>>>({});
+  /** Sheet-name index for per-quote labor cache (survives workbook/sheet id changes on reload). */
+  const sheetLaborByNameByQuoteRef = useRef<Record<string, Record<string, any>>>({});
+  /** Mirror of latest `sheetLabor` state for saving cache on proposal switch. */
+  const sheetLaborLiveRef = useRef<Record<string, any>>({});
+  /** Per-quote cache of sheet-linked line items (section labor lives here on legacy DBs). */
+  const customRowLineItemsByQuoteRef = useRef<Record<string, Record<string, CustomRowLineItem[]>>>({});
+  /** Authoritative per-quote sheet labor from DB prefetch — never cleared on proposal switch. */
+  const prefetchedSheetLaborByQuoteRef = useRef<Record<string, Record<string, CustomRowLineItem[]>>>({});
+  /** Mirror of latest `customRowLineItems` for cache on proposal switch. */
+  const customRowLineItemsLiveRef = useRef<Record<string, CustomRowLineItem[]>>({});
+  const sheetSectionLineItemsLiveRef = useRef<Record<string, CustomRowLineItem[]>>({});
+  /** sheet_id → sheet_name for all sheets referenced by loaded line items (cross-proposal rekey). */
+  const sheetMetaByIdRef = useRef<Record<string, string>>({});
+  const [sheetMetaById, setSheetMetaById] = useState<Record<string, string>>({});
+  /** Bumped when per-quote line-item cache updates without a React state write. */
+  const [lineItemsCacheGen, setLineItemsCacheGen] = useState(0);
+  const prevFinancialQuoteIdRef = useRef<string | null>(null);
+  /** materials-workbook-updated fired during loadData — replay after load completes. */
+  const pendingMaterialsWorkbookReloadRef = useRef(false);
+  /** Last external locked workbook id we reloaded materials for (per quote). */
+  const lastExternalLaborWbRef = useRef<{ quoteId: string; wbId: string } | null>(null);
+  /** Workbook id resolved by the latest `loadMaterialsData` (for loadCustomRows before React re-renders). */
+  const displayedWorkbookIdRef = useRef<string | null>(null);
+  /** Labor total applied by the latest `loadMaterialsData` (for post-sync retry in loadData). */
+  const lastMaterialsLaborTotalRef = useRef(0);
+  /** True while `loadData` is in flight — blocks materials-workbook-updated from racing proposal switches. */
+  const financialLoadInFlightRef = useRef(false);
 
   // Subcontractor dialog state
   const [copyCoDialogOpen, setCopyCoDialogOpen] = useState(false);
@@ -3205,6 +3712,15 @@ export function JobFinancials({
   
   // Use ref to track user's selected quote ID (persists across re-renders)
   const userSelectedQuoteIdRef = useRef<string | null>(null);
+  /** Skip duplicate onQuoteChange notifications after commitProposalSwitch. */
+  const lastNotifiedQuoteIdRef = useRef<string | null | undefined>(undefined);
+  /** Blocks loadData/loadCustomRows until commitProposalSwitch prefetch + restore finishes. */
+  const proposalSwitchGateRef = useRef<Promise<void> | null>(null);
+  async function waitForProposalSwitchGate() {
+    if (proposalSwitchGateRef.current) {
+      await proposalSwitchGateRef.current;
+    }
+  }
   // Track the last controlledQuoteId we synced so we only reload when the parent
   // actually changes the selection — not when allJobQuotes first populates.
   const lastSyncedControlledIdRef = useRef<string | null | undefined>(undefined);
@@ -3329,24 +3845,1189 @@ export function JobFinancials({
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      // Load quote list first so the proposal shell shows immediately (fast path)
       const selectedQuote = await loadQuoteData();
       if (cancelled) return;
       setLoading(false);
-
-      // Load financial data in background so UI is already visible
-      loadData(true, selectedQuote ?? undefined).then(() => {
-        if (!cancelled) setInitialDataLoaded(true);
-      });
-
-      // Do not run any automatic restore/copy that deletes or overwrites materials.
-      // Materials and workbooks are only changed when the user explicitly: deletes a sheet/workbook,
-      // or chooses "Restore from snapshot" / "Restore version" and confirms.
+      // Financial data loads via quote?.id effect after setQuote commits (runs after row-state clear).
     })();
     return () => {
       cancelled = true;
     };
   }, [job.id]);
+
+  useEffect(() => {
+    sheetLaborLiveRef.current = sheetLabor;
+  }, [sheetLabor]);
+
+  useEffect(() => {
+    customRowLineItemsLiveRef.current = customRowLineItems;
+  }, [customRowLineItems]);
+
+  useEffect(() => {
+    sheetSectionLineItemsLiveRef.current = sheetSectionLineItems;
+  }, [sheetSectionLineItems]);
+
+  useEffect(() => {
+    sheetLaborDisplayLiveRef.current = sheetLaborDisplayMap;
+  }, [sheetLaborDisplayMap]);
+
+  /** Store quote-native sheet labor keys; displayCustomRowLineItems rekeys onto the live breakdown. */
+  function setSheetLaborDisplayMapSafe(
+    map: Record<string, CustomRowLineItem[]>,
+    source: string,
+  ) {
+    const labor = laborTotalFromLineItemsMap(map);
+    const prevLabor = laborTotalFromLineItemsMap(sheetLaborDisplayLiveRef.current);
+    if (labor <= 0 && prevLabor > 0) {
+      agentDebugLog({
+        runId: 'post-fix',
+        hypothesisId: 'H33-blockedDisplayWipe',
+        location: 'JobFinancials.tsx:setSheetLaborDisplayMapSafe',
+        message: 'blocked empty sheetLaborDisplayMap write — kept prior labor',
+        data: { source, prevLabor, prevKeys: Object.keys(sheetLaborDisplayLiveRef.current) },
+      });
+      return;
+    }
+    if (labor <= 0) return;
+    const copy = JSON.parse(JSON.stringify(map)) as Record<string, CustomRowLineItem[]>;
+    sheetLaborDisplayLiveRef.current = copy;
+    setSheetLaborDisplayMap(copy);
+  }
+
+  /** Keep sheet id → name across proposal switches so rekey can map prior proposal keys. */
+  useEffect(() => {
+    const patch: Record<string, string> = {};
+    materialSheets.forEach((s: any) => {
+      const id = String(s?.id ?? '').trim();
+      if (id) patch[id] = String(s?.sheet_name ?? '');
+    });
+    (materialsBreakdown?.sheetBreakdowns || []).forEach((s: any) => {
+      const id = String(s?.sheetId ?? '').trim();
+      if (id) patch[id] = String(s?.sheetName ?? '');
+    });
+    if (Object.keys(patch).length === 0) return;
+    sheetMetaByIdRef.current = { ...sheetMetaByIdRef.current, ...patch };
+    setSheetMetaById((prev) => ({ ...prev, ...patch }));
+  }, [quote?.id, materialSheets, materialsBreakdown?.sheetBreakdowns]);
+
+  function pickBestLineItemsMap(
+    candidates: Array<Record<string, CustomRowLineItem[]> | null | undefined>,
+  ): Record<string, CustomRowLineItem[]> | null {
+    let best: Record<string, CustomRowLineItem[]> | null = null;
+    let bestLabor = 0;
+    for (const map of candidates) {
+      if (!map) continue;
+      const labor = laborTotalFromLineItemsMap(map);
+      if (labor > bestLabor) {
+        bestLabor = labor;
+        best = map;
+      }
+    }
+    return best;
+  }
+
+  /** Best sheet-labor map for a quote — prefetched DB snapshot wins over stale React/cache state. */
+  function pickBestSheetLaborForQuote(
+    quoteId: string | null | undefined,
+  ): Record<string, CustomRowLineItem[]> | null {
+    if (!quoteId) return null;
+    const prefetched = prefetchedSheetLaborByQuoteRef.current[quoteId];
+    const cached = customRowLineItemsByQuoteRef.current[quoteId];
+    return pickBestLineItemsMap([
+      prefetched && laborTotalFromLineItemsMap(prefetched) > 0 ? prefetched : null,
+      quoteId === prevFinancialQuoteIdRef.current &&
+      laborTotalFromLineItemsMap(sheetLaborDisplayLiveRef.current) > 0
+        ? sheetLaborDisplayLiveRef.current
+        : null,
+      laborTotalFromLineItemsMap(sheetSectionLineItemsLiveRef.current) > 0
+        ? sheetSectionLineItemsLiveRef.current
+        : null,
+      laborTotalFromLineItemsMap(customRowLineItemsLiveRef.current) > 0
+        ? customRowLineItemsLiveRef.current
+        : null,
+      cached && laborTotalFromLineItemsMap(cached) > 0 ? cached : null,
+    ]);
+  }
+
+  function storeSheetLaborForQuote(quoteId: string, map: Record<string, CustomRowLineItem[]>) {
+    const labor = laborTotalFromLineItemsMap(map);
+    if (labor <= 0) return;
+    prefetchedSheetLaborByQuoteRef.current[quoteId] = JSON.parse(JSON.stringify(map));
+    saveQuoteLineItemsCache(quoteId, map);
+  }
+
+  function saveQuoteLineItemsCache(
+    quoteId: string | null | undefined,
+    map: Record<string, CustomRowLineItem[]>,
+    opts?: { allowReduce?: boolean },
+  ) {
+    if (!quoteId) return;
+    const newLabor = laborTotalFromLineItemsMap(map);
+    const existing = customRowLineItemsByQuoteRef.current[quoteId];
+    const existingLabor = existing ? laborTotalFromLineItemsMap(existing) : 0;
+    const prefetchedLabor = laborTotalFromLineItemsMap(
+      prefetchedSheetLaborByQuoteRef.current[quoteId] ?? {},
+    );
+    if (!opts?.allowReduce) {
+      if (newLabor <= 0 && (existingLabor > 0 || prefetchedLabor > 0)) {
+        agentDebugLog({
+          runId: 'post-fix',
+          hypothesisId: 'H16-cacheWipe',
+          location: 'JobFinancials.tsx:saveQuoteLineItemsCache:blocked',
+          message: 'blocked cache write that would wipe labor',
+          data: { quoteId, newLabor, existingLabor, prefetchedLabor },
+        });
+        return;
+      }
+      if (newLabor > 0 && newLabor < existingLabor) return;
+      if (prefetchedLabor > 0 && newLabor > 0 && newLabor < prefetchedLabor) {
+        agentDebugLog({
+          runId: 'post-fix',
+          hypothesisId: 'H28-leavingDbSnapshot',
+          location: 'JobFinancials.tsx:saveQuoteLineItemsCache:blockedBelowPrefetch',
+          message: 'blocked cache write below DB-prefetched labor for quote',
+          data: { quoteId, newLabor, prefetchedLabor },
+        });
+        return;
+      }
+    }
+    customRowLineItemsByQuoteRef.current[quoteId] = JSON.parse(JSON.stringify(map));
+    setLineItemsCacheGen((g) => g + 1);
+  }
+
+  function applySheetSectionLineItems(
+    map: Record<string, CustomRowLineItem[]>,
+    quoteId?: string | null,
+    opts?: { allowReduce?: boolean },
+  ) {
+    const labor = laborTotalFromLineItemsMap(map);
+    const activeQuoteId = prevFinancialQuoteIdRef.current;
+    const userSelected = userSelectedQuoteIdRef.current;
+    const isActiveQuote =
+      !quoteId || quoteId === activeQuoteId || quoteId === userSelected;
+
+    if (quoteId && labor > 0) {
+      saveQuoteLineItemsCache(quoteId, map, opts);
+    }
+
+    if (!isActiveQuote) {
+      agentDebugLog({
+        runId: 'post-fix',
+        hypothesisId: 'H17-staleSectionApply',
+        location: 'JobFinancials.tsx:applySheetSectionLineItems:cacheOnly',
+        message: 'cached sheet line items for inactive quote — skipped live state write',
+        data: { quoteId, activeQuoteId, labor },
+      });
+      return;
+    }
+
+    const prevLabor = laborTotalFromLineItemsMap(sheetSectionLineItemsLiveRef.current);
+    if (!opts?.allowReduce && labor <= 0 && prevLabor > 0) {
+      return;
+    }
+    if (!opts?.allowReduce && labor > 0 && labor < prevLabor) {
+      return;
+    }
+    const copy = JSON.parse(JSON.stringify(map)) as Record<string, CustomRowLineItem[]>;
+    sheetSectionLineItemsLiveRef.current = copy;
+    setSheetSectionLineItems(copy);
+  }
+
+  function commitSheetLineItemsState(
+    map: Record<string, CustomRowLineItem[]>,
+    quoteId?: string | null,
+    opts?: { allowReduce?: boolean },
+  ) {
+    const mapLabor = laborTotalFromLineItemsMap(map);
+    const existingLabor = laborTotalFromLineItemsMap(
+      pickBestLineItemsMap([
+        quoteId ? customRowLineItemsByQuoteRef.current[quoteId] : null,
+        sheetSectionLineItemsLiveRef.current,
+        customRowLineItemsLiveRef.current,
+      ]) ?? {},
+    );
+    if (mapLabor <= 0 && existingLabor > 0 && !opts?.allowReduce) {
+      agentDebugLog({
+        runId: 'post-fix',
+        hypothesisId: 'H19-emptyCommit',
+        location: 'JobFinancials.tsx:commitSheetLineItemsState:blocked',
+        message: 'blocked commit that would wipe visible sheet line item labor',
+        data: { quoteId, mapLabor, existingLabor, activeQuoteId: prevFinancialQuoteIdRef.current },
+      });
+      return;
+    }
+    applySheetSectionLineItems(map, quoteId, opts);
+    const copy = JSON.parse(JSON.stringify(map)) as Record<string, CustomRowLineItem[]>;
+    customRowLineItemsLiveRef.current = copy;
+    setCustomRowLineItems(copy);
+  }
+
+  function resolvedSheetLineItemLaborForQuote(quoteId: string | null | undefined): number {
+    if (!quoteId) return 0;
+    return laborTotalFromLineItemsMap(
+      pickBestLineItemsMap([
+        prefetchedSheetLaborByQuoteRef.current[quoteId],
+        customRowLineItemsByQuoteRef.current[quoteId],
+        sheetSectionLineItemsLiveRef.current,
+        customRowLineItemsLiveRef.current,
+      ]) ?? {},
+    );
+  }
+
+  function rekeySheetLaborOntoBreakdown(
+    map: Record<string, CustomRowLineItem[]>,
+  ): Record<string, CustomRowLineItem[]> {
+    const displayedSheets: LaborSheetRef[] = (
+      materialsBreakdown?.sheetBreakdowns?.length
+        ? materialsBreakdown.sheetBreakdowns
+        : materialSheets
+    )
+      .map((s: any) => ({
+        id: String(s?.sheetId ?? s?.id ?? '').trim(),
+        sheet_name: s?.sheetName ?? s?.sheet_name,
+        order_index: s?.orderIndex ?? s?.order_index,
+      }))
+      .filter((s) => s.id);
+    if (displayedSheets.length === 0) return map;
+
+    const sheetIdToName = new Map<string, string>();
+    Object.entries(sheetMetaByIdRef.current).forEach(([id, name]) => sheetIdToName.set(id, name));
+    Object.entries(sheetMetaById).forEach(([id, name]) => sheetIdToName.set(id, name));
+    materialSheets.forEach((s: any) => {
+      const id = String(s?.id ?? '').trim();
+      if (id) sheetIdToName.set(id, String(s?.sheet_name ?? ''));
+    });
+    (materialsBreakdown?.sheetBreakdowns || []).forEach((s: any) => {
+      const id = String(s?.sheetId ?? '').trim();
+      if (id) sheetIdToName.set(id, String(s?.sheetName ?? ''));
+    });
+
+    const displayedIds = new Set(displayedSheets.map((s) => s.id));
+    const hasOverlap = Object.keys(map).some((k) => displayedIds.has(String(k).trim()));
+    if (hasOverlap) return map;
+
+    const rekeyed = rekeySheetLineItemsToDisplayedSheets(map, displayedSheets, sheetIdToName);
+    return laborTotalFromLineItemsMap(rekeyed) > 0 ? rekeyed : map;
+  }
+
+  function applyPrefetchedLaborForActiveQuote(source: string): number {
+    const qid = quote?.id;
+    if (!qid) return 0;
+    const prefetched = prefetchedSheetLaborByQuoteRef.current[qid];
+    if (!prefetched || laborTotalFromLineItemsMap(prefetched) <= 0) return 0;
+    const map = JSON.parse(JSON.stringify(prefetched)) as Record<string, CustomRowLineItem[]>;
+    const labor = laborTotalFromLineItemsMap(map);
+    commitSheetLineItemsState(map, qid);
+    setSheetLaborDisplayMapSafe(map, `applyPrefetchedLaborForActiveQuote:${source}`);
+    agentDebugLog({
+      runId: 'post-fix',
+      hypothesisId: 'H31-breakdownSync',
+      location: 'JobFinancials.tsx:applyPrefetchedLaborForActiveQuote',
+      message: 'applied DB-prefetched sheet labor (native keys — display layer rekeys)',
+      data: { qid, source, labor, sheetKeys: Object.keys(map) },
+    });
+    return labor;
+  }
+  /** Display layer: row-linked items from customRowLineItems; sheet labor from sheetSectionLineItems + cache + rekey. */
+  const displayCustomRowLineItems = useMemo(() => {
+    const qid = quote?.id;
+    const customRowIds = new Set(customRows.map((r) => String(r.id ?? '').trim()).filter(Boolean));
+
+    const rowLinkedOnly: Record<string, CustomRowLineItem[]> = {};
+    Object.entries(customRowLineItems).forEach(([k, items]) => {
+      if (customRowIds.has(k) || (items || []).some((it) => it.row_id)) {
+        rowLinkedOnly[k] = items;
+      }
+    });
+
+    const displayedSheets: LaborSheetRef[] = (
+      materialsBreakdown?.sheetBreakdowns?.length
+        ? materialsBreakdown.sheetBreakdowns
+        : materialSheets
+    )
+      .map((s: any) => ({
+        id: String(s?.sheetId ?? s?.id ?? '').trim(),
+        sheet_name: s?.sheetName ?? s?.sheet_name,
+        order_index: s?.orderIndex ?? s?.order_index,
+      }))
+      .filter((s) => s.id);
+
+    const sheetIdToName = new Map<string, string>();
+    Object.entries(sheetMetaById).forEach(([id, name]) => {
+      const sid = String(id).trim();
+      if (sid) sheetIdToName.set(sid, name);
+    });
+    Object.entries(sheetMetaByIdRef.current).forEach(([id, name]) => {
+      const sid = String(id).trim();
+      if (sid && !sheetIdToName.has(sid)) sheetIdToName.set(sid, name);
+    });
+    materialSheets.forEach((s: any) => {
+      const id = String(s?.id ?? '').trim();
+      if (id) sheetIdToName.set(id, String(s?.sheet_name ?? ''));
+    });
+    (materialsBreakdown?.sheetBreakdowns || []).forEach((s: any) => {
+      const id = String(s?.sheetId ?? '').trim();
+      if (id) sheetIdToName.set(id, String(s?.sheetName ?? ''));
+    });
+
+    const cached = qid ? customRowLineItemsByQuoteRef.current[qid] : null;
+    const prefetchedForQuote = qid ? prefetchedSheetLaborByQuoteRef.current[qid] : null;
+    const prefetchedLabor = prefetchedForQuote ? laborTotalFromLineItemsMap(prefetchedForQuote) : 0;
+    const displayMapLabor = laborTotalFromLineItemsMap(sheetLaborDisplayMap);
+    const sectionLabor = laborTotalFromLineItemsMap(sheetSectionLineItems);
+    const cachedLabor = cached ? laborTotalFromLineItemsMap(cached) : 0;
+    const stateSheetOnly = Object.fromEntries(
+      Object.entries(customRowLineItems).filter(([k]) => !customRowIds.has(k)),
+    );
+    const stateSheetLabor = laborTotalFromLineItemsMap(stateSheetOnly);
+
+    const sheetSource =
+      pickBestLineItemsMap([
+        prefetchedLabor > 0 ? prefetchedForQuote : null,
+        displayMapLabor > 0 ? sheetLaborDisplayMap : null,
+        cachedLabor > 0 ? cached : null,
+        sectionLabor > 0 ? sheetSectionLineItems : null,
+        stateSheetLabor > 0 ? stateSheetOnly : null,
+      ]) ?? {};
+
+    const sheetOnlySource = Object.fromEntries(
+      Object.entries(sheetSource).filter(([k]) => !customRowIds.has(k)),
+    );
+
+    if (displayedSheets.length === 0) {
+      return { ...rowLinkedOnly, ...sheetOnlySource };
+    }
+
+    let rekeyedSheets = rekeySheetLineItemsToDisplayedSheets(
+      sheetOnlySource,
+      displayedSheets,
+      sheetIdToName,
+    );
+    let rekeyedLabor = laborTotalFromLineItemsMap(rekeyedSheets);
+    const sourceLabor = laborTotalFromLineItemsMap(sheetOnlySource);
+
+    if (rekeyedLabor <= 0 && sourceLabor > 0) {
+      const displayedIds = new Set(displayedSheets.map((s) => String(s.id).trim()));
+      const sourceOverlap = Object.keys(sheetOnlySource).some((k) => displayedIds.has(String(k).trim()));
+      const fallbackOut: Record<string, CustomRowLineItem[]> = {};
+      for (const ds of displayedSheets) {
+        const targetName = normalizeLaborSheetName(ds.sheet_name);
+        if (!targetName) continue;
+        for (const [sid, items] of Object.entries(sheetOnlySource)) {
+          if (!items?.length) continue;
+          const srcName = normalizeLaborSheetName(sheetIdToName.get(String(sid).trim()));
+          if (srcName === targetName) {
+            fallbackOut[ds.id] = items.map((it) => ({ ...it, sheet_id: ds.id }));
+            break;
+          }
+        }
+      }
+      const fallbackLabor = laborTotalFromLineItemsMap(fallbackOut);
+      if (fallbackLabor > 0) {
+        rekeyedSheets = fallbackOut;
+        rekeyedLabor = fallbackLabor;
+        agentDebugLog({
+          runId: 'post-fix',
+          hypothesisId: 'H34-rekeyFallbackGap',
+          location: 'JobFinancials.tsx:displayCustomRowLineItems:fallback',
+          message: 'primary rekey returned zero — recovered labor via sheet-name fallback',
+          data: {
+            quoteId: qid,
+            sourceLabor,
+            displayMapLabor,
+            prefetchedLabor,
+            sourceOverlap,
+            cachedLabor,
+            sectionLabor,
+            stateSheetLabor,
+            fallbackLabor,
+            sourceKeys: Object.keys(sheetOnlySource),
+            displayedSheetIds: displayedSheets.map((s) => s.id),
+          },
+        });
+      } else if (sourceLabor > 0) {
+        agentDebugLog({
+          runId: 'post-fix',
+          hypothesisId: 'H34-rekeyFallbackGap',
+          location: 'JobFinancials.tsx:displayCustomRowLineItems:fallbackFailed',
+          message: 'sheet labor in source but primary rekey AND name fallback both returned zero',
+          data: {
+            quoteId: qid,
+            sourceLabor,
+            displayMapLabor,
+            prefetchedLabor,
+            sourceKeys: Object.keys(sheetOnlySource),
+            displayedSheetIds: displayedSheets.map((s) => s.id),
+            sheetIdToNameSize: sheetIdToName.size,
+          },
+        });
+      }
+    }
+
+    if (rekeyedLabor > 0 && rekeyedLabor > sectionLabor && sectionLabor > 0) {
+      agentDebugLog({
+        runId: 'post-fix',
+        hypothesisId: 'H15-displayLayer',
+        location: 'JobFinancials.tsx:displayCustomRowLineItems',
+        message: 'display rekey recovered labor not reachable via sheetSectionLineItems keys',
+        data: {
+          quoteId: qid,
+          sectionLabor,
+          rekeyedLabor,
+          sectionKeys: Object.keys(sheetSectionLineItems),
+          displayKeys: Object.keys(rekeyedSheets),
+          displayedSheetIds: displayedSheets.map((s) => s.id),
+        },
+      });
+    }
+
+    return { ...rowLinkedOnly, ...rekeyedSheets };
+  }, [
+    quote?.id,
+    customRowLineItems,
+    sheetSectionLineItems,
+    sheetLaborDisplayMap,
+    customRows,
+    materialsBreakdown,
+    materialSheets,
+    sheetMetaById,
+    lineItemsCacheGen,
+  ]);
+
+  useEffect(() => {
+    if (!quote?.id) return;
+    const displayLabor = laborTotalFromLineItemsMap(displayCustomRowLineItems);
+    const displayMapLabor = laborTotalFromLineItemsMap(sheetLaborDisplayMap);
+    const sectionLabor = laborTotalFromLineItemsMap(sheetSectionLineItems);
+    agentDebugLog({
+      runId: 'post-fix',
+      hypothesisId: 'H32-displaySnapshot',
+      location: 'JobFinancials.tsx:displaySnapshot',
+      message: 'display labor snapshot for active quote',
+      data: {
+        quoteId: quote.id,
+        displayLabor,
+        displayMapLabor,
+        sectionLabor,
+        displayMapKeys: Object.keys(sheetLaborDisplayMap),
+        breakdownSheetIds: (materialsBreakdown?.sheetBreakdowns || []).map((s: any) => s?.sheetId),
+      },
+    });
+  }, [
+    quote?.id,
+    displayCustomRowLineItems,
+    sheetLaborDisplayMap,
+    sheetSectionLineItems,
+    materialsBreakdown?.sheetBreakdowns,
+  ]);
+
+  useEffect(() => {
+    if (!quote?.id) return;
+    const breakdownIds = (materialsBreakdown?.sheetBreakdowns || [])
+      .map((s: any) => String(s?.sheetId ?? '').trim())
+      .filter(Boolean);
+    if (breakdownIds.length === 0) return;
+    const stateLabor = laborTotalFromLineItemsMap(customRowLineItems);
+    const sectionLabor = laborTotalFromLineItemsMap(sheetSectionLineItems);
+    const displayLabor = laborTotalFromLineItemsMap(displayCustomRowLineItems);
+    if (stateLabor <= 0 && sectionLabor <= 0 && displayLabor <= 0) return;
+    let resolvedLabor = 0;
+    for (const s of materialsBreakdown.sheetBreakdowns || []) {
+      const sid = String((s as any)?.sheetId ?? '').trim();
+      if (!sid) continue;
+      const items = resolveCustomRowLineItemsForSheet(
+        displayCustomRowLineItems,
+        materialSheets,
+        sid,
+        (s as any)?.sheetName,
+        materialsBreakdown.sheetBreakdowns,
+        sheetMetaById,
+      );
+      resolvedLabor += items
+        .filter((it) => (it.item_type || 'material') === 'labor')
+        .reduce(
+          (sum, it) =>
+            sum + (Number(it.total_cost) || Number(it.quantity || 0) * Number(it.unit_cost || 0)),
+          0,
+        );
+    }
+    const stateKeys = Object.keys(customRowLineItems);
+    const sectionKeys = Object.keys(sheetSectionLineItems);
+    const keyOverlap = stateKeys.some((k) => breakdownIds.includes(String(k).trim()));
+    if ((stateLabor > 0 || sectionLabor > 0 || displayLabor > 0) && resolvedLabor === 0) {
+      agentDebugLog({
+        runId: 'post-fix',
+        hypothesisId: 'H14-rekey',
+        location: 'JobFinancials.tsx:laborRenderMismatch',
+        message: 'line items have labor but section lookup resolves zero — key/sheet id mismatch',
+        data: {
+          quoteId: quote.id,
+          stateLabor,
+          sectionLabor,
+          displayLabor,
+          resolvedLabor,
+          stateKeys,
+          sectionKeys,
+          breakdownIds,
+          keyOverlap,
+        },
+      });
+    }
+  }, [
+    quote?.id,
+    customRowLineItems,
+    sheetSectionLineItems,
+    displayCustomRowLineItems,
+    materialsBreakdown,
+    materialSheets,
+    sheetMetaById,
+  ]);
+
+  // Mirror visible sheet labor into per-quote cache so proposal switches never lose data the UI is showing.
+  useEffect(() => {
+    const qid = quote?.id;
+    if (!qid) return;
+    const rowIds = new Set(customRows.map((r) => String(r.id ?? '').trim()).filter(Boolean));
+    const sheetMap = extractSheetOnlyLineItems(displayCustomRowLineItems, rowIds);
+    const labor = laborTotalFromLineItemsMap(sheetMap);
+    if (labor <= 0) return;
+    const cachedLabor = laborTotalFromLineItemsMap(customRowLineItemsByQuoteRef.current[qid] ?? {});
+    const sectionLabor = laborTotalFromLineItemsMap(sheetSectionLineItemsLiveRef.current);
+    if (labor <= cachedLabor && labor <= sectionLabor) return;
+    const rowPart = Object.fromEntries(
+      Object.entries(customRowLineItems).filter(([k]) => rowIds.has(k)),
+    );
+    saveQuoteLineItemsCache(qid, { ...rowPart, ...sheetMap });
+    if (labor > sectionLabor) {
+      const copy = JSON.parse(JSON.stringify(sheetMap)) as Record<string, CustomRowLineItem[]>;
+      sheetSectionLineItemsLiveRef.current = copy;
+      setSheetSectionLineItems(copy);
+      agentDebugLog({
+        runId: 'post-fix',
+        hypothesisId: 'H23-displayCacheSync',
+        location: 'JobFinancials.tsx:displayCacheSync',
+        message: 'synced visible sheet labor into cache and sheetSectionLineItems',
+        data: { qid, labor, sectionLabor, cachedLabor, sheetKeys: Object.keys(sheetMap) },
+      });
+    }
+  }, [quote?.id, displayCustomRowLineItems, customRows, customRowLineItems]);
+
+  // Synchronous proposal switch: invalidate in-flight loads BEFORE paint so stale P1 loadCustomRows
+  // cannot apply after quote.id is already P2 (quote load effect may defer until materials panel is ready).
+  useLayoutEffect(() => {
+    const qid = quote?.id ?? null;
+    if (!qid) return;
+    const prev = prevFinancialQuoteIdRef.current;
+    if (prev === qid) return;
+
+    if (prev) {
+      if (laborMapTotal(sheetLaborLiveRef.current) > 0) {
+        sheetLaborByQuoteRef.current[prev] = { ...sheetLaborLiveRef.current };
+      }
+      const liveLabor = laborTotalFromLineItemsMap(customRowLineItemsLiveRef.current);
+      const sectionLabor = laborTotalFromLineItemsMap(sheetSectionLineItemsLiveRef.current);
+      const prevCachedLabor = laborTotalFromLineItemsMap(
+        customRowLineItemsByQuoteRef.current[prev] ?? {},
+      );
+      const prefetchedPrevLabor = laborTotalFromLineItemsMap(
+        prefetchedSheetLaborByQuoteRef.current[prev] ?? {},
+      );
+      const best = pickBestSheetLaborForQuote(prev);
+      const bestLabor = best ? laborTotalFromLineItemsMap(best) : 0;
+      if (best && bestLabor > 0) {
+        saveQuoteLineItemsCache(prev, best);
+      }
+      financialLoadInFlightRef.current = false;
+      const invalidatedGen = ++financialLoadCoopGenRef.current;
+      agentDebugLog({
+        runId: 'post-fix',
+        hypothesisId: 'H16-cacheWipe',
+        location: 'JobFinancials.tsx:quoteSwitchLayout',
+        message: 'quote switch — saved best line items cache (never empty over labor)',
+        data: {
+          fromQuoteId: prev,
+          toQuoteId: qid,
+          invalidatedGen,
+          liveLabor,
+          sectionLabor,
+          prevCachedLabor,
+          prefetchedPrevLabor,
+          savedLabor: bestLabor,
+        },
+      });
+    }
+
+    prevFinancialQuoteIdRef.current = qid;
+    lastCustomRowsQuoteIdRef.current = null;
+    lastExternalLaborWbRef.current = null;
+
+    const cachedLineItems = customRowLineItemsByQuoteRef.current[qid];
+    const cachedLineLabor = cachedLineItems ? laborTotalFromLineItemsMap(cachedLineItems) : 0;
+    const restoreFrom = pickBestSheetLaborForQuote(qid);
+    const restoreLabor = restoreFrom ? laborTotalFromLineItemsMap(restoreFrom) : 0;
+    const prefetchedLabor = laborTotalFromLineItemsMap(
+      prefetchedSheetLaborByQuoteRef.current[qid] ?? {},
+    );
+    if (restoreFrom && restoreLabor > 0) {
+      commitSheetLineItemsState(restoreFrom, qid);
+      setSheetLaborDisplayMapSafe(restoreFrom, 'quoteSwitchLayout:restoreCache');
+      agentDebugLog({
+        runId: 'post-fix',
+        hypothesisId: 'H13-immediateSwitch',
+        location: 'JobFinancials.tsx:quoteSwitchLayout:restoreCache',
+        message: 'synchronous restore of line items cache on switch',
+        data: {
+          qid,
+          laborTotal: restoreLabor,
+          sheetKeyCount: Object.keys(restoreFrom).length,
+          prefetchedLabor,
+          cachedLineLabor,
+          source:
+            prefetchedLabor > 0 && restoreFrom === prefetchedSheetLaborByQuoteRef.current[qid]
+              ? 'prefetch'
+              : cachedLineLabor > 0 && restoreFrom === cachedLineItems
+                ? 'cache'
+                : 'live',
+        },
+      });
+    }
+
+    void refreshSheetSectionLineItemsForQuote(qid).then((labor) => {
+      if (prevFinancialQuoteIdRef.current !== qid) return;
+      agentDebugLog({
+        runId: 'post-fix',
+        hypothesisId: 'H13-immediateSwitch',
+        location: 'JobFinancials.tsx:quoteSwitchLayout:refresh',
+        message: 'layout refresh of sheet section line items',
+        data: { qid, labor },
+      });
+    });
+  }, [quote?.id]);
+
+  /** Direct DB fetch — section labor on legacy DBs lives in custom_financial_row_items keyed by sheet_id. */
+  async function prefetchSheetLineItemsForQuote(quoteId: string): Promise<Record<string, CustomRowLineItem[]>> {
+    const { data: wbRows } = await supabase
+      .from('material_workbooks')
+      .select('id, status, version_number')
+      .eq('quote_id', quoteId);
+    const wbs = (wbRows || []) as { id?: string; status?: string; version_number?: number }[];
+    const wbIds = wbs.map((w) => w.id).filter(Boolean) as string[];
+    if (wbIds.length === 0) return {};
+
+    const hasLocked = wbs.some((w) => w.status === 'locked');
+    const hasWorking = wbs.some((w) => w.status === 'working');
+    let primaryWbId = '';
+    if (hasLocked && hasWorking) {
+      primaryWbId =
+        wbs
+          .filter((w) => w.status === 'locked')
+          .sort((a, b) => (Number(b.version_number) || 0) - (Number(a.version_number) || 0))[0]?.id ?? '';
+    } else if (hasWorking) {
+      primaryWbId =
+        wbs
+          .filter((w) => w.status === 'working')
+          .sort((a, b) => (Number(b.version_number) || 0) - (Number(a.version_number) || 0))[0]?.id ?? '';
+    } else {
+      primaryWbId =
+        wbs
+          .filter((w) => w.status === 'locked')
+          .sort((a, b) => (Number(b.version_number) || 0) - (Number(a.version_number) || 0))[0]?.id ??
+        wbs[0]?.id ??
+        '';
+    }
+
+    const { data: sheetRows } = await supabase
+      .from('material_sheets')
+      .select('id, sheet_name, order_index, workbook_id')
+      .in('workbook_id', wbIds)
+      .order('order_index');
+    const allSheets = sheetRows || [];
+    const sheetIds = allSheets.map((s: { id?: string }) => String(s?.id ?? '').trim()).filter(Boolean);
+    if (sheetIds.length === 0) return {};
+
+    const sheetIdToName = new Map<string, string>();
+    const metaPatch: Record<string, string> = {};
+    allSheets.forEach((s: any) => {
+      const id = String(s?.id ?? '').trim();
+      const name = String(s?.sheet_name ?? '');
+      if (id) {
+        sheetIdToName.set(id, name);
+        metaPatch[id] = name;
+      }
+    });
+    if (Object.keys(metaPatch).length > 0) {
+      sheetMetaByIdRef.current = { ...sheetMetaByIdRef.current, ...metaPatch };
+      setSheetMetaById((prev) => ({ ...prev, ...metaPatch }));
+    }
+
+    const displayedSheets: LaborSheetRef[] = allSheets
+      .filter((s: any) => String(s?.workbook_id ?? '').trim() === String(primaryWbId).trim())
+      .map((s: any) => ({
+        id: String(s.id),
+        sheet_name: s.sheet_name,
+        order_index: s.order_index,
+      }));
+
+    const { data: items, error } = await supabase
+      .from('custom_financial_row_items')
+      .select('*')
+      .in('sheet_id', sheetIds)
+      .is('row_id', null)
+      .order('order_index');
+    if (error) {
+      console.error('prefetchSheetLineItemsForQuote:', error);
+      return {};
+    }
+    const rawMap: Record<string, CustomRowLineItem[]> = {};
+    (items || []).forEach((item: CustomRowLineItem) => {
+      const sid = String(item.sheet_id ?? '').trim();
+      if (!sid) return;
+      if (!rawMap[sid]) rawMap[sid] = [];
+      rawMap[sid].push(item);
+    });
+    const rekeyed = rekeySheetLineItemsToDisplayedSheets(rawMap, displayedSheets, sheetIdToName);
+    const rawLabor = laborTotalFromLineItemsMap(rawMap);
+    const rekeyedLabor = laborTotalFromLineItemsMap(rekeyed);
+    const result = rekeyedLabor > 0 ? rekeyed : rawLabor > 0 ? rawMap : rekeyed;
+    agentDebugLog({
+      runId: 'post-fix',
+      hypothesisId: 'H14-rekey',
+      location: 'JobFinancials.tsx:prefetchSheetLineItemsForQuote',
+      message: 'prefetch rekeyed sheet line items onto displayed workbook',
+      data: {
+        quoteId,
+        primaryWbId,
+        rawKeyCount: Object.keys(rawMap).length,
+        rekeyedKeyCount: Object.keys(rekeyed).length,
+        rawLabor,
+        rekeyedLabor,
+        resultLabor: laborTotalFromLineItemsMap(result),
+        displayedSheetIds: displayedSheets.map((s) => s.id),
+      },
+    });
+    if (laborTotalFromLineItemsMap(result) > 0) {
+      storeSheetLaborForQuote(quoteId, result);
+    }
+    return result;
+  }
+
+  /** Sole loader for sheet-linked labor line items — bypasses loadCustomRows remapping. */
+  async function refreshSheetSectionLineItemsForQuote(
+    targetQuoteId: string,
+    cooperativeGen?: number,
+  ): Promise<number> {
+    if (customRowsApplyAbortReason(targetQuoteId, cooperativeGen)) {
+      return resolvedSheetLineItemLaborForQuote(targetQuoteId);
+    }
+    const prefetched = await prefetchSheetLineItemsForQuote(targetQuoteId);
+    if (customRowsApplyAbortReason(targetQuoteId, cooperativeGen)) {
+      return resolvedSheetLineItemLaborForQuote(targetQuoteId);
+    }
+    const labor = laborTotalFromLineItemsMap(prefetched);
+    const existing = resolvedSheetLineItemLaborForQuote(targetQuoteId);
+    const stored = prefetchedSheetLaborByQuoteRef.current[targetQuoteId];
+    const storedLabor = stored ? laborTotalFromLineItemsMap(stored) : 0;
+    if (labor <= 0 && storedLabor > 0) {
+      applySheetSectionLineItems(stored!, targetQuoteId);
+      agentDebugLog({
+        runId: 'post-fix',
+        hypothesisId: 'H31-breakdownSync',
+        location: 'JobFinancials.tsx:refreshSheetSectionLineItems:useStoredPrefetch',
+        message: 'live prefetch empty — restored from stored DB snapshot for quote',
+        data: { targetQuoteId, storedLabor, cooperativeGen },
+      });
+      return storedLabor;
+    }
+    if (labor <= 0 && existing > 0) {
+      agentDebugLog({
+        runId: 'post-fix',
+        hypothesisId: 'H31-rejectCrossProposalKeep',
+        location: 'JobFinancials.tsx:refreshSheetSectionLineItems:rejectKeepExisting',
+        message: 'prefetch empty and no stored snapshot — not keeping cross-proposal live state',
+        data: { targetQuoteId, existing, storedLabor, cooperativeGen },
+      });
+      return storedLabor;
+    }
+    if (labor > 0) {
+      applySheetSectionLineItems(prefetched, targetQuoteId);
+      agentDebugLog({
+        runId: 'post-fix',
+        hypothesisId: 'H22-dedicatedSheetLoad',
+        location: 'JobFinancials.tsx:refreshSheetSectionLineItems:applied',
+        message: 'applied sheet section line items from dedicated prefetch loader',
+        data: {
+          targetQuoteId,
+          labor,
+          sheetKeyCount: Object.keys(prefetched).length,
+          cooperativeGen,
+        },
+      });
+      return labor;
+    }
+    return existing;
+  }
+
+  // Single load path for proposal switches: runs after clear-on-switch effect, never races navigate handlers.
+  const financialLoadForQuoteRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!quote?.id) return;
+    if (materialsPanelActive && !materialsWorkbookReady) {
+      agentDebugLog({
+        runId: 'post-fix',
+        hypothesisId: 'H3-workbook',
+        location: 'JobFinancials.tsx:quoteEffect:deferUntilMaterialsReady',
+        message: 'defer loadData until materials panel finishes loadWorkbook',
+        data: {
+          quoteId: quote.id,
+          proposalNumber: (quote as any)?.proposal_number ?? null,
+          materialsSyncGen,
+        },
+      });
+      return;
+    }
+    if (
+      materialsPanelActive &&
+      lastFinancialLoadSyncGenRef.current === materialsSyncGen &&
+      financialLoadForQuoteRef.current === quote.id
+    ) {
+      return;
+    }
+    const qid = quote.id;
+    const prev = prevFinancialQuoteIdRef.current;
+    if (prev && prev !== qid && laborMapTotal(sheetLaborLiveRef.current) > 0) {
+      sheetLaborByQuoteRef.current[prev] = { ...sheetLaborLiveRef.current };
+    }
+    if (prev && prev !== qid) {
+      const best = pickBestSheetLaborForQuote(prev);
+      if (best && laborTotalFromLineItemsMap(best) > 0) {
+        saveQuoteLineItemsCache(prev, best);
+      }
+    }
+    prevFinancialQuoteIdRef.current = qid;
+    lastExternalLaborWbRef.current = null;
+
+    const cachedLineItems = customRowLineItemsByQuoteRef.current[qid];
+    const cachedLineLabor = cachedLineItems ? laborTotalFromLineItemsMap(cachedLineItems) : 0;
+    const prefetchedLabor = laborTotalFromLineItemsMap(
+      prefetchedSheetLaborByQuoteRef.current[qid] ?? {},
+    );
+    const restoreFrom = pickBestSheetLaborForQuote(qid);
+    const restoreLabor = restoreFrom ? laborTotalFromLineItemsMap(restoreFrom) : 0;
+    if (restoreFrom && restoreLabor > 0) {
+      if (
+        cachedLineLabor > 0 &&
+        restoreLabor >= cachedLineLabor &&
+        restoreFrom !== cachedLineItems
+      ) {
+        agentDebugLog({
+          runId: 'post-fix',
+          hypothesisId: 'H38-quoteEffectCacheOverwrite',
+          location: 'JobFinancials.tsx:quoteSwitch:restoreLineItemsCache',
+          message: 'quote effect restore preferred prefetch/live over stale per-quote cache',
+          data: {
+            qid,
+            restoreLabor,
+            cachedLineLabor,
+            prefetchedLabor,
+            restoreKeys: Object.keys(restoreFrom),
+            cacheKeys: Object.keys(cachedLineItems ?? {}),
+          },
+        });
+      }
+      commitSheetLineItemsState(restoreFrom, qid);
+      setSheetLaborDisplayMapSafe(restoreFrom, 'quoteSwitch:restoreLineItemsCache');
+      agentDebugLog({
+        runId: 'post-fix',
+        hypothesisId: 'H9-sheetLineItems',
+        location: 'JobFinancials.tsx:quoteSwitch:restoreLineItemsCache',
+        message: 'restored sheet line items from best snapshot (prefetch > cache)',
+        data: {
+          qid,
+          sheetKeyCount: Object.keys(restoreFrom).length,
+          laborTotal: restoreLabor,
+          cachedLineLabor,
+          prefetchedLabor,
+        },
+      });
+    } else if (cachedLineItems && cachedLineLabor > 0) {
+      commitSheetLineItemsState(cachedLineItems, qid);
+      setSheetLaborDisplayMapSafe(cachedLineItems, 'quoteSwitch:restoreLineItemsCacheFallback');
+      agentDebugLog({
+        runId: 'post-fix',
+        hypothesisId: 'H9-sheetLineItems',
+        location: 'JobFinancials.tsx:quoteSwitch:restoreLineItemsCache',
+        message: 'restored customRowLineItems from per-quote cache',
+        data: {
+          qid,
+          sheetKeyCount: Object.keys(cachedLineItems).length,
+          laborTotal: cachedLineLabor,
+        },
+      });
+    }
+
+    const cached = sheetLaborByQuoteRef.current[qid];
+    const cachedByName = sheetLaborByNameByQuoteRef.current[qid];
+    const displaySheetRefs = materialSheets.map((s: any) => ({
+      id: String(s?.id ?? ''),
+      sheet_name: s?.sheet_name,
+      order_index: s?.order_index,
+    }));
+    const displayIds = new Set(displaySheetRefs.map((s) => String(s.id).trim()).filter(Boolean));
+    const cacheKeyOverlap =
+      cached &&
+      Object.keys(cached).some((k) => displayIds.has(String(k).trim()));
+    const remappedCache =
+      cached && laborMapTotal(cached) > 0 && displaySheetRefs.length > 0
+        ? remapLaborPayloadToDisplayedSheets(displaySheetRefs, cached, cachedByName)
+        : null;
+    if (remappedCache && laborMapTotal(remappedCache) > 0 && (cacheKeyOverlap || laborMapTotal(cachedByName ?? {}) > 0)) {
+      setSheetLabor({ ...remappedCache });
+      agentDebugLog({
+        runId: 'post-fix',
+        hypothesisId: 'H6-cache-keys',
+        location: 'JobFinancials.tsx:quoteSwitch:restoreCache',
+        message: 'restored sheetLabor from per-quote cache (remapped to displayed sheets)',
+        data: {
+          qid,
+          cacheKeyCount: Object.keys(cached ?? {}).length,
+          cacheTotal: laborMapTotal(cached ?? {}),
+          remappedKeyCount: Object.keys(remappedCache).length,
+          remappedTotal: laborMapTotal(remappedCache),
+          cacheKeyOverlap,
+        },
+      });
+    } else {
+      agentDebugLog({
+        runId: 'post-fix',
+        hypothesisId: 'H4-double-load',
+        location: 'JobFinancials.tsx:quoteSwitch:noCache',
+        message: 'no per-quote labor cache — keeping prior sheetLabor until loadMaterialsData completes',
+        data: { qid },
+      });
+    }
+
+    financialLoadForQuoteRef.current = qid;
+    if (materialsPanelActive) {
+      lastFinancialLoadSyncGenRef.current = materialsSyncGen;
+    }
+    void (async () => {
+      await waitForProposalSwitchGate();
+      const refreshedLabor = await refreshSheetSectionLineItemsForQuote(qid);
+      if (prevFinancialQuoteIdRef.current !== qid) return;
+      agentDebugLog({
+        runId: 'post-fix',
+        hypothesisId: 'H22-dedicatedSheetLoad',
+        location: 'JobFinancials.tsx:quoteSwitch:preLoadRefresh',
+        message: 'awaited sheet section refresh before loadData',
+        data: { qid, refreshedLabor, cachedLineLabor },
+      });
+      if (prevFinancialQuoteIdRef.current !== qid) return;
+      await loadData(true, quote);
+      if (financialLoadForQuoteRef.current === qid) setInitialDataLoaded(true);
+    })();
+  }, [quote?.id, materialsPanelActive, materialsWorkbookReady, materialsSyncGen]);
+
+  // Always DB-fetch sheet labor for the active quote once breakdown sheet ids are known.
+  useEffect(() => {
+    const qid = quote?.id;
+    if (!qid) {
+      setSheetLaborDisplayMap({});
+      return;
+    }
+    const breakdownIds = (materialsBreakdown?.sheetBreakdowns || [])
+      .map((s: any) => String(s?.sheetId ?? '').trim())
+      .filter(Boolean);
+    if (breakdownIds.length === 0) return;
+
+    let cancelled = false;
+    void (async () => {
+      await waitForProposalSwitchGate();
+      if (cancelled || quote?.id !== qid) return;
+
+      let map = prefetchedSheetLaborByQuoteRef.current[qid];
+      let labor = map ? laborTotalFromLineItemsMap(map) : 0;
+      if (labor <= 0) {
+        map = await prefetchSheetLineItemsForQuote(qid);
+        labor = laborTotalFromLineItemsMap(map);
+      }
+      if (labor <= 0 || cancelled || quote?.id !== qid) {
+        agentDebugLog({
+          runId: 'post-fix',
+          hypothesisId: 'H32-prefetchMiss',
+          location: 'JobFinancials.tsx:sheetLaborDisplayEffect',
+          message: 'DB prefetch returned zero sheet labor for quote',
+          data: { qid, breakdownIds },
+        });
+        return;
+      }
+
+      const nativeMap = JSON.parse(JSON.stringify(map)) as Record<string, CustomRowLineItem[]>;
+      const nativeLabor = laborTotalFromLineItemsMap(nativeMap);
+      if (nativeLabor <= 0 || cancelled || quote?.id !== qid) return;
+
+      setSheetLaborDisplayMapSafe(nativeMap, 'sheetLaborDisplayEffect');
+      commitSheetLineItemsState(nativeMap, qid);
+      agentDebugLog({
+        runId: 'post-fix',
+        hypothesisId: 'H32-sheetLaborState',
+        location: 'JobFinancials.tsx:sheetLaborDisplayEffect',
+        message: 'set sheetLaborDisplayMap from DB prefetch (native keys)',
+        data: { qid, nativeLabor, sheetKeys: Object.keys(nativeMap), breakdownIds },
+      });
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [quote?.id, materialsBreakdown?.sheetBreakdowns, materialsSyncGen]);
+
+  /** Notify parent + local quote atomically so Materials resets before loadData runs. */
+  async function commitProposalSwitch(nextQuote: { id: string }) {
+    const runSwitch = async () => {
+    const leavingId = quote?.id ?? null;
+    const nextId = nextQuote.id;
+
+    const metaPatch: Record<string, string> = {};
+    materialSheets.forEach((s: any) => {
+      const id = String(s?.id ?? '').trim();
+      if (id) metaPatch[id] = String(s?.sheet_name ?? '');
+    });
+    if (Object.keys(metaPatch).length > 0) {
+      sheetMetaByIdRef.current = { ...sheetMetaByIdRef.current, ...metaPatch };
+      setSheetMetaById((prev) => ({ ...prev, ...metaPatch }));
+    }
+
+    if (leavingId && leavingId !== nextId) {
+      const leavingPrefetched = await prefetchSheetLineItemsForQuote(leavingId);
+      const leavingPrefetchedLabor = laborTotalFromLineItemsMap(leavingPrefetched);
+      const best = pickBestLineItemsMap([
+        leavingPrefetchedLabor > 0 ? leavingPrefetched : null,
+        sheetSectionLineItemsLiveRef.current,
+        customRowLineItemsLiveRef.current,
+        customRowLineItemsByQuoteRef.current[leavingId],
+      ]);
+      const bestLabor = best ? laborTotalFromLineItemsMap(best) : 0;
+      if (best && bestLabor > 0) {
+        if (leavingPrefetchedLabor <= 0) {
+          storeSheetLaborForQuote(leavingId, best);
+        }
+        agentDebugLog({
+          runId: 'post-fix',
+          hypothesisId: 'H28-leavingDbSnapshot',
+          location: 'JobFinancials.tsx:commitProposalSwitch:saveLeaving',
+          message: 'saved leaving proposal sheet labor before navigate',
+          data: {
+            leavingId,
+            nextId,
+            bestLabor,
+            leavingPrefetchedLabor,
+            source: leavingPrefetchedLabor > 0 ? 'dbPrefetch' : 'liveOrCache',
+          },
+        });
+      }
+    }
+
+    userSelectedQuoteIdRef.current = nextId;
+    lastNotifiedQuoteIdRef.current = nextId;
+
+    const prefetched = await prefetchSheetLineItemsForQuote(nextId);
+    const prefetchedLabor = laborTotalFromLineItemsMap(prefetched);
+    const cached = customRowLineItemsByQuoteRef.current[nextId];
+    const cachedLabor = cached ? laborTotalFromLineItemsMap(cached) : 0;
+    const storedPrefetched = prefetchedSheetLaborByQuoteRef.current[nextId];
+    const storedPrefetchedLabor = storedPrefetched ? laborTotalFromLineItemsMap(storedPrefetched) : 0;
+    agentDebugLog({
+      runId: 'post-fix',
+      hypothesisId: 'H25-prefetchBeforeSwitch',
+      location: 'JobFinancials.tsx:commitProposalSwitch:prefetch',
+      message: 'awaited DB prefetch of sheet labor before materials reset',
+      data: { nextId, prefetchedLabor, cachedLabor, storedPrefetchedLabor, prefetchedKeys: Object.keys(prefetched) },
+    });
+
+    onQuoteChange?.(nextId);
+    setQuote(nextQuote as any);
+
+    const restoreMap =
+      pickBestLineItemsMap([
+        prefetchedLabor > 0 ? prefetched : null,
+        storedPrefetchedLabor > 0 ? storedPrefetched : null,
+        cachedLabor > 0 ? cached : null,
+      ]);
+    if (restoreMap && laborTotalFromLineItemsMap(restoreMap) > 0) {
+      const nativeRestore = JSON.parse(JSON.stringify(restoreMap)) as Record<string, CustomRowLineItem[]>;
+      const staleRekeyLabor = laborTotalFromLineItemsMap(
+        rekeySheetLaborOntoBreakdown(JSON.parse(JSON.stringify(restoreMap))),
+      );
+      setSheetLaborDisplayMapSafe(nativeRestore, 'commitProposalSwitch:restoreTarget');
+      commitSheetLineItemsState(nativeRestore, nextId);
+      agentDebugLog({
+        runId: 'post-fix',
+        hypothesisId: 'H24-syncNavigateSave',
+        location: 'JobFinancials.tsx:commitProposalSwitch:restoreTarget',
+        message: 'restored sheet line items after quote state commit (native keys)',
+        data: {
+          nextId,
+          labor: laborTotalFromLineItemsMap(nativeRestore),
+          staleRekeyLabor,
+          sheetKeyCount: Object.keys(nativeRestore).length,
+          source:
+            prefetchedLabor > 0
+              ? 'prefetch'
+              : storedPrefetchedLabor > 0
+                ? 'storedPrefetch'
+                : 'cache',
+        },
+      });
+    }
+    };
+    const gate = runSwitch();
+    proposalSwitchGateRef.current = gate;
+    try {
+      await gate;
+    } finally {
+      if (proposalSwitchGateRef.current === gate) {
+        proposalSwitchGateRef.current = null;
+      }
+    }
+  }
+
+  // Materials panel syncs workbook after proposal switch; reload labor when it arrives (initial load often runs with ext view null).
+  useEffect(() => {
+    if (!quote?.id) return;
+    const wbId = externalMaterialsWorkbookView?.workbookId;
+    const status = externalMaterialsWorkbookView?.status;
+    if (!wbId || (status !== 'locked' && status !== 'working')) return;
+    const wbIdStr = String(wbId).trim();
+    const last = lastExternalLaborWbRef.current;
+    if (last?.quoteId === quote.id && last.wbId === wbIdStr) return;
+    if (financialLoadInFlightRef.current) {
+      pendingMaterialsWorkbookReloadRef.current = true;
+      agentDebugLog({
+        runId: 'post-fix',
+        hypothesisId: 'H3-workbook',
+        location: 'JobFinancials.tsx:externalWbSync:deferred',
+        message: 'external locked workbook arrived during loadData — defer reload',
+        data: { quoteId: quote.id, wbId: wbIdStr },
+      });
+      return;
+    }
+    lastExternalLaborWbRef.current = { quoteId: quote.id, wbId: wbIdStr };
+    agentDebugLog({
+      runId: 'post-fix',
+      hypothesisId: 'H9-sheetLineItems',
+      location: 'JobFinancials.tsx:externalWbSync:reload',
+      message: 'external workbook synced — reload materials + sheet line items',
+      data: { quoteId: quote.id, wbId: wbIdStr },
+    });
+    const syncGen = financialLoadCoopGenRef.current;
+    void (async () => {
+      await loadMaterialsData(quote.id, false, undefined, syncGen);
+      if (!isFinancialLoadStale(syncGen)) {
+        await loadCustomRows(quote.id, false, syncGen);
+        await refreshSheetSectionLineItemsForQuote(quote.id, syncGen);
+      }
+    })();
+  }, [quote?.id, externalMaterialsWorkbookView?.workbookId, externalMaterialsWorkbookView?.status]);
 
   // Load proposal versions when quote changes
   useEffect(() => {
@@ -3378,6 +5059,27 @@ export function JobFinancials({
   // Keep optional sheet overlay scoped to the active quote.
   useEffect(() => {
     setOptionalSheetOverlay({});
+  }, [quote?.id]);
+
+  // Clear line-item / row state when switching proposals (materials breakdown is replaced by loadMaterialsData).
+  // Do NOT clear sheetLabor here — loadData may already be in flight from the click handler; wiping labor
+  // after loadMaterialsData completes is what makes labor vanish on P2 after P1→P2 navigation.
+  useEffect(() => {
+    // #region agent log
+    agentDebugLog({
+      runId: 'post-fix',
+      hypothesisId: 'H1-clear',
+      location: 'JobFinancials.tsx:clearOnQuoteSwitch',
+      message: 'clearing row state on quote change (sheetLabor preserved until loadMaterialsData)',
+      data: { quoteId: quote?.id ?? null, proposalNumber: (quote as any)?.proposal_number ?? null },
+    });
+    // #endregion
+    savingMarkupsRef.current.clear();
+    setCategoryMarkups({});
+    setCustomRows([]);
+    setSubcontractorEstimates([]);
+    setSubcontractorLineItems({});
+    setLinkedSubcontractors({});
   }, [quote?.id]);
   useEffect(() => {
     const scopeId = quote?.id ? `quote:${quote.id}` : `job:${job.id}`;
@@ -3423,8 +5125,6 @@ export function JobFinancials({
   }, [job?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Notify parent when proposal changes (for combined Proposal+Materials view).
-  // Track last notified ID so we don't send a redundant update that re-triggers sync.
-  const lastNotifiedQuoteIdRef = useRef<string | null | undefined>(undefined);
   useEffect(() => {
     const id = quote?.id ?? null;
     if (id !== lastNotifiedQuoteIdRef.current) {
@@ -3433,7 +5133,7 @@ export function JobFinancials({
     }
   }, [quote?.id, onQuoteChange]);
 
-  // When parent controls quote (e.g. user switched proposal in Materials panel), sync our quote.
+  // When parent controls quote
   // Guard with lastSyncedControlledIdRef so we only full-reload when the parent *changes* the selection,
   // not when allJobQuotes first populates after mount (which would double-load on every open).
   useEffect(() => {
@@ -3455,7 +5155,6 @@ export function JobFinancials({
         }
         userSelectedQuoteIdRef.current = match.id;
         setQuote(match);
-        void loadData(false, match);
       }
       return;
     }
@@ -3463,8 +5162,10 @@ export function JobFinancials({
     if (match && quote?.id !== match.id) {
       lastSyncedControlledIdRef.current = controlledQuoteId;
       userSelectedQuoteIdRef.current = match.id;
+      // #region agent log
+      fetch('http://127.0.0.1:7264/ingest/38c719fd-41f2-436e-b178-2936be94ecc3',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'458a80'},body:JSON.stringify({sessionId:'458a80',runId:'post-fix',hypothesisId:'H4-double-load',location:'JobFinancials.tsx:controlledQuoteSync',message:'controlled quote switch (load via quote effect)',data:{fromQuoteId:quote?.id??null,toQuoteId:controlledQuoteId,proposalNumber:(match as any)?.proposal_number??null},timestamp:Date.now()})}).catch(()=>{});
+      // #endregion
       setQuote(match);
-      void loadData(false, match);
     } else if (match && quote?.id === match.id) {
       lastSyncedControlledIdRef.current = controlledQuoteId;
     } else if (allJobQuotes.length === 0) {
@@ -3487,7 +5188,6 @@ export function JobFinancials({
             return [fetched, ...prev];
           });
           setQuote(fetched);
-          void loadData(false, fetched);
         });
       return () => {
         cancelled = true;
@@ -3509,11 +5209,22 @@ export function JobFinancials({
       const ctx = workbookUpdateCtxRef.current;
       if (jobId != null && jobId !== ctx.jobId) return;
       if (quoteId != null && ctx.quoteId != null && quoteId !== ctx.quoteId) return;
+      if (financialLoadInFlightRef.current) {
+        pendingMaterialsWorkbookReloadRef.current = true;
+        agentDebugLog({
+          runId: 'post-fix',
+          hypothesisId: 'H3-workbook',
+          location: 'JobFinancials.tsx:materialsWorkbookUpdated:deferred',
+          message: 'materials-workbook-updated deferred — loadData in flight',
+          data: { jobId, quoteId: quoteId ?? ctx.quoteId },
+        });
+        return;
+      }
       const isHist = !!ctx.quoteId
         && ctx.allJobQuotesFirstId != null
         && ctx.quoteId !== ctx.allJobQuotesFirstId
         && ctx.quoteId !== ctx.historicalUnlockedQuoteId;
-      ctx.loadMaterialsData(ctx.quoteId, isHist);
+      ctx.loadMaterialsData(ctx.quoteId, isHist, undefined, financialLoadCoopGenRef.current);
       void ctx.loadSubcontractorEstimates(ctx.quoteId, isHist);
     };
     window.addEventListener('materials-workbook-updated', handler as EventListener);
@@ -4754,6 +6465,8 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
   ) {
     if (!profile?.id) return;
     const sheetIdMap: Record<string, string> = {};
+    const oldSheetIdToNewWorkbookId: Record<string, string> = {};
+    const oldSheetIdToSectionName: Record<string, string> = {};
     const rowIdMap: Record<string, string> = {};
 
     const { data: existingRows } = await supabase.from('custom_financial_rows').select('id').eq('quote_id', targetQuoteId);
@@ -4796,6 +6509,8 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
         }).select('id').single();
         if (shErr || !newSheet) continue;
         sheetIdMap[sheet.id] = newSheet.id;
+        oldSheetIdToNewWorkbookId[sheet.id] = newWb.id;
+        oldSheetIdToSectionName[sheet.id] = String(sheet.sheet_name ?? '').trim() || null;
         const { data: items } = await supabase.from('material_items').select('*').eq('sheet_id', sheet.id).order('order_index');
         if (items?.length) await supabase.from('material_items').insert(items.map(({ id: _i, sheet_id: _s, created_at: _c, updated_at: _u, ...r }: any) => ({ ...r, sheet_id: newSheet.id })));
         const { data: labor } = await supabase.from('material_sheet_labor').select('*').eq('sheet_id', sheet.id);
@@ -4818,18 +6533,38 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
       rowIdMap[row.id] = newRow.id;
       const { data: rItems } = await supabase.from('custom_financial_row_items').select('*').eq('row_id', row.id).order('order_index');
       if (rItems?.length) {
-        await supabase.from('custom_financial_row_items').insert(rItems.map(({ id: _i, row_id: _r, sheet_id: oldSid, created_at: _c, updated_at: _u, ...r }: any) => ({
-          ...r, row_id: newRow.id, sheet_id: oldSid ? (sheetIdMap[oldSid] ?? null) : null,
-        })));
+        await supabase.from('custom_financial_row_items').insert(
+          rItems.map((item) => {
+            const oldSid = item.sheet_id ? String(item.sheet_id) : null;
+            const newSid = oldSid ? (sheetIdMap[oldSid] ?? null) : null;
+            return payloadForClonedLineItem(item as Record<string, unknown>, {
+              row_id: newRow.id,
+              sheet_id: newSid,
+              quote_id: targetQuoteId,
+              workbook_id: newSid ? (oldSheetIdToNewWorkbookId[oldSid!] ?? null) : null,
+              section_name: oldSid ? (oldSheetIdToSectionName[oldSid] ?? null) : null,
+            });
+          }),
+        );
       }
     }
     const oldSheetIdList = Object.keys(sheetIdMap);
     if (oldSheetIdList.length > 0) {
       const { data: sItems } = await supabase.from('custom_financial_row_items').select('*').in('sheet_id', oldSheetIdList).is('row_id', null);
       if (sItems?.length) {
-        await supabase.from('custom_financial_row_items').insert(sItems.map(({ id: _i, row_id: _r, sheet_id: oldSid, created_at: _c, updated_at: _u, ...r }: any) => ({
-          ...r, row_id: null, sheet_id: oldSid ? (sheetIdMap[oldSid] ?? null) : null,
-        })));
+        await supabase.from('custom_financial_row_items').insert(
+          sItems.map((item) => {
+            const oldSid = item.sheet_id ? String(item.sheet_id) : null;
+            const newSid = oldSid ? (sheetIdMap[oldSid] ?? null) : null;
+            return payloadForClonedLineItem(item as Record<string, unknown>, {
+              row_id: null,
+              sheet_id: newSid,
+              quote_id: targetQuoteId,
+              workbook_id: oldSid ? (oldSheetIdToNewWorkbookId[oldSid] ?? null) : null,
+              section_name: oldSid ? (oldSheetIdToSectionName[oldSid] ?? null) : null,
+            });
+          }),
+        );
       }
     }
 
@@ -4861,12 +6596,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
   }> {
     const userId = profile?.id;
     if (!userId) throw new Error('Not signed in');
-    const { data: changeOrderQuotes } = await supabase
-      .from('quotes')
-      .select('id, sent_at, locked_for_editing, signed_version, customer_signed_at')
-      .eq('job_id', job.id)
-      .eq('is_change_order_proposal', true)
-      .limit(1);
+    const { data: changeOrderQuotes } = await fetchChangeOrderQuoteForJob(supabase, job.id);
     let quoteId: string;
     let q: {
       sent_at: string | null;
@@ -4875,7 +6605,8 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
       customer_signed_at?: string | null;
     };
     if (changeOrderQuotes?.length) {
-      quoteId = changeOrderQuotes[0].id;
+      quoteId = String(changeOrderQuotes[0].id ?? '');
+      if (!quoteId) throw new Error('Change order quote is missing an id');
       q = {
         sent_at: changeOrderQuotes[0].sent_at ?? null,
         locked_for_editing: changeOrderQuotes[0].locked_for_editing ?? null,
@@ -4890,15 +6621,17 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
           is_change_order_proposal: true,
           created_by: userId,
         } as Record<string, unknown>)
-        .select('id, sent_at, locked_for_editing, signed_version, customer_signed_at')
+        .select('id, sent_at')
         .single();
       if (quoteErr || !newQuote) throw new Error(quoteErr?.message ?? 'Failed to create change order proposal');
       quoteId = newQuote.id;
+      const { data: freshCo } = await fetchChangeOrderQuoteForJob(supabase, job.id);
+      const coRow = freshCo?.[0];
       q = {
-        sent_at: newQuote.sent_at ?? null,
-        locked_for_editing: newQuote.locked_for_editing ?? null,
-        signed_version: newQuote.signed_version,
-        customer_signed_at: (newQuote as any).customer_signed_at ?? null,
+        sent_at: coRow?.sent_at ?? newQuote.sent_at ?? null,
+        locked_for_editing: coRow?.locked_for_editing ?? null,
+        signed_version: coRow?.signed_version,
+        customer_signed_at: coRow?.customer_signed_at ?? null,
       };
     }
     const { data: workbooks } = await supabase
@@ -5468,12 +7201,17 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
 
       // ── Step 2: Copy material_workbooks → sheets → items / labor / markups (single snapshot, no further reads of source) ──
       const sheetIdMap: Record<string, string> = {};
+      const oldSheetIdToNewWorkbookId: Record<string, string> = {};
+      const oldSheetIdToSectionName: Record<string, string> = {};
       const snapshotSheets: any[]                          = [];
       const snapshotCategoryMarkups: Record<string, number> = {};
       const snapshotSheetLabor: any[]                      = [];
 
       const { data: oldWorkbooksFull, error: wbFetchErr } = await fetchMaterialWorkbooksFullForQuote(oldQuoteId);
       if (wbFetchErr) throw new Error(`Step 2 (fetch workbooks): ${wbFetchErr.message}`);
+
+      const sourceWorkbook = pickWorkbookForProposalClone(oldWorkbooksFull || []);
+      const workbooksToClone = sourceWorkbook ? [sourceWorkbook] : [];
 
       const { data: maxWbRow } = await supabase
         .from('material_workbooks')
@@ -5484,7 +7222,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
         .maybeSingle();
       let nextWbVersion = (maxWbRow?.version_number ?? 0) + 1;
 
-      for (const wb of (oldWorkbooksFull || [])) {
+      for (const wb of workbooksToClone) {
         const {
           id: _oldWbId,
           quote_id: _oldWbQuote,
@@ -5555,6 +7293,8 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
           }
           if (shErr) throw new Error(`Step 2 (insert sheet): ${shErr.message}`);
           sheetIdMap[sheet.id] = newSheet.id;
+          oldSheetIdToNewWorkbookId[sheet.id] = newWb.id;
+          oldSheetIdToSectionName[sheet.id] = String(sheet.sheet_name ?? '').trim() || null;
 
           const items = (sheet.material_items || []).slice().sort((a: any, b: any) => (a.order_index ?? 0) - (b.order_index ?? 0));
           if (items.length) {
@@ -5596,7 +7336,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
           });
         }
       }
-      for (const wb of (oldWorkbooksFull || [])) {
+      for (const wb of workbooksToClone) {
         const oldSheets = (((wb as any).material_sheets as any[]) || []).slice().sort((a: any, b: any) => (a.order_index ?? 0) - (b.order_index ?? 0));
         for (const sheet of oldSheets) {
           const newSid = sheetIdMap[sheet.id];
@@ -5650,9 +7390,17 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
         if (riFetchErr) throw new Error(`Step 3 (fetch row items): ${riFetchErr.message}`);
         if (rItems?.length) {
           const { error: riErr } = await supabase.from('custom_financial_row_items').insert(
-            rItems.map(({ id: _id, row_id: _rid, sheet_id: oldSid, created_at: _ca, updated_at: _ua, ...r }) => ({
-              ...r, row_id: newRow.id, sheet_id: oldSid ? (sheetIdMap[oldSid] ?? null) : null,
-            }))
+            rItems.map((item) => {
+              const oldSid = item.sheet_id ? String(item.sheet_id) : null;
+              const newSid = oldSid ? (sheetIdMap[oldSid] ?? null) : null;
+              return payloadForClonedLineItem(item as Record<string, unknown>, {
+                row_id: newRow.id,
+                sheet_id: newSid,
+                quote_id: newQuoteId,
+                workbook_id: oldSid ? (oldSheetIdToNewWorkbookId[oldSid] ?? null) : null,
+                section_name: oldSid ? (oldSheetIdToSectionName[oldSid] ?? null) : null,
+              });
+            }),
           );
           if (riErr) throw new Error(`Step 3 (insert row items): ${riErr.message}`);
         }
@@ -5667,9 +7415,17 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
         if (siFetchErr) throw new Error(`Step 3 (fetch sheet items): ${siFetchErr.message}`);
         if (sItems?.length) {
           const { error: siErr } = await supabase.from('custom_financial_row_items').insert(
-            sItems.map(({ id: _id, row_id: _rid, sheet_id: oldSid, created_at: _ca, updated_at: _ua, ...r }) => ({
-              ...r, row_id: null, sheet_id: oldSid ? (sheetIdMap[oldSid] ?? null) : null,
-            }))
+            sItems.map((item) => {
+              const oldSid = item.sheet_id ? String(item.sheet_id) : null;
+              const newSid = oldSid ? (sheetIdMap[oldSid] ?? null) : null;
+              return payloadForClonedLineItem(item as Record<string, unknown>, {
+                row_id: null,
+                sheet_id: newSid,
+                quote_id: newQuoteId,
+                workbook_id: oldSid ? (oldSheetIdToNewWorkbookId[oldSid] ?? null) : null,
+                section_name: oldSid ? (oldSheetIdToSectionName[oldSid] ?? null) : null,
+              });
+            }),
           );
           if (siErr) throw new Error(`Step 3 (insert sheet items): ${siErr.message}`);
         }
@@ -6207,9 +7963,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
     const firstQuote = formalJobQuotes[0];
     if (quote?.id === firstQuote.id) return;
     setEstimateCatalogViewOpen(false);
-    setQuote(firstQuote);
-    userSelectedQuoteIdRef.current = firstQuote.id;
-    await loadData(false, firstQuote);
+    await commitProposalSwitch(firstQuote);
   }
 
   async function navigateToPreviousProposal() {
@@ -6218,11 +7972,15 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
     const currentIndex = formalJobQuotes.findIndex(q => q.id === quote?.id);
     if (currentIndex < formalJobQuotes.length - 1) {
       const olderQuote = formalJobQuotes[currentIndex + 1];
+      agentDebugLog({
+        runId: 'post-fix',
+        hypothesisId: 'H4-double-load',
+        location: 'JobFinancials.tsx:navigateToPreviousProposal',
+        message: 'proposal navigation',
+        data: { from: quote?.id ?? null, to: olderQuote.id, proposalNumber: (olderQuote as any)?.proposal_number ?? null },
+      });
       setEstimateCatalogViewOpen(false);
-      setQuote(olderQuote);
-      userSelectedQuoteIdRef.current = olderQuote.id;
-      // Pass olderQuote explicitly — avoids stale closure on quote state
-      await loadData(false, olderQuote);
+      await commitProposalSwitch(olderQuote);
     }
   }
 
@@ -6232,20 +7990,22 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
     const currentIndex = formalJobQuotes.findIndex(q => q.id === quote?.id);
     if (currentIndex > 0) {
       const newerQuote = formalJobQuotes[currentIndex - 1];
+      agentDebugLog({
+        runId: 'post-fix',
+        hypothesisId: 'H4-double-load',
+        location: 'JobFinancials.tsx:navigateToNextProposal',
+        message: 'proposal navigation',
+        data: { from: quote?.id ?? null, to: newerQuote.id, proposalNumber: (newerQuote as any)?.proposal_number ?? null },
+      });
       setEstimateCatalogViewOpen(false);
-      setQuote(newerQuote);
-      userSelectedQuoteIdRef.current = newerQuote.id;
-      // Pass newerQuote explicitly — avoids stale closure on quote state
-      await loadData(false, newerQuote);
+      await commitProposalSwitch(newerQuote);
     }
   }
 
   async function navigateToProposal(selectedQuote: any) {
     if (!selectedQuote || selectedQuote.id === quote?.id) return;
     setEstimateCatalogViewOpen(false);
-    setQuote(selectedQuote);
-    userSelectedQuoteIdRef.current = selectedQuote.id;
-    await loadData(false, selectedQuote);
+    await commitProposalSwitch(selectedQuote);
   }
 
   /**
@@ -6424,8 +8184,10 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
     if (!silent) {
       setLoading(true);
     }
+    financialLoadInFlightRef.current = true;
     const loadCoopGen = ++financialLoadCoopGenRef.current;
     try {
+      await waitForProposalSwitchGate();
       // IMPORTANT: When a proposal is locked (either contract-frozen OR office-locked), `loadCustomRows` relies on the
       // currently displayed sheet IDs to fetch sheet-linked line items (Add Labor). Load materials first to avoid a
       // race where sheet IDs are empty and labor disappears from locked totals until a later refresh/unlock cycle.
@@ -6460,12 +8222,52 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
           ]);
         }
       }
+
+      // Materials panel syncs its workbook asynchronously after proposal switch. While loadCustomRows /
+      // subs were loading, externalMaterialsWorkbookViewRef may now point at a different (often working) workbook
+      // that holds section labor. Retry once when first pass had zero labor and the synced workbook differs.
+      if (!isFinancialLoadStale(loadCoopGen) && targetQuoteId) {
+        const extNow = externalMaterialsWorkbookViewRef.current;
+        const extWbId = extNow?.workbookId ? String(extNow.workbookId).trim() : '';
+        const loadedWbId = displayedWorkbookIdRef.current || '';
+        const sheetLineItemLabor = resolvedSheetLineItemLaborForQuote(targetQuoteId);
+        const laborZero =
+          lastMaterialsLaborTotalRef.current === 0 && sheetLineItemLabor === 0;
+        const pending = pendingMaterialsWorkbookReloadRef.current;
+        pendingMaterialsWorkbookReloadRef.current = false;
+        const shouldRetryMaterials =
+          pending || (laborZero && !!extWbId && extWbId !== loadedWbId);
+
+        if (shouldRetryMaterials) {
+          agentDebugLog({
+            runId: 'post-fix',
+            hypothesisId: 'H3-workbook',
+            location: 'JobFinancials.tsx:loadData:retryAfterExtSync',
+            message: 'retry loadMaterialsData — materials workbook synced during loadData',
+            data: {
+              targetQuoteId,
+              extWbId,
+              loadedWbId,
+              extStatus: extNow?.status ?? null,
+              pending,
+              laborZero,
+              sheetLineItemLabor,
+            },
+          });
+          await loadMaterialsData(targetQuoteId, isHistorical, undefined, loadCoopGen);
+          if (!isFinancialLoadStale(loadCoopGen)) {
+            await loadCustomRows(targetQuoteId, isHistorical, loadCoopGen);
+            await refreshSheetSectionLineItemsForQuote(targetQuoteId, loadCoopGen);
+          }
+        }
+      }
     } catch (error) {
       console.error('Error loading financial data:', error);
       if (!silent) {
         toast.error('Failed to load financial data');
       }
     } finally {
+      financialLoadInFlightRef.current = false;
       if (!silent) {
         setLoading(false);
       }
@@ -6541,10 +8343,15 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
         ]);
         if (forQuote.error) throw forQuote.error;
         if (forJob.error) throw forJob.error;
-        const removedEstIds = new Set((removed.data || []).map((r: any) => r.section_id));
+        const removedEstIds = isMissingQuoteRemovedSectionsError(removed.error)
+          ? new Set<string>()
+          : new Set((removed.data || []).map((r: any) => r.section_id));
         const quoteIds = new Set((forQuote.data || []).map((e: any) => e.id));
-        const jobOnly = (forJob.data || []).filter((e: any) => !quoteIds.has(e.id) && !removedEstIds.has(e.id));
-        rawData = [...(forQuote.data || []), ...jobOnly];
+        rawData = [...(forQuote.data || [])];
+        if (!jobHasMultipleFormalProposals(allJobQuotes)) {
+          const jobOnly = (forJob.data || []).filter((e: any) => !quoteIds.has(e.id) && !removedEstIds.has(e.id));
+          rawData = [...rawData, ...jobOnly];
+        }
       } else {
         const { data, error } = await supabase
           .from('subcontractor_estimates')
@@ -6624,13 +8431,13 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
   /** Copy a job's existing material workbook into this proposal so materials appear in the proposal by default. */
   async function copyJobWorkbookToQuote(jobId: string, quoteId: string): Promise<any | null> {
     if (!profile?.id) return null;
-    // Find any workbook for this job that isn't already for this quote (prefer working)
+    // Only seed from a job-level workbook (quote_id null) — never clone another proposal's workbook.
     const { data: sourceWb, error: srcErr } = await supabase
       .from('material_workbooks')
       .select('id')
       .eq('job_id', jobId)
-      .or(`quote_id.is.null,quote_id.neq.${quoteId}`)
-      .order('status', { ascending: false }) // 'working' > 'locked' if we use enum ordering
+      .is('quote_id', null)
+      .order('status', { ascending: false })
       .order('updated_at', { ascending: false })
       .limit(1)
       .maybeSingle();
@@ -6742,6 +8549,23 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
     cooperativeGen?: number
   ) {
     const wasHistoricalRequest = isHistorical;
+    const extView = externalMaterialsWorkbookViewRef.current;
+    // #region agent log
+    agentDebugLog({
+      runId: 'post-fix',
+      hypothesisId: 'H3-workbook',
+      location: 'JobFinancials.tsx:loadMaterialsData:start',
+      message: 'loadMaterialsData invoked',
+      data: {
+        targetQuoteId,
+        cooperativeGen,
+        currentGen: financialLoadCoopGenRef.current,
+        extWbIdRef: extView?.workbookId ?? null,
+        extWbStatusRef: extView?.status ?? null,
+        extWbIdClosure: externalMaterialsWorkbookView?.workbookId ?? null,
+      },
+    });
+    // #endregion
     try {
       // Historical (locked/older) proposals: always load live data from DB so labor and materials
       // always show. Snapshots created when cloning can be incomplete and hide labor/subs.
@@ -6929,6 +8753,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
       // (orphan_sheet_id → displayed_sheet_id) entries can't bleed into this load.
       siblingSheetRemapRef.current = {};
       const hasQuote = targetQuoteId != null && targetQuoteId !== '';
+      const isolateProposalsOnJob = jobHasMultipleFormalProposals(allJobQuotes);
       let workbookData: any = null;
       let workbookError: any = null;
       let usedFallbackWorkbook = false;
@@ -6938,6 +8763,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
         const wbSelect = `
           id,
           status,
+          quote_id,
           material_sheets (
             *,
             material_items (*),
@@ -6947,24 +8773,24 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
         `;
         // Used later for empty-workbook fallback rules (must be outer scope).
         let contractFrozen = false;
-        // If the split-view materials panel is explicitly viewing a locked workbook, mirror that here
-        // so the proposal totals stay attached to the locked snapshot (never influenced by working edits).
-        if (externalMaterialsWorkbookView?.status === 'locked' && externalMaterialsWorkbookView.workbookId) {
+        // If the split-view materials panel is explicitly viewing a workbook, mirror that here
+        // so the proposal totals stay attached to the same snapshot (never influenced by a stale closure).
+        if (extView?.workbookId && (extView.status === 'locked' || extView.status === 'working')) {
+          const extWbId = String(extView.workbookId).trim();
           const { data: forcedWb, error: forcedErr } = await supabase
             .from('material_workbooks')
             .select(wbSelect)
-            .eq('id', externalMaterialsWorkbookView.workbookId)
+            .eq('id', extWbId)
             .limit(1)
             .maybeSingle();
           if (forcedErr) throw forcedErr;
-          workbookData = forcedWb;
-          workbookError = null;
+          const forcedQuoteId = String((forcedWb as { quote_id?: string | null })?.quote_id ?? '').trim();
+          if (forcedWb && forcedQuoteId && forcedQuoteId === targetQuoteId) {
+            workbookData = forcedWb;
+            workbookError = null;
+          }
         } else {
-        const { data: quoteRowForMaterials } = await supabase
-          .from('quotes')
-          .select('locked_for_editing, sent_at, signed_version, customer_signed_at')
-          .eq('id', targetQuoteId)
-          .maybeSingle();
+        const { data: quoteRowForMaterials } = await fetchQuoteContractRow(supabase, targetQuoteId);
         contractFrozen = isQuoteContractFrozen(quoteRowForMaterials as any);
 
         // Locked + working rows for the same quote = contract snapshot + job workbook. Proposal totals must always
@@ -6982,32 +8808,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
         // Non–first-proposal tab: same workbook priority as MaterialsManagement (workingList[0] ?? lockedList[0]),
         // both sorted by version_number desc — NOT updated_at alone, or locking the working copy can surface an
         // older locked snapshot and change materials totals on the left panel.
-        if (wasHistoricalRequest) {
-          // Historical/locked proposal view: prefer locked workbook so working edits never change this proposal's prices.
-          // Fall back to working only if no locked workbook exists yet for this quote.
-          const lockedFb = await supabase
-            .from('material_workbooks')
-            .select(wbSelect)
-            .eq('quote_id', targetQuoteId)
-            .eq('status', 'locked')
-            .order('version_number', { ascending: false })
-            .limit(1)
-            .maybeSingle();
-          workbookData = lockedFb.data;
-          workbookError = lockedFb.error;
-          if (!workbookData && !workbookError) {
-            const workingFb = await supabase
-              .from('material_workbooks')
-              .select(wbSelect)
-              .eq('quote_id', targetQuoteId)
-              .eq('status', 'working')
-              .order('version_number', { ascending: false })
-              .limit(1)
-              .maybeSingle();
-            workbookData = workingFb.data;
-            workbookError = workingFb.error;
-          }
-        } else if (contractFrozen) {
+        if (contractFrozen) {
           // Office lock OR signed contract: one `locked` workbook row holds the proposal materials total (no edits on a separate job workbook affect this).
           // When signed contract + working duplicate exists, this is always the locked snapshot; when office-locked only, it is the single flipped workbook.
           const { data: lockedRows, error: lockedErr } = await supabase
@@ -7027,68 +8828,66 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
             toast.error('Locked proposal workbook not found. Create/restore the locked contract workbook to view locked totals.');
           }
         } else {
-          // Draft (not office-locked, not signed contract): one working workbook holds proposal price + edits.
-          // A separate locked row exists only after sign-contract (handled above) or rare legacy — prefer working first so COS edits change the header.
-          const workingPreferred = await supabase
+          // Draft: prefer the working workbook with the most labor/items (clone can create multiple working rows).
+          const { data: workingRows, error: workingErr } = await supabase
             .from('material_workbooks')
             .select(wbSelect)
             .eq('quote_id', targetQuoteId)
             .eq('status', 'working')
-            .order('version_number', { ascending: false })
-            .limit(1)
-            .maybeSingle();
-          workbookData = workingPreferred.data;
-          workbookError = workingPreferred.error;
+            .order('version_number', { ascending: false });
+          workbookData = pickWorkbookForProposalClone(workingRows || []) ?? null;
+          workbookError = workingErr;
 
           if (!workbookData && !workbookError) {
-            const lockedFb = await supabase
+            const { data: lockedRows, error: lockedErr } = await supabase
               .from('material_workbooks')
               .select(wbSelect)
               .eq('quote_id', targetQuoteId)
               .eq('status', 'locked')
-              .order('version_number', { ascending: false })
-              .limit(1)
-              .maybeSingle();
-            workbookData = lockedFb.data;
-            workbookError = lockedFb.error;
+              .order('version_number', { ascending: false });
+            workbookData = pickWorkbookForProposalClone(lockedRows || []) ?? null;
+            workbookError = lockedErr;
           }
 
           if (!workbookData && !workbookError) {
-            const fallback = await supabase
+            const { data: anyRows, error: anyErr } = await supabase
               .from('material_workbooks')
               .select(wbSelect)
               .eq('quote_id', targetQuoteId)
               .order('version_number', { ascending: false })
-              .order('updated_at', { ascending: false })
-              .limit(1)
-              .maybeSingle();
-            workbookData = fallback.data;
+              .order('updated_at', { ascending: false });
+            workbookData = pickWorkbookForProposalClone(anyRows || []) ?? null;
+            workbookError = anyErr;
           }
         }
         }
 
-        if (!workbookData) {
+        if (!workbookData && hasQuote && !isolateProposalsOnJob) {
           const copied = await copyJobWorkbookToQuote(job.id, targetQuoteId);
           if (copied) workbookData = copied;
         }
-        // If proposal workbook is empty (no sheets/items), use another job workbook so draft proposals still show prices.
-        // NEVER do this for sent/signed/office-locked quotes — that would show another workbook's section names, descriptions,
-        // and labor while header totals may still reflect the contract (misleading and breaks trust in signed data).
+        // If proposal workbook is empty (no sheets/items), use job-level workbook so a single-proposal job still shows prices.
+        // NEVER borrow job-level (or any shared) workbook when multiple formal proposals exist — both would display and
+        // edit the same sheet_ids, so changes on #26049-2 would alter #26049-1.
         const sheetsFromWb = workbookData?.material_sheets || [];
         const itemCount = sheetsFromWb.reduce((n: number, s: any) => n + ((s.material_items || []).length), 0);
-        if (workbookData && (sheetsFromWb.length === 0 || itemCount === 0)) {
+        if (
+          workbookData &&
+          (sheetsFromWb.length === 0 || itemCount === 0) &&
+          !isolateProposalsOnJob
+        ) {
           if (contractFrozen) {
             usedFallbackWorkbook = false;
             proposalWorkbookIdForLabor = null;
           } else {
             proposalWorkbookIdForLabor = workbookData.id;
-            const { data: allJobWbs } = await supabase
+            const { data: jobLevelWbs } = await supabase
               .from('material_workbooks')
               .select(wbSelect)
               .eq('job_id', job.id)
+              .is('quote_id', null)
               .order('updated_at', { ascending: false });
-            const list = allJobWbs || [];
-            for (const wb of list) {
+            for (const wb of jobLevelWbs || []) {
               const wbSheets = wb?.material_sheets || [];
               const wbItemCount = wbSheets.reduce((n: number, s: any) => n + ((s.material_items || []).length), 0);
               if (wbItemCount > 0) {
@@ -7119,6 +8918,22 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
       }
 
       if (workbookError) throw workbookError;
+
+      if (workbookData && targetQuoteId) {
+        const wbQuoteId = String((workbookData as any).quote_id ?? '').trim();
+        if (wbQuoteId && wbQuoteId !== targetQuoteId) {
+          console.warn(
+            `[proposal-isolation] Rejected workbook ${workbookData.id} (quote_id=${wbQuoteId}) for proposal ${targetQuoteId}`,
+          );
+          workbookData = null;
+        } else if (isolateProposalsOnJob && !wbQuoteId) {
+          console.warn(
+            `[proposal-isolation] Rejected legacy shared workbook ${workbookData.id} (quote_id null) for proposal ${targetQuoteId}`,
+          );
+          workbookData = null;
+        }
+      }
+
       // Air-gap: never load job-level workbook when a quote is active — each proposal stays isolated
       if (!workbookData) {
         if (isFinancialLoadStale(cooperativeGen)) return;
@@ -7129,13 +8944,56 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
         setMaterialSheets([]);
         setActiveWorkbookId(null);
         setActiveWorkbookStatus(null);
-        setSheetLabor({});
+        const cachedById =
+          targetQuoteId && sheetLaborByQuoteRef.current[targetQuoteId]
+            ? sheetLaborByQuoteRef.current[targetQuoteId]
+            : null;
+        const cachedByName =
+          targetQuoteId ? sheetLaborByNameByQuoteRef.current[targetQuoteId] : undefined;
+        const priorSheetRefs = materialSheets.map((s: any) => ({
+          id: String(s?.id ?? ''),
+          sheet_name: s?.sheet_name,
+          order_index: s?.order_index,
+        }));
+        const remappedCached =
+          cachedById && priorSheetRefs.length > 0
+            ? remapLaborPayloadToDisplayedSheets(priorSheetRefs, cachedById, cachedByName)
+            : cachedById
+              ? { ...cachedById }
+              : null;
+        if (remappedCached && laborMapTotal(remappedCached) > 0) {
+          setSheetLabor(remappedCached);
+        } else if (laborMapTotal(sheetLaborLiveRef.current) === 0) {
+          setSheetLabor({});
+        }
         setSheetMarkups({});
         return;
       }
       if (isFinancialLoadStale(cooperativeGen)) return;
-      setActiveWorkbookId(String(workbookData.id ?? '') || null);
+      displayedWorkbookIdRef.current = String(workbookData.id ?? '') || null;
+      setActiveWorkbookId(displayedWorkbookIdRef.current);
       setActiveWorkbookStatus((workbookData.status as any) ?? null);
+      // #region agent log
+      agentDebugLog({
+        runId: 'post-fix',
+        hypothesisId: 'H3-workbook',
+        location: 'JobFinancials.tsx:loadMaterialsData:workbookResolved',
+        message: 'workbook picked for proposal',
+        data: {
+          targetQuoteId,
+          workbookId: workbookData.id,
+          wbStatus: workbookData.status,
+          wbQuoteId: (workbookData as any).quote_id ?? null,
+          sheetCount: (workbookData.material_sheets || []).length,
+          nestedLaborCount: (workbookData.material_sheets || []).reduce(
+            (n: number, s: any) => n + (s.material_sheet_labor || []).length,
+            0,
+          ),
+          usedFallbackWorkbook,
+          extWbIdRef: extView?.workbookId ?? null,
+        },
+      });
+      // #endregion
 
       const sheetsData: any[] = (workbookData.material_sheets || [])
         .slice()
@@ -7182,7 +9040,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
       }
       // When we displayed a fallback workbook (proposal had no sheets/items), labor was on the proposal's workbook;
       // fetch that labor and merge by sheet name so labor still shows on the right sections
-      if (usedFallbackWorkbook && proposalWorkbookIdForLabor && hasQuote) {
+      if (usedFallbackWorkbook && proposalWorkbookIdForLabor && hasQuote && !isolateProposalsOnJob) {
         const { data: proposalSheets } = await supabase
           .from('material_sheets')
           .select('id, sheet_name')
@@ -7218,10 +9076,9 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
         }
       }
 
-      // When viewing the contract LOCKED workbook, sheet-level labor often lives on another row for the same quote
-      // (working job workbook, an older locked version, etc.) with different material_sheets.id values.
-      // Merge labor from every *other* workbook for this quote onto displayed sheets by name, then order_index.
-      if (hasQuote && (workbookData.status as any) === 'locked') {
+      // Sheet-level labor often lives on a sibling workbook for the SAME quote (working vs locked,
+      // or multiple working copies after clone). Merge onto displayed sheets by name / order_index.
+      if (hasQuote && targetQuoteId && workbookData?.id) {
         try {
           const normalizeSheetName = (v: unknown) =>
             String(v ?? '')
@@ -7291,13 +9148,28 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
               });
             }
           }
+          agentDebugLog({
+            runId: 'post-fix',
+            hypothesisId: 'H5-sibling',
+            location: 'JobFinancials.tsx:loadMaterialsData:siblingMerge',
+            message: 'sibling workbook labor merge',
+            data: {
+              targetQuoteId,
+              displayedWbId: String(workbookData.id ?? '').trim(),
+              otherWbCount: otherWbIds.length,
+              laborKeyCountAfter: Object.keys(laborMap).length,
+              laborTotalAfter: laborMapTotal(laborMap),
+            },
+          });
         } catch (e) {
           console.warn('merge sibling workbook labor into locked view:', e);
         }
       }
 
-      // Labor sometimes remains only on another job workbook (e.g. quote_id null COS copy) while the UI shows the contract workbook.
-      if (job?.id && sheetsData.length > 0) {
+      // Labor sometimes remains only on another workbook for the SAME quote (locked vs working).
+      // When multiple formal proposals exist on the job, never merge labor from other quotes' sheets.
+      const isolateProposals = jobHasMultipleFormalProposals(allJobQuotes);
+      if (job?.id && sheetsData.length > 0 && !isolateProposals) {
         try {
           const normalizeSheetNameJl = (v: unknown) =>
             String(v ?? '')
@@ -7322,8 +9194,14 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
           const displayedIdSet = new Set(
             sheetsData.map((s: any) => String(s?.id ?? '').trim()).filter(Boolean)
           );
-          const { data: jobWbList } = await supabase.from('material_workbooks').select('id').eq('job_id', job.id);
-          const jobWbIds = (jobWbList || []).map((w: any) => String(w?.id ?? '').trim()).filter(Boolean);
+          const { data: jobWbList } = await supabase
+            .from('material_workbooks')
+            .select('id, quote_id')
+            .eq('job_id', job.id);
+          const jobWbIds = (jobWbList || [])
+            .filter((w: any) => !w.quote_id || w.quote_id === targetQuoteId)
+            .map((w: any) => String(w?.id ?? '').trim())
+            .filter(Boolean);
           if (jobWbIds.length > 0) {
             const { data: jobSheetsAll } = await supabase
               .from('material_sheets')
@@ -7389,23 +9267,185 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
           console.warn('merge job-level workbook labor onto displayed sheets:', e);
         }
       }
-
-      if (isFinancialLoadStale(cooperativeGen)) return;
+      const displayedSheetRefsForLabor: LaborSheetRef[] = sheetsData.map((s: any) => ({
+        id: String(s.id),
+        sheet_name: s.sheet_name,
+        order_index: s.order_index,
+      }));
+      if (targetQuoteId && displayedSheetRefsForLabor.length > 0) {
+        try {
+          await mergeLaborFromAllQuoteWorkbooks(
+            targetQuoteId,
+            displayedSheetRefsForLabor,
+            laborMap,
+          );
+        } catch (e) {
+          console.warn('mergeLaborFromAllQuoteWorkbooks:', e);
+        }
+        if (job?.id && laborMapTotal(laborMap) === 0) {
+          try {
+            await mergeLaborFromJobWorkbooksForQuote(
+              job.id,
+              targetQuoteId,
+              displayedSheetRefsForLabor,
+              laborMap,
+            );
+          } catch (e) {
+            console.warn('mergeLaborFromJobWorkbooksForQuote:', e);
+          }
+        }
+      }
+      agentDebugLog({
+        runId: 'post-fix',
+        hypothesisId: 'H5-sibling',
+        location: 'JobFinancials.tsx:loadMaterialsData:afterLaborMerge',
+        message: 'labor map built',
+        data: {
+          targetQuoteId,
+          displayedWorkbookId: displayedWorkbookIdRef.current,
+          laborKeyCount: Object.keys(laborMap).length,
+          laborMapTotal: laborMapTotal(laborMap),
+          mergedTrustedCount: Object.values(laborMap).filter((l: any) => l?.labor_mergetrusted).length,
+        },
+      });
+      if (isFinancialLoadStale(cooperativeGen)) {
+        // #region agent log
+        agentDebugLog({
+          runId: 'post-fix',
+          hypothesisId: 'H2-stale',
+          location: 'JobFinancials.tsx:loadMaterialsData:staleBeforeSetLabor',
+          message: 'aborted before setSheetLabor — stale cooperativeGen',
+          data: {
+            targetQuoteId,
+            cooperativeGen,
+            currentGen: financialLoadCoopGenRef.current,
+            laborKeyCount: Object.keys(laborMap).length,
+          },
+        });
+        // #endregion
+        return;
+      }
       const sheetLaborPayload: Record<string, any> = {};
       for (const [k, v] of Object.entries(laborMap)) {
         const nk = String(k).trim();
         if (nk) sheetLaborPayload[nk] = v;
       }
-      // Merge in any existing sheet labor not in fetch (e.g. just-saved row not yet visible) so it doesn't glitch away
-      setSheetLabor(prev => {
-        const next = { ...sheetLaborPayload };
-        if (prev && typeof prev === 'object') {
-          Object.keys(prev).forEach(sid => {
-            if (!(sid in next)) next[sid] = prev[sid];
-          });
+      const displayedSheetRefs: LaborSheetRef[] = sheetsData.map((s: any) => ({
+        id: String(s?.id ?? ''),
+        sheet_name: s?.sheet_name,
+        order_index: s?.order_index,
+      }));
+      const displayIdSet = new Set(
+        displayedSheetRefs.map((s) => String(s.id).trim()).filter(Boolean),
+      );
+      let finalLaborPayload = sheetLaborPayload;
+      if (targetQuoteId && laborMapTotal(finalLaborPayload) === 0 && sheetLaborByQuoteRef.current[targetQuoteId]) {
+        finalLaborPayload = remapLaborPayloadToDisplayedSheets(
+          displayedSheetRefs,
+          sheetLaborByQuoteRef.current[targetQuoteId],
+          sheetLaborByNameByQuoteRef.current[targetQuoteId],
+        );
+      }
+      if (targetQuoteId && laborMapTotal(finalLaborPayload) === 0 && sheetLaborByNameByQuoteRef.current[targetQuoteId]) {
+        finalLaborPayload = remapLaborPayloadToDisplayedSheets(
+          displayedSheetRefs,
+          {},
+          sheetLaborByNameByQuoteRef.current[targetQuoteId],
+        );
+      }
+      const payloadKeysMismatch = Object.keys(finalLaborPayload).some(
+        (k) => !displayIdSet.has(String(k).trim()),
+      );
+      if (payloadKeysMismatch && displayedSheetRefs.length > 0) {
+        const remappedPayload = remapLaborPayloadToDisplayedSheets(
+          displayedSheetRefs,
+          finalLaborPayload,
+          targetQuoteId ? sheetLaborByNameByQuoteRef.current[targetQuoteId] : undefined,
+        );
+        if (laborMapTotal(remappedPayload) > 0) {
+          finalLaborPayload = remappedPayload;
         }
-        return next;
+      }
+      const sameQuoteReload =
+        targetQuoteId != null &&
+        targetQuoteId === lastSheetLaborQuoteIdRef.current &&
+        laborMapTotal(finalLaborPayload) > 0;
+      const extNowForLabor = externalMaterialsWorkbookViewRef.current;
+      const deferEmptySheetLabor =
+        controlledQuoteId !== undefined &&
+        targetQuoteId != null &&
+        laborMapTotal(finalLaborPayload) === 0 &&
+        !extNowForLabor?.workbookId &&
+        !sheetLaborByQuoteRef.current[targetQuoteId];
+
+      if (deferEmptySheetLabor) {
+        agentDebugLog({
+          runId: 'post-fix',
+          hypothesisId: 'H3-workbook',
+          location: 'JobFinancials.tsx:loadMaterialsData:deferEmptyLabor',
+          message: 'defer empty sheetLabor — awaiting materials workbook sync',
+          data: { targetQuoteId, displayedWorkbookId: displayedWorkbookIdRef.current },
+        });
+        lastMaterialsLaborTotalRef.current = laborMapTotal(sheetLaborLiveRef.current);
+      } else if (laborMapTotal(finalLaborPayload) === 0) {
+        agentDebugLog({
+          runId: 'post-fix',
+          hypothesisId: 'H7-sameQuoteReload',
+          location: 'JobFinancials.tsx:loadMaterialsData:skipEmptyApply',
+          message: 'skip empty sheetLabor apply — would wipe visible labor',
+          data: {
+            targetQuoteId,
+            lastAppliedQuoteId: lastSheetLaborQuoteIdRef.current,
+            liveTotal: laborMapTotal(sheetLaborLiveRef.current),
+            cooperativeGen,
+          },
+        });
+        lastMaterialsLaborTotalRef.current = laborMapTotal(sheetLaborLiveRef.current);
+      } else {
+        setSheetLabor((prev) => {
+          const next = { ...finalLaborPayload };
+          if (sameQuoteReload && prev && typeof prev === 'object') {
+            Object.keys(prev).forEach((sid) => {
+              if (!(sid in next)) next[sid] = prev[sid];
+            });
+          }
+          return next;
+        });
+        lastSheetLaborQuoteIdRef.current = targetQuoteId;
+        if (targetQuoteId && laborMapTotal(finalLaborPayload) > 0) {
+          sheetLaborByQuoteRef.current[targetQuoteId] = { ...finalLaborPayload };
+          const byName: Record<string, any> = {};
+          sheetsData.forEach((s: any) => {
+            const sid = String(s?.id ?? '').trim();
+            const nameKey = normalizeLaborSheetName(s?.sheet_name);
+            if (sid && nameKey && finalLaborPayload[sid]) byName[nameKey] = finalLaborPayload[sid];
+          });
+          if (Object.keys(byName).length > 0) {
+            sheetLaborByNameByQuoteRef.current[targetQuoteId] = byName;
+          }
+        }
+        lastMaterialsLaborTotalRef.current = laborMapTotal(finalLaborPayload);
+      }
+      // #region agent log
+      agentDebugLog({
+        runId: 'post-fix',
+        hypothesisId: 'H4-double-load',
+        location: 'JobFinancials.tsx:loadMaterialsData:setSheetLabor',
+        message: 'applying sheetLabor state',
+        data: {
+          targetQuoteId,
+          sameQuoteReload,
+          deferEmptySheetLabor,
+          payloadKeyCount: Object.keys(finalLaborPayload).length,
+          payloadTotal: laborMapTotal(finalLaborPayload),
+          appliedTotal: lastMaterialsLaborTotalRef.current,
+          usedCache: laborMapTotal(sheetLaborPayload) === 0 && laborMapTotal(finalLaborPayload) > 0,
+          payloadKeysMismatch,
+          cooperativeGen,
+          displayedWorkbookId: displayedWorkbookIdRef.current,
+        },
       });
+      // #endregion
 
       // Build category markups map, preserving any in-progress saves
       const freshMarkups: Record<string, number> = {};
@@ -7607,6 +9647,10 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
       console.log('📝 Loading live custom rows for locked/historical proposal');
       isHistorical = false;
     }
+    if (targetQuoteId && jobHasMultipleFormalProposals(allJobQuotes)) {
+      await realignMisassignedSheetLineItems(supabase, targetQuoteId);
+    }
+    await waitForProposalSwitchGate();
     if (false && isHistorical && targetQuoteId) {
       const { data: versionData, error: versionError } = await supabase
         .from('proposal_versions')
@@ -7686,7 +9730,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
       }));
       if (JSON.stringify(asCustomRows) !== JSON.stringify(customRows)) setCustomRows(asCustomRows);
       setCustomRowLabor(laborMap);
-      setCustomRowLineItems(lineItemsMap);
+      commitSheetLineItemsState(lineItemsMap, targetQuoteId);
       console.log('✅ Loaded custom rows from snapshot (deduped)');
       return;
       }
@@ -7704,16 +9748,21 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
       ]);
       if (forQuote.error) {
         console.error('Error loading custom rows (quote):', forQuote.error);
-        return;
       }
       if (forJob.error) {
         console.error('Error loading custom rows (job):', forJob.error);
-        return;
       }
-      const removedRowIds = new Set((removed.data || []).map((r: any) => r.section_id));
-      const quoteIds = new Set((forQuote.data || []).map((r: any) => r.id));
-      const jobOnly = (forJob.data || []).filter((r: any) => !quoteIds.has(r.id) && !removedRowIds.has(r.id));
-      rawRows = [...(forQuote.data || []), ...jobOnly];
+      if (!forQuote.error) {
+        const removedRowIds = isMissingQuoteRemovedSectionsError(removed.error)
+          ? new Set<string>()
+          : new Set((removed.data || []).map((r: any) => r.section_id));
+        const quoteIds = new Set((forQuote.data || []).map((r: any) => r.id));
+        rawRows = [...(forQuote.data || [])];
+        if (!forJob.error && !jobHasMultipleFormalProposals(allJobQuotes)) {
+          const jobOnly = (forJob.data || []).filter((r: any) => !quoteIds.has(r.id) && !removedRowIds.has(r.id));
+          rawRows = [...rawRows, ...jobOnly];
+        }
+      }
     } else {
       const { data, error } = await supabase
         .from('custom_financial_rows')
@@ -7766,6 +9815,24 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
 
     if (isFinancialLoadStale(cooperativeGen)) return;
 
+    const applyAbort = customRowsApplyAbortReason(targetQuoteId, cooperativeGen);
+    if (applyAbort) {
+      agentDebugLog({
+        runId: 'post-fix',
+        hypothesisId: 'H10-staleApply',
+        location: 'JobFinancials.tsx:loadCustomRows:abortApply',
+        message: 'aborted before applying custom row state',
+        data: {
+          targetQuoteId,
+          activeQuoteId: prevFinancialQuoteIdRef.current,
+          reason: applyAbort,
+          cooperativeGen,
+          currentGen: financialLoadCoopGenRef.current,
+        },
+      });
+      return;
+    }
+
     const laborMap: Record<string, any> = {};
     dedupedRows.forEach(row => {
       if (row.notes) {
@@ -7803,6 +9870,192 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
       (row.custom_financial_row_items || []) as CustomRowLineItem[]
     );
 
+    // Row-linked items only — sheet section labor uses refreshSheetSectionLineItemsForQuote (prefetch path).
+    const rowLineItemsMap: Record<string, CustomRowLineItem[]> = {};
+    rowLinkedItems.forEach((item) => {
+      const rowId = item.row_id ? (duplicateToSurviving[item.row_id] ?? item.row_id) : null;
+      if (!rowId) return;
+      if (!rowLineItemsMap[rowId]) rowLineItemsMap[rowId] = [];
+      const fp = lineItemOptimisticFingerprint(item);
+      const isDup = rowLineItemsMap[rowId].some(
+        (ex) =>
+          (item.id && ex.id === item.id) ||
+          lineItemOptimisticFingerprint(ex) === fp,
+      );
+      if (!isDup) rowLineItemsMap[rowId].push(item);
+    });
+    Object.keys(rowLineItemsMap).forEach((k) => {
+      rowLineItemsMap[k].sort((a, b) => (a.order_index ?? 0) - (b.order_index ?? 0));
+    });
+    const rowIds = new Set(dedupedRows.map((r) => r.id));
+
+    if (targetQuoteId) {
+      await refreshSheetSectionLineItemsForQuote(targetQuoteId, cooperativeGen);
+    }
+
+    const applyAbortAfterRefresh = customRowsApplyAbortReason(targetQuoteId, cooperativeGen);
+    if (applyAbortAfterRefresh) {
+      agentDebugLog({
+        runId: 'post-fix',
+        hypothesisId: 'H10-staleApply',
+        location: 'JobFinancials.tsx:loadCustomRows:abortAfterRefresh',
+        message: 'aborted row line item apply after sheet refresh — stale or wrong quote',
+        data: {
+          targetQuoteId,
+          activeQuoteId: prevFinancialQuoteIdRef.current,
+          userSelectedQuoteId: userSelectedQuoteIdRef.current,
+          reason: applyAbortAfterRefresh,
+          cooperativeGen,
+        },
+      });
+      return;
+    }
+
+    const sheetLaborSource =
+      pickBestLineItemsMap([
+        targetQuoteId &&
+        targetQuoteId === userSelectedQuoteIdRef.current &&
+        laborTotalFromLineItemsMap(sheetLaborDisplayLiveRef.current) > 0
+          ? sheetLaborDisplayLiveRef.current
+          : null,
+        targetQuoteId ? prefetchedSheetLaborByQuoteRef.current[targetQuoteId] : null,
+        targetQuoteId ? customRowLineItemsByQuoteRef.current[targetQuoteId] : null,
+        sheetSectionLineItemsLiveRef.current,
+        customRowLineItemsLiveRef.current,
+      ]) ?? {};
+    let sheetPart = extractSheetOnlyLineItems(sheetLaborSource, rowIds);
+    if (targetQuoteId && laborTotalFromLineItemsMap(sheetPart) <= 0) {
+      const pf = prefetchedSheetLaborByQuoteRef.current[targetQuoteId];
+      const pfLabor = pf ? laborTotalFromLineItemsMap(pf) : 0;
+      if (pfLabor > 0) {
+        sheetPart = extractSheetOnlyLineItems(pf, rowIds);
+        agentDebugLog({
+          runId: 'post-fix',
+          hypothesisId: 'H35-prefetchFallback',
+          location: 'JobFinancials.tsx:loadCustomRows:prefetchFallback',
+          message: 'sheetPart empty after refresh — restored from DB-prefetched ref',
+          data: { targetQuoteId, pfLabor, pfKeys: Object.keys(pf ?? {}) },
+        });
+      }
+    }
+
+    const displayedSheetsForMerge: LaborSheetRef[] = (
+      materialsBreakdown?.sheetBreakdowns?.length
+        ? materialsBreakdown.sheetBreakdowns
+        : materialSheets
+    )
+      .map((s: any) => ({
+        id: String(s?.sheetId ?? s?.id ?? '').trim(),
+        sheet_name: s?.sheetName ?? s?.sheet_name,
+        order_index: s?.orderIndex ?? s?.order_index,
+      }))
+      .filter((s) => s.id);
+    if (displayedSheetsForMerge.length > 0 && laborTotalFromLineItemsMap(sheetPart) > 0) {
+      const mergeIdToName = new Map<string, string>();
+      Object.entries(sheetMetaByIdRef.current).forEach(([id, name]) => {
+        mergeIdToName.set(id, name);
+      });
+      materialSheets.forEach((s: any) => {
+        const id = String(s?.id ?? '').trim();
+        if (id) mergeIdToName.set(id, String(s?.sheet_name ?? ''));
+      });
+      const rekeyed = rekeySheetLineItemsToDisplayedSheets(sheetPart, displayedSheetsForMerge, mergeIdToName);
+      if (laborTotalFromLineItemsMap(rekeyed) > 0) {
+        agentDebugLog({
+          runId: 'post-fix',
+          hypothesisId: 'H25-crossProposalRekey',
+          location: 'JobFinancials.tsx:loadCustomRows:mergeRekey',
+          message: 'rekeyed sheet labor onto displayed sheets before row-only merge',
+          data: {
+            targetQuoteId,
+            beforeKeys: Object.keys(sheetPart),
+            afterKeys: Object.keys(rekeyed),
+            labor: laborTotalFromLineItemsMap(rekeyed),
+            displayedSheetIds: displayedSheetsForMerge.map((s) => s.id),
+          },
+        });
+        sheetPart = rekeyed;
+      }
+    }
+
+    setCustomRowLineItems((prev) => {
+      const prevSheetOnly = extractSheetOnlyLineItems(prev, rowIds);
+      const prevSheetLabor = laborTotalFromLineItemsMap(prevSheetOnly);
+      let mergedSheet = sheetPart;
+      if (laborTotalFromLineItemsMap(mergedSheet) <= 0 && prevSheetLabor > 0) {
+        mergedSheet = prevSheetOnly;
+        agentDebugLog({
+          runId: 'post-fix',
+          hypothesisId: 'H38-monotonicSheetMerge',
+          location: 'JobFinancials.tsx:loadCustomRows:keepPrevSheetOnly',
+          message: 'loadCustomRows would wipe sheet labor — kept prior sheet keys',
+          data: { targetQuoteId, prevSheetLabor, cooperativeGen },
+        });
+      } else if (laborTotalFromLineItemsMap(mergedSheet) <= 0 && targetQuoteId) {
+        const pfBest = pickBestSheetLaborForQuote(targetQuoteId);
+        const pfSheet = pfBest ? extractSheetOnlyLineItems(pfBest, rowIds) : {};
+        if (laborTotalFromLineItemsMap(pfSheet) > 0) {
+          mergedSheet = pfSheet;
+          agentDebugLog({
+            runId: 'post-fix',
+            hypothesisId: 'H38-monotonicSheetMerge',
+            location: 'JobFinancials.tsx:loadCustomRows:prefetchSheetMerge',
+            message: 'merged sheet labor from authoritative prefetch snapshot',
+            data: {
+              targetQuoteId,
+              labor: laborTotalFromLineItemsMap(pfSheet),
+              cooperativeGen,
+            },
+          });
+        }
+      }
+      const next: Record<string, CustomRowLineItem[]> = { ...mergedSheet, ...rowLineItemsMap };
+      for (const parentId of Object.keys(prev || {})) {
+        if (!rowIds.has(parentId)) continue;
+        const prevItems = prev[parentId] || [];
+        const optimistic = prevItems.filter((it: any) => String(it?.id || '').startsWith('optimistic_'));
+        if (!optimistic.length) continue;
+        const existingIds = new Set((next[parentId] || []).map((it: any) => String(it?.id || '')));
+        const serverFp = new Set((next[parentId] || []).map((it: any) => lineItemOptimisticFingerprint(it)));
+        const toAdd = optimistic.filter((it: any) => {
+          if (existingIds.has(String(it?.id || ''))) return false;
+          if (serverFp.has(lineItemOptimisticFingerprint(it))) return false;
+          return true;
+        });
+        if (toAdd.length) next[parentId] = [...(next[parentId] || []), ...toAdd];
+      }
+      customRowLineItemsLiveRef.current = next;
+      if (targetQuoteId && laborTotalFromLineItemsMap(mergedSheet) > 0) {
+        saveQuoteLineItemsCache(targetQuoteId, next);
+      }
+      return next;
+    });
+    if (targetQuoteId && laborTotalFromLineItemsMap(sheetPart) > 0) {
+      applySheetSectionLineItems(sheetPart, targetQuoteId);
+      setSheetLaborDisplayMapSafe(sheetPart, 'loadCustomRows:rowsOnly');
+    } else if (targetQuoteId) {
+      const pfBest = pickBestSheetLaborForQuote(targetQuoteId);
+      if (pfBest && laborTotalFromLineItemsMap(pfBest) > 0) {
+        applySheetSectionLineItems(pfBest, targetQuoteId);
+        setSheetLaborDisplayMapSafe(pfBest, 'loadCustomRows:rowsOnlyPrefetch');
+      }
+    }
+    agentDebugLog({
+      runId: 'post-fix',
+      hypothesisId: 'H22-dedicatedSheetLoad',
+      location: 'JobFinancials.tsx:loadCustomRows:rowsOnly',
+      message: 'applied row-linked + sheet section line items after dedicated refresh',
+      data: {
+        targetQuoteId,
+        rowKeyCount: Object.keys(rowLineItemsMap).length,
+        sheetKeyCount: Object.keys(sheetPart).length,
+        sheetLabor: laborTotalFromLineItemsMap(sheetPart),
+        cooperativeGen,
+      },
+    });
+    return;
+
+    // Legacy sheet-linked fetch below (unreachable — kept for reference during migration).
     // Fetch sheet-linked items (row_id IS NULL).
     // NOTE: Sheet line items are proposal-scoped via (quote_id + section_name) and may optionally also have sheet_id.
     // We attach them to the currently displayed sheets by matching section_name (and fall back to sheet_id).
@@ -7813,42 +10066,50 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
      * Do NOT seed from `activeWorkbookId`: after `await loadMaterialsData()` React has not re-rendered,
      * so that state is often still the previous quote/job and sheet-linked labor never maps onto sections.
      */
-    let displayedWorkbookIdForLineItems: string | null = null;
+    let displayedWorkbookIdForLineItems: string | null = displayedWorkbookIdRef.current;
+    if (displayedWorkbookIdForLineItems && targetQuoteId) {
+      const { data: wbRow } = await supabase
+        .from('material_workbooks')
+        .select('quote_id')
+        .eq('id', displayedWorkbookIdForLineItems)
+        .maybeSingle();
+      const wbQuoteId = String((wbRow as { quote_id?: string | null })?.quote_id ?? '').trim();
+      if (wbQuoteId !== targetQuoteId) {
+        agentDebugLog({
+          runId: 'post-fix',
+          hypothesisId: 'H9-sheetLineItems',
+          location: 'JobFinancials.tsx:loadCustomRows:rejectStaleWorkbook',
+          message: 'displayedWorkbookIdRef belongs to another proposal — re-resolve for sheet line items',
+          data: {
+            targetQuoteId,
+            staleWorkbookId: displayedWorkbookIdForLineItems,
+            staleWorkbookQuoteId: wbQuoteId || null,
+          },
+        });
+        displayedWorkbookIdForLineItems = null;
+      }
+    }
+    const extViewForRows = externalMaterialsWorkbookViewRef.current;
     if (
       targetQuoteId &&
-      externalMaterialsWorkbookView?.status === 'locked' &&
-      externalMaterialsWorkbookView?.workbookId
+      !displayedWorkbookIdForLineItems &&
+      extViewForRows?.workbookId &&
+      (extViewForRows?.status === 'locked' || extViewForRows?.status === 'working')
     ) {
-      displayedWorkbookIdForLineItems = String(externalMaterialsWorkbookView.workbookId).trim() || null;
-    }
-    const displayedSheetIds = Array.from(
-      new Set((materialsBreakdown.sheetBreakdowns || []).map((s: any) => String(s?.sheetId || '').trim()).filter(Boolean))
-    );
-    if (displayedSheetIds.length > 0) {
-      sheetIds = displayedSheetIds;
+      const extWbId = String(extViewForRows.workbookId).trim();
+      const { data: extWb } = await supabase
+        .from('material_workbooks')
+        .select('quote_id')
+        .eq('id', extWbId)
+        .maybeSingle();
+      const extQuoteId = String((extWb as { quote_id?: string | null })?.quote_id ?? '').trim();
+      if (extQuoteId && extQuoteId === targetQuoteId) {
+        displayedWorkbookIdForLineItems = extWbId || null;
+      }
     }
 
-    // When a proposal has both a locked workbook (contract) and a working workbook (edits),
-    // sheet IDs differ between the two. Sheet-linked line items (Add Labor) are stored by sheet_id,
-    // so if they were added while viewing/using the working workbook they won't naturally appear
-    // under the locked workbook's sheet IDs.
-    //
-    // Build a best-effort mapping from working sheet_id → displayed (locked) sheet_id using sheet_name (+ order_index fallback).
-    const normalizeSheetName = (v: unknown) =>
-      String(v ?? '')
-        .toLowerCase()
-        .trim()
-        .replace(/\s+/g, ' ');
-    const displayedSheetNameToId = new Map<string, string>();
-    const displayedSheetOrderToId = new Map<number, string>();
-    /** All sheet ids on the displayed (usually locked / contract) workbook — must feed sheet line-item fetch even when React `materialsBreakdown` is stale after `loadMaterialsData`. */
-    let displayedLockedSheetIds: string[] = [];
     if (targetQuoteId && !displayedWorkbookIdForLineItems) {
-      const { data: quoteRowLineItems } = await supabase
-        .from('quotes')
-        .select('locked_for_editing, signed_version, customer_signed_at')
-        .eq('id', targetQuoteId)
-        .maybeSingle();
+      const { data: quoteRowLineItems } = await fetchQuoteContractRow(supabase, targetQuoteId);
       let preferLockedWb = isQuoteContractFrozen(quoteRowLineItems as any);
       const { data: wbPairProbe } = await supabase
         .from('material_workbooks')
@@ -7904,8 +10165,16 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
       }
     }
     if (!targetQuoteId) {
-      displayedWorkbookIdForLineItems = activeWorkbookId || null;
+      displayedWorkbookIdForLineItems = activeWorkbookId || displayedWorkbookIdRef.current || null;
     }
+    const normalizeSheetName = (v: unknown) =>
+      String(v ?? '')
+        .toLowerCase()
+        .trim()
+        .replace(/\s+/g, ' ');
+    const displayedSheetNameToId = new Map<string, string>();
+    const displayedSheetOrderToId = new Map<number, string>();
+    let displayedLockedSheetIds: string[] = [];
     if (displayedWorkbookIdForLineItems) {
       const { data: liveDisplayedSheets } = await supabase
         .from('material_sheets')
@@ -7933,6 +10202,24 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
     }
     const workingSheetIdToDisplayedId = new Map<string, string>();
     const extraWorkingSheetIds: string[] = [];
+    let quoteNativeSheetIds = new Set<string>();
+    if (targetQuoteId) {
+      const { data: quoteWbRows } = await supabase
+        .from('material_workbooks')
+        .select('id')
+        .eq('quote_id', targetQuoteId);
+      const quoteWbIdList = (quoteWbRows || []).map((w: { id?: string }) => String(w?.id ?? '').trim()).filter(Boolean);
+      if (quoteWbIdList.length > 0) {
+        const { data: nativeSheets } = await supabase
+          .from('material_sheets')
+          .select('id')
+          .in('workbook_id', quoteWbIdList);
+        quoteNativeSheetIds = new Set(
+          (nativeSheets || []).map((s: { id?: string }) => String(s?.id ?? '').trim()).filter(Boolean),
+        );
+      }
+    }
+    const displayedSectionSheetIds = new Set(displayedLockedSheetIds.map((s) => String(s).trim()));
     // Map non-displayed workbook sheet_ids → displayed (contract) sheet_ids by section name / order.
     // Signed contract + locked proposal: labor line items may reference the job workbook or an older workbook row, not only `status=working`.
     if (targetQuoteId) {
@@ -7959,14 +10246,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
         });
       });
     }
-    if (extraWorkingSheetIds.length > 0) {
-      sheetIds = Array.from(new Set([...(sheetIds || []), ...extraWorkingSheetIds]));
-    }
-    // Contract / locked view: line items may be stored on locked sheet_ids. `materialsBreakdown` in this closure
-    // can still be empty right after `await loadMaterialsData` (state not committed), so always union DB-resolved ids.
-    if (displayedLockedSheetIds.length > 0) {
-      sheetIds = Array.from(new Set([...(sheetIds || []), ...displayedLockedSheetIds]));
-    }
+    let quoteSheetIds: string[] = [];
     if (targetQuoteId) {
       let quoteWb: any = null;
       let { data: wbData } = await supabase
@@ -7987,23 +10267,30 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
         quoteWb = fallback.data;
       }
       const quoteSheets = (quoteWb as any)?.material_sheets || [];
-      let quoteSheetIds = quoteSheets.map((s: any) => s.id);
+      quoteSheetIds = quoteSheets.map((s: any) => s.id).filter(Boolean);
       const itemCount = quoteSheets.reduce((n: number, s: any) => n + ((s.material_items || []).length), 0);
       if (quoteSheetIds.length === 0 || itemCount === 0) {
-        const { data: allJobWbs } = await supabase
+        const { data: allQuoteWbs } = await supabase
           .from('material_workbooks')
           .select('id, material_sheets(id)')
-          .eq('job_id', job.id)
+          .eq('quote_id', targetQuoteId)
           .order('updated_at', { ascending: false });
-        for (const wb of allJobWbs || []) {
-          const sids = ((wb as any).material_sheets || []).map((s: any) => s.id);
+        for (const wb of allQuoteWbs || []) {
+          const sids = ((wb as any).material_sheets || []).map((s: any) => s.id).filter(Boolean);
           if (sids.length > 0) {
             quoteSheetIds = sids;
             break;
           }
         }
       }
-      if (sheetIds.length === 0) sheetIds = quoteSheetIds;
+      // Authoritative: only sheets on this proposal's workbooks (never stale P1 sheet ids).
+      sheetIds = quoteNativeSheetIds.size > 0 ? Array.from(quoteNativeSheetIds) : Array.from(
+        new Set([
+          ...displayedLockedSheetIds,
+          ...extraWorkingSheetIds,
+          ...quoteSheetIds,
+        ].filter(Boolean)),
+      );
     } else {
       const { data: jobWb } = await supabase
         .from('material_workbooks')
@@ -8014,41 +10301,72 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
       if (sheetIds.length === 0) sheetIds = ((jobWb as any)?.material_sheets || []).map((s: any) => s.id);
     }
     if (targetQuoteId) {
-      // Primary: proposal-scoped items (new behavior).
-      const workbookIdsToLoad = new Set<string>();
-      if (displayedWorkbookIdForLineItems) workbookIdsToLoad.add(displayedWorkbookIdForLineItems);
-      // Line items (e.g. section "Add Labor") are often saved on the working workbook while the UI shows locked totals.
-      // Always include the newest working workbook when it differs from the displayed one so nothing disappears on refresh.
-      const { data: workingWbForItems } = await supabase
-        .from('material_workbooks')
-        .select('id')
-        .eq('quote_id', targetQuoteId)
-        .eq('status', 'working')
-        .order('version_number', { ascending: false })
-        .limit(1)
-        .maybeSingle();
-      const workingWbId = String((workingWbForItems as any)?.id ?? '').trim();
-      if (workingWbId && workingWbId !== displayedWorkbookIdForLineItems) {
-        workbookIdsToLoad.add(workingWbId);
+      const useLegacySheetLineItemsOnly = shouldSkipCustomRowItemQuoteIdColumn();
+      let byQuoteErr: { code?: string; message?: string } | null = null;
+
+      if (!useLegacySheetLineItemsOnly) {
+        // Primary: proposal-scoped items (new behavior) when DB has quote_id column.
+        const workbookIdsToLoad = new Set<string>();
+        if (displayedWorkbookIdForLineItems) workbookIdsToLoad.add(displayedWorkbookIdForLineItems);
+        const { data: workingWbForItems } = await supabase
+          .from('material_workbooks')
+          .select('id')
+          .eq('quote_id', targetQuoteId)
+          .eq('status', 'working')
+          .order('version_number', { ascending: false })
+          .limit(1)
+          .maybeSingle();
+        const workingWbId = String((workingWbForItems as any)?.id ?? '').trim();
+        if (workingWbId && workingWbId !== displayedWorkbookIdForLineItems) {
+          workbookIdsToLoad.add(workingWbId);
+        }
+
+        let byQuoteQuery = supabase
+          .from('custom_financial_row_items')
+          .select('*')
+          .eq('quote_id', targetQuoteId)
+          .is('row_id', null)
+          .order('order_index');
+        const wbIds = Array.from(workbookIdsToLoad);
+        const skipWorkbookFilter = shouldSkipCustomRowItemWorkbookFilter();
+        if (wbIds.length > 0 && !skipWorkbookFilter) {
+          byQuoteQuery = byQuoteQuery.or(`workbook_id.is.null,workbook_id.in.(${wbIds.join(',')})`);
+        }
+        let { data: byQuote, error: err } = await byQuoteQuery;
+        byQuoteErr = err as typeof byQuoteErr;
+        if (byQuoteErr && wbIds.length > 0 && isMissingCustomRowItemColumnError(byQuoteErr, 'workbook_id')) {
+          markCustomRowItemsNoWorkbookIdColumn();
+          const retryNoWb = await supabase
+            .from('custom_financial_row_items')
+            .select('*')
+            .eq('quote_id', targetQuoteId)
+            .is('row_id', null)
+            .order('order_index');
+          byQuote = retryNoWb.data;
+          byQuoteErr = retryNoWb.error as typeof byQuoteErr;
+        }
+        if (byQuoteErr && isMissingCustomRowItemColumnError(byQuoteErr, 'quote_id')) {
+          markCustomRowItemsNoQuoteIdColumn();
+        } else if (!byQuoteErr) {
+          sheetLinkedItems = (byQuote || []) as CustomRowLineItem[];
+        }
       }
 
-      let byQuoteQuery = supabase
-        .from('custom_financial_row_items')
-        .select('*')
-        .eq('quote_id', targetQuoteId)
-        .is('row_id', null)
-        .order('order_index');
-      const wbIds = Array.from(workbookIdsToLoad);
-      if (wbIds.length > 0) {
-        // Prefer scoping to relevant workbooks; include NULL for backward compatibility.
-        byQuoteQuery = byQuoteQuery.or(`workbook_id.is.null,workbook_id.in.(${wbIds.join(',')})`);
-      }
-      const { data: byQuote, error: byQuoteErr } = await byQuoteQuery;
-      if (byQuoteErr) {
-        console.error('Error loading quote-scoped sheet line items:', byQuoteErr);
+      if (useLegacySheetLineItemsOnly || byQuoteErr) {
+        if (byQuoteErr) {
+          const expectedSchemaGap =
+            isMissingCustomRowItemColumnError(byQuoteErr, 'workbook_id') ||
+            isMissingCustomRowItemColumnError(byQuoteErr, 'quote_id') ||
+            isMissingCustomRowItemColumnError(byQuoteErr, 'section_name');
+          if (!expectedSchemaGap) {
+            console.error('Error loading quote-scoped sheet line items:', byQuoteErr);
+          }
+        }
         // Older DBs may not yet have quote_id/workbook_id/section_name columns. Fall back to legacy sheet_id-linked fetch.
         let legacySheetIds = sheetIds;
-        if (legacySheetIds.length === 0 && targetQuoteId) {
+        if (legacySheetIds.length === 0 && quoteNativeSheetIds.size > 0) {
+          legacySheetIds = Array.from(quoteNativeSheetIds);
+        } else if (legacySheetIds.length === 0 && targetQuoteId) {
           try {
             const { data: wbRows } = await supabase
               .from('material_workbooks')
@@ -8074,19 +10392,58 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
             .is('row_id', null)
             .order('order_index');
           if (sheetItemsErr) console.error('Error loading sheet-linked line items:', sheetItemsErr);
-          sheetLinkedItems = (sheetItems || []) as CustomRowLineItem[];
+          const rawItems = (sheetItems || []) as CustomRowLineItem[];
+          if (targetQuoteId && rawItems.length > 0) {
+            const { data: sheetMetaRows } = await supabase
+              .from('material_sheets')
+              .select('id, material_workbooks!inner(quote_id)')
+              .in('id', legacySheetIds);
+            let allowedSheetIds = new Set(
+              (sheetMetaRows || [])
+                .filter(
+                  (s: any) =>
+                    String(s?.material_workbooks?.quote_id ?? '').trim() === targetQuoteId,
+                )
+                .map((s: any) => String(s?.id ?? '').trim())
+                .filter(Boolean),
+            );
+            if (allowedSheetIds.size === 0 && quoteNativeSheetIds.size > 0) {
+              allowedSheetIds = new Set(quoteNativeSheetIds);
+              agentDebugLog({
+                runId: 'post-fix',
+                hypothesisId: 'H18-legacyJoinFallback',
+                location: 'JobFinancials.tsx:loadCustomRows:legacyJoinFallback',
+                message: 'workbook join returned no sheets — using quoteNativeSheetIds filter',
+                data: {
+                  targetQuoteId,
+                  rawCount: rawItems.length,
+                  nativeSheetCount: quoteNativeSheetIds.size,
+                },
+              });
+            }
+            if (allowedSheetIds.size === 0) {
+              sheetLinkedItems = rawItems;
+            } else {
+              sheetLinkedItems = rawItems.filter((item) =>
+                allowedSheetIds.has(String(item.sheet_id ?? '').trim()),
+              );
+            }
+          } else {
+            sheetLinkedItems = filterLineItemsForActiveQuote(rawItems, targetQuoteId);
+          }
         } else {
           sheetLinkedItems = [];
         }
-      } else {
-        sheetLinkedItems = (byQuote || []) as CustomRowLineItem[];
       }
 
-      // Always merge sheet_id-linked rows for this proposal's sheets (locked + working).
-      // Primary query uses quote_id + workbook_id; after "set as contract" some rows can still be
-      // legacy (quote_id null) or workbook_id from an edge case — they would be dropped if we only
-      // relied on byQuote, or if byQuote returned other rows and skipped the old "length === 0" fallback.
-      if (sheetIds.length > 0) {
+      // Merge sheet_id rows only when quote-scoped query succeeded (DB has quote_id). Legacy-only path
+      // already loaded all sheet-linked items — merging again duplicates line items across proposals.
+      if (sheetIds.length > 0 && !useLegacySheetLineItemsOnly && !byQuoteErr) {
+        const knownIds = new Set(
+          sheetLinkedItems.map((i) => String(i?.id ?? '').trim()).filter(Boolean),
+        );
+        const knownFp = new Set(sheetLinkedItems.map((i) => lineItemOptimisticFingerprint(i)));
+        const byQuoteSucceeded = true;
         const { data: bySheetRows, error: bySheetErr } = await supabase
           .from('custom_financial_row_items')
           .select('*')
@@ -8096,12 +10453,17 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
         if (bySheetErr) {
           console.error('Error loading sheet-linked line items (merge):', bySheetErr);
         } else {
-          const seen = new Set(sheetLinkedItems.map((i) => i.id).filter(Boolean));
           for (const row of (bySheetRows || []) as CustomRowLineItem[]) {
-            if (row.id && !seen.has(row.id)) {
-              seen.add(row.id);
-              sheetLinkedItems.push(row);
-            }
+            const rid = String(row?.id ?? '').trim();
+            const rowQuoteId = String((row as any)?.quote_id ?? '').trim() || null;
+            if (rid && knownIds.has(rid)) continue;
+            const fp = lineItemOptimisticFingerprint(row);
+            if (knownFp.has(fp)) continue;
+            if (byQuoteSucceeded && rowQuoteId) continue;
+            if (rowQuoteId && rowQuoteId !== targetQuoteId) continue;
+            if (rid) knownIds.add(rid);
+            knownFp.add(fp);
+            sheetLinkedItems.push(row);
           }
         }
       }
@@ -8113,7 +10475,10 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
         .is('row_id', null)
         .order('order_index');
       if (sheetItemsErr) console.error('Error loading sheet-linked line items:', sheetItemsErr);
-      sheetLinkedItems = (sheetItems || []) as CustomRowLineItem[];
+      sheetLinkedItems = filterLineItemsForActiveQuote(
+        (sheetItems || []) as CustomRowLineItem[],
+        targetQuoteId,
+      );
     }
 
     const allLineItems = [...rowLinkedItems, ...sheetLinkedItems];
@@ -8152,31 +10517,209 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
 
     const getEffectiveParentId = (item: CustomRowLineItem) => {
       if (item.row_id) return duplicateToSurviving[item.row_id] ?? item.row_id;
-      // Prefer attaching by section_name (stable across workbook copies).
       const sec = normalizeSheetName((item as any).section_name);
       if (sec && sheetNameToId.has(sec)) return sheetNameToId.get(sec) ?? null;
       const sid = item.sheet_id ?? null;
-      if (sid && workingSheetIdToDisplayedId.has(String(sid))) return workingSheetIdToDisplayedId.get(String(sid)) ?? sid;
-      return sid;
+      if (!sid) return null;
+      const sidStr = String(sid).trim();
+      if (quoteNativeSheetIds.has(sidStr)) {
+        if (displayedSectionSheetIds.has(sidStr)) return sidStr;
+        const remapped = workingSheetIdToDisplayedId.get(sidStr);
+        if (remapped) return remapped;
+        return sidStr;
+      }
+      const remapped = workingSheetIdToDisplayedId.get(sidStr);
+      if (remapped) return remapped;
+      return sidStr;
     };
-    const lineItemsMap: Record<string, CustomRowLineItem[]> = {};
+    let lineItemsMap: Record<string, CustomRowLineItem[]> = {};
     allLineItems.forEach(item => {
       const parentId = getEffectiveParentId(item);
-      if (parentId) {
-        if (!lineItemsMap[parentId]) lineItemsMap[parentId] = [];
-        lineItemsMap[parentId].push(item);
-      }
+      if (!parentId) return;
+      if (!lineItemsMap[parentId]) lineItemsMap[parentId] = [];
+      const fp = lineItemOptimisticFingerprint(item);
+      const isDup = lineItemsMap[parentId].some(
+        (ex) =>
+          (item.id && ex.id === item.id) ||
+          lineItemOptimisticFingerprint(ex) === fp,
+      );
+      if (!isDup) lineItemsMap[parentId].push(item);
     });
     Object.keys(lineItemsMap).forEach(k => {
       lineItemsMap[k].sort((a, b) => (a.order_index ?? 0) - (b.order_index ?? 0));
     });
-    if (isFinancialLoadStale(cooperativeGen)) return;
-    // Preserve optimistic items only when the server list does not already include an equivalent row.
-    // Otherwise we show duplicates (real UUID + optimistic_*) and deleting only removes the DB row.
-    setCustomRowLineItems(prev => {
-      const next: Record<string, CustomRowLineItem[]> = { ...lineItemsMap };
-      for (const parentId of Object.keys(prev || {})) {
-        const optimistic = (prev[parentId] || []).filter((it: any) => String(it?.id || '').startsWith('optimistic_'));
+
+    const sheetIdToName = new Map<string, string>();
+    displayedSheetNameToId.forEach((id, nameKey) => {
+      const sid = String(id).trim();
+      if (sid) sheetIdToName.set(sid, nameKey);
+    });
+    if (quoteNativeSheetIds.size > 0) {
+      const { data: nativeMeta } = await supabase
+        .from('material_sheets')
+        .select('id, sheet_name')
+        .in('id', Array.from(quoteNativeSheetIds));
+      (nativeMeta || []).forEach((s: any) => {
+        const id = String(s?.id ?? '').trim();
+        if (id) sheetIdToName.set(id, String(s?.sheet_name ?? ''));
+      });
+    }
+    const displayedSheetsForRekey: LaborSheetRef[] = displayedLockedSheetIds.map((id) => ({
+      id: String(id),
+      sheet_name: sheetIdToName.get(String(id)) ?? undefined,
+    }));
+    if (displayedSheetsForRekey.length > 0) {
+      const rawLabor = laborTotalFromLineItemsMap(lineItemsMap);
+      lineItemsMap = rekeySheetLineItemsToDisplayedSheets(
+        lineItemsMap,
+        displayedSheetsForRekey,
+        sheetIdToName,
+      );
+      const metaPatch: Record<string, string> = {};
+      sheetIdToName.forEach((name, id) => {
+        metaPatch[id] = name;
+      });
+      if (Object.keys(metaPatch).length > 0) {
+        sheetMetaByIdRef.current = { ...sheetMetaByIdRef.current, ...metaPatch };
+        setSheetMetaById((prev) => ({ ...prev, ...metaPatch }));
+      }
+      agentDebugLog({
+        runId: 'post-fix',
+        hypothesisId: 'H14-rekey',
+        location: 'JobFinancials.tsx:loadCustomRows:rekey',
+        message: 'rekeyed sheet line items onto displayed workbook sheets',
+        data: {
+          targetQuoteId,
+          displayedWorkbookIdForLineItems,
+          rawLabor,
+          rekeyedLabor: laborTotalFromLineItemsMap(lineItemsMap),
+          displayedSheetIds: displayedSheetsForRekey.map((s) => s.id),
+          mappedKeys: Object.keys(lineItemsMap),
+        },
+      });
+    }
+
+    const laborLineItemTotal = laborTotalFromLineItemsMap(lineItemsMap);
+    agentDebugLog({
+      runId: 'post-fix',
+      hypothesisId: 'H9-sheetLineItems',
+      location: 'JobFinancials.tsx:loadCustomRows:done',
+      message: 'sheet-linked line items mapped',
+      data: {
+        targetQuoteId,
+        displayedWorkbookIdForLineItems,
+        legacySheetIdCount: sheetIds.length,
+        sheetLinkedCount: sheetLinkedItems.length,
+        mappedSheetKeyCount: Object.keys(lineItemsMap).length,
+        laborLineItemTotal,
+        cooperativeGen,
+      },
+    });
+    if (isFinancialLoadStale(cooperativeGen)) {
+      agentDebugLog({
+        runId: 'post-fix',
+        hypothesisId: 'H9-sheetLineItems',
+        location: 'JobFinancials.tsx:loadCustomRows:staleAbort',
+        message: 'aborted before setCustomRowLineItems — stale cooperativeGen',
+        data: { targetQuoteId, cooperativeGen, currentGen: financialLoadCoopGenRef.current, laborLineItemTotal },
+      });
+      if (targetQuoteId && laborLineItemTotal > 0) {
+        saveQuoteLineItemsCache(targetQuoteId, lineItemsMap);
+      }
+      return;
+    }
+    const lineItemsApplyAbort = customRowsApplyAbortReason(targetQuoteId, cooperativeGen);
+    if (lineItemsApplyAbort === 'wrongQuote') {
+      agentDebugLog({
+        runId: 'post-fix',
+        hypothesisId: 'H10-staleApply',
+        location: 'JobFinancials.tsx:loadCustomRows:abortLineItems',
+        message: 'aborted setCustomRowLineItems — proposal switched during async load',
+        data: {
+          targetQuoteId,
+          activeQuoteId: prevFinancialQuoteIdRef.current,
+          laborLineItemTotal,
+          cooperativeGen,
+        },
+      });
+      return;
+    }
+    const quoteChanged = lastCustomRowsQuoteIdRef.current !== targetQuoteId;
+    lastCustomRowsQuoteIdRef.current = targetQuoteId;
+
+    const prevItems = customRowLineItemsLiveRef.current;
+    const prevLabor = laborTotalFromLineItemsMap(prevItems);
+    const next: Record<string, CustomRowLineItem[]> = { ...lineItemsMap };
+    const cached = targetQuoteId ? customRowLineItemsByQuoteRef.current[targetQuoteId] : null;
+    const cachedLabor = cached ? laborTotalFromLineItemsMap(cached) : 0;
+    const sectionLaborLive = laborTotalFromLineItemsMap(sheetSectionLineItemsLiveRef.current);
+
+    const rekeyIfNeeded = (map: Record<string, CustomRowLineItem[]>) => {
+      if (displayedSheetsForRekey.length === 0) return map;
+      const rekeyed = rekeySheetLineItemsToDisplayedSheets(map, displayedSheetsForRekey, sheetIdToName);
+      return laborTotalFromLineItemsMap(rekeyed) > 0 ? rekeyed : map;
+    };
+
+    const pickKeepMap = () =>
+      pickBestLineItemsMap([
+        cachedLabor > 0 ? cached : null,
+        prevLabor > 0 ? prevItems : null,
+        sectionLaborLive > 0 ? sheetSectionLineItemsLiveRef.current : null,
+      ]) ?? prevItems;
+
+    let finalMap: Record<string, CustomRowLineItem[]> = next;
+
+    if (quoteChanged) {
+      const displayedIds = new Set(displayedLockedSheetIds.map((id) => String(id).trim()));
+      const keyOverlap =
+        displayedIds.size > 0 &&
+        Object.keys(next).some((k) => displayedIds.has(String(k).trim()));
+      if (laborLineItemTotal === 0 && (cachedLabor > 0 || prevLabor > 0 || sectionLaborLive > 0)) {
+        finalMap = rekeyIfNeeded(JSON.parse(JSON.stringify(pickKeepMap())));
+        agentDebugLog({
+          runId: 'post-fix',
+          hypothesisId: 'H12-sameQuoteWipe',
+          location: 'JobFinancials.tsx:loadCustomRows:keepCachedLineItems',
+          message: 'proposal switch reload mapped zero labor — keeping cache/prev',
+          data: { targetQuoteId, cachedLabor, prevLabor, sectionLaborLive },
+        });
+      } else if (laborLineItemTotal > 0 && !keyOverlap && (cachedLabor > 0 || prevLabor > 0 || sectionLaborLive > 0)) {
+        finalMap = rekeyIfNeeded(JSON.parse(JSON.stringify(pickKeepMap())));
+        agentDebugLog({
+          runId: 'post-fix',
+          hypothesisId: 'H14-rekey',
+          location: 'JobFinancials.tsx:loadCustomRows:keepCacheWrongKeys',
+          message: 'mapped labor has no key overlap with displayed sheets — keeping cache/prev',
+          data: {
+            targetQuoteId,
+            laborLineItemTotal,
+            mappedKeys: Object.keys(next),
+            displayedSheetIds: Array.from(displayedIds),
+            cachedLabor,
+            prevLabor,
+            sectionLaborLive,
+          },
+        });
+      } else if (targetQuoteId && laborLineItemTotal > 0) {
+        saveQuoteLineItemsCache(targetQuoteId, next);
+      }
+    } else if (laborLineItemTotal === 0 && (prevLabor > 0 || cachedLabor > 0 || sectionLaborLive > 0)) {
+      finalMap = rekeyIfNeeded(JSON.parse(JSON.stringify(pickKeepMap())));
+      agentDebugLog({
+        runId: 'post-fix',
+        hypothesisId: 'H12-sameQuoteWipe',
+        location: 'JobFinancials.tsx:loadCustomRows:keepPrevOnSameQuoteEmpty',
+        message: 'same-quote reload mapped zero labor — keeping existing line items',
+        data: { targetQuoteId, prevLabor, cachedLabor, sectionLaborLive, cooperativeGen },
+      });
+    } else {
+      for (const parentId of Object.keys(prevItems || {})) {
+        const prevParentItems = prevItems[parentId] || [];
+        const optimistic = prevParentItems.filter((it: any) => String(it?.id || '').startsWith('optimistic_'));
+        const realItems = prevParentItems.filter((it: any) => !String(it?.id || '').startsWith('optimistic_'));
+        if (!next[parentId]?.length && realItems.length) {
+          next[parentId] = [...realItems];
+        }
         if (!optimistic.length) continue;
         const existingIds = new Set((next[parentId] || []).map((it: any) => String(it?.id || '')));
         const serverFp = new Set((next[parentId] || []).map((it: any) => lineItemOptimisticFingerprint(it)));
@@ -8187,7 +10730,53 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
         });
         if (toAdd.length) next[parentId] = [...(next[parentId] || []), ...toAdd];
       }
-      return next;
+
+      const mergedLabor = laborTotalFromLineItemsMap(next);
+      if (mergedLabor < prevLabor && prevLabor > 0) {
+        finalMap = rekeyIfNeeded(JSON.parse(JSON.stringify(pickKeepMap())));
+        agentDebugLog({
+          runId: 'post-fix',
+          hypothesisId: 'H12-sameQuoteWipe',
+          location: 'JobFinancials.tsx:loadCustomRows:keepPrevOnLaborDrop',
+          message: 'same-quote reload would reduce labor — keeping existing line items',
+          data: { targetQuoteId, prevLabor, mergedLabor, cooperativeGen },
+        });
+      } else {
+        finalMap = next;
+        if (targetQuoteId && mergedLabor > 0) {
+          saveQuoteLineItemsCache(targetQuoteId, next);
+        }
+      }
+    }
+
+    if (laborTotalFromLineItemsMap(finalMap) <= 0) {
+      const fallback = pickKeepMap();
+      const fallbackLabor = laborTotalFromLineItemsMap(fallback);
+      if (fallbackLabor > 0) {
+        finalMap = rekeyIfNeeded(JSON.parse(JSON.stringify(fallback)));
+        agentDebugLog({
+          runId: 'post-fix',
+          hypothesisId: 'H19-emptyCommit',
+          location: 'JobFinancials.tsx:loadCustomRows:finalFallback',
+          message: 'mapped reload empty — restored from cache/live before commit',
+          data: { targetQuoteId, fallbackLabor, cooperativeGen },
+        });
+      }
+    }
+
+    commitSheetLineItemsState(finalMap, targetQuoteId);
+    agentDebugLog({
+      runId: 'post-fix',
+      hypothesisId: 'H9-sheetLineItems',
+      location: 'JobFinancials.tsx:loadCustomRows:committed',
+      message: 'committed sheet line items to state',
+      data: {
+        targetQuoteId,
+        activeQuoteId: prevFinancialQuoteIdRef.current,
+        finalLabor: laborTotalFromLineItemsMap(finalMap),
+        quoteChanged,
+        cooperativeGen,
+      },
     });
   }
 
@@ -8519,7 +11108,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
     if (sheetId) {
       const existingLabor = sheetLabor[sheetId];
       const nativeSheetLabor =
-        existingLabor && sheetLaborCountsForDisplayedSection(existingLabor, sheetId) ? existingLabor : null;
+        existingLabor && isNativeMaterialSheetLabor(existingLabor, sheetId) ? existingLabor : null;
       setEditingLaborSheetId(sheetId);
       setEditingLaborRowId(null);
       
@@ -8568,7 +11157,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
       // Save material sheet labor
       const existingLabor = sheetLabor[editingLaborSheetId];
       const nativeExisting =
-        existingLabor && sheetLaborCountsForDisplayedSection(existingLabor, editingLaborSheetId)
+        existingLabor && isNativeMaterialSheetLabor(existingLabor, editingLaborSheetId)
           ? existingLabor
           : null;
       const laborData = {
@@ -10108,7 +12697,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
           const linkedRows = customRows.filter((r: any) => r.sheet_id === sheet.sheetId);
           const linkedSubs = linkedSubcontractors[sheet.sheetId] || [];
           
-          const linkedRowTotals = sumLinkedRowTotals(linkedRows, customRowLineItems);
+          const linkedRowTotals = sumLinkedRowTotals(linkedRows, displayCustomRowLineItems);
           
           const linkedSubsMaterialsTotal = sumLinkedSubMaterialsFromSubs(linkedSubs, subcontractorLineItems);
           
@@ -10122,7 +12711,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
             const baseSheetBd = materialsBreakdown.sheetBreakdowns.find((s: any) => s.sheetId === (sheet as any).compareToSheetId);
             if (baseSheetBd) {
               const baseLinkedRows2 = customRows.filter((r: any) => r.sheet_id === baseSheetBd.sheetId);
-              const baseLinkedRowTotals2 = sumLinkedRowTotals(baseLinkedRows2, customRowLineItems);
+              const baseLinkedRowTotals2 = sumLinkedRowTotals(baseLinkedRows2, displayCustomRowLineItems);
               const baseLinkedSubs2 = linkedSubcontractors[baseSheetBd.sheetId] || [];
               const baseLinkedSubsTotal2 = sumLinkedSubMaterialsFromSubs(baseLinkedSubs2, subcontractorLineItems);
               const baseCatTotals2 = (baseSheetBd.categories || []).reduce((s2: number, cat: any) => {
@@ -10143,7 +12732,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
                   ? Number(baseSheetLaborData.total_labor_cost) ||
                     Number(baseSheetLaborData.estimated_hours || 0) * Number(baseSheetLaborData.hourly_rate || 0)
                   : 0;
-              const baseSheetLaborLineItems2 = customRowLineItems[baseSheetBd.sheetId]?.filter((it: any) => (it.item_type || 'material') === 'labor') || [];
+              const baseSheetLaborLineItems2 = displayCustomRowLineItems[baseSheetBd.sheetId]?.filter((it: any) => (it.item_type || 'material') === 'labor') || [];
               const baseSheetLaborLineItemsTotal2 = baseSheetLaborLineItems2.reduce((s2: number, it: any) => s2 + (it.total_cost * (1 + (it.markup_percent || 0) / 100)), 0);
               const baseNonTaxable2 = baseLinkedSubs2.reduce((s2: number, sub: any) => {
                 const li2 = subcontractorLineItems[sub.id] || [];
@@ -10159,7 +12748,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
                   ? Number(optSheetLaborData.total_labor_cost) ||
                     Number(optSheetLaborData.estimated_hours || 0) * Number(optSheetLaborData.hourly_rate || 0)
                   : 0;
-              const optSheetLaborLineItems = customRowLineItems[sheet.sheetId]?.filter((it: any) => (it.item_type || 'material') === 'labor') || [];
+              const optSheetLaborLineItems = displayCustomRowLineItems[sheet.sheetId]?.filter((it: any) => (it.item_type || 'material') === 'labor') || [];
               const optSheetLaborLineItemsTotal = optSheetLaborLineItems.reduce((s2: number, it: any) => s2 + (it.total_cost * (1 + (it.markup_percent || 0) / 100)), 0);
               const optLinkedSubs2 = linkedSubcontractors[sheet.sheetId] || [];
               const optSubLabor = sumLinkedSubLaborFromSubs(optLinkedSubs2, subcontractorLineItems);
@@ -10196,7 +12785,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
             }
           }
           
-          const sheetFinancialLineItems = customRowLineItems[String(sheet.sheetId)] || [];
+          const sheetFinancialLineItems = displayCustomRowLineItems[String(sheet.sheetId)] || [];
           let materialPdfItems: Array<{
             description: string;
             quantity: number;
@@ -10232,7 +12821,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
                 Number(exportSheetLaborRow.estimated_hours || 0) * Number(exportSheetLaborRow.hourly_rate || 0)
               : 0;
           const exportLaborLineItems =
-            customRowLineItems[sheet.sheetId]?.filter((it: any) => (it.item_type || 'material') === 'labor') || [];
+            displayCustomRowLineItems[sheet.sheetId]?.filter((it: any) => (it.item_type || 'material') === 'labor') || [];
           const exportSheetLaborLineItemsTotal = exportLaborLineItems.reduce(
             (s2: number, it: any) => s2 + effectiveCustomRowLineItemBase(it) * (1 + (it.markup_percent || 0) / 100),
             0
@@ -10663,7 +13252,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
 
     // Linked custom rows (materials) — match section header math (per-line-item markup; no extra rowMarkup multiplier)
     const linkedRows = customRows.filter(r => (r as any).sheet_id === sheet.sheetId);
-    const linkedRowMat = sumLinkedRowMaterialTotals(linkedRows, customRowLineItems);
+    const linkedRowMat = sumLinkedRowMaterialTotals(linkedRows, displayCustomRowLineItems);
     let linkedRowsMaterialsTotal = linkedRowMat.materialTotal;
     let linkedRowsMaterialsTaxableOnly = linkedRowMat.materialTaxableOnly;
     // Linked subs attached to custom rows (materials only) — include subcontractor markup (section header behavior)
@@ -10701,7 +13290,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
     });
 
     // Sheet-level material line items (row_id null, sheet_id set) — same as section header total
-    const sheetMatLineItems = (customRowLineItems[sheet.sheetId] || []).filter(
+    const sheetMatLineItems = (displayCustomRowLineItems[sheet.sheetId] || []).filter(
       (item: any) => (item.item_type || 'material') === 'material'
     );
     const sheetMatLinePrice = sheetMatLineItems.reduce((sum: number, item: any) => {
@@ -10786,7 +13375,16 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
     const labor = sheetLabor[sheetId];
     
     // Add labor from sheet line items (labor type) - same formula as section display (cost + markup)
-    const sheetLineItems = customRowLineItems[sheetId] || [];
+    const msForSheet = materialSheets.find((m: any) => m.id === sheetId);
+    const bdForSheet = materialsBreakdown.sheetBreakdowns.find((s: any) => s.sheetId === sheetId);
+    const sheetLineItems = resolveCustomRowLineItemsForSheet(
+      displayCustomRowLineItems,
+      materialSheets,
+      sheetId,
+      bdForSheet?.sheetName ?? msForSheet?.sheet_name,
+      materialsBreakdown.sheetBreakdowns,
+      sheetMetaById,
+    );
     const sheetLaborLineItems = sheetLineItems.filter((item: any) => (item.item_type || 'material') === 'labor');
     const sheetLaborLineItemsTotal = sheetLaborLineItems.reduce((itemSum: number, item: any) => {
       const itemMarkup = item.markup_percent || 0;
@@ -10978,7 +13576,14 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
 
       const categoryMaterialsOnly = getSheetCategoryPriceSplit(sheetBd).materials;
 
-      const sheetMaterialItems = (customRowLineItems[sheetId] || []).filter(
+      const sheetMaterialItems = resolveCustomRowLineItemsForSheet(
+        displayCustomRowLineItems,
+        materialSheets,
+        sheetId,
+        sheetBd?.sheetName ?? sheet?.sheetName,
+        materialsBreakdown.sheetBreakdowns,
+        sheetMetaById,
+      ).filter(
         (item: any) => (item.item_type || 'material') === 'material'
       );
       const sheetMaterialLineItemsTotal = sheetMaterialItems.reduce((sum: number, item: any) => {
@@ -10987,7 +13592,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
       }, 0);
 
       const linkedRows = customRows.filter((r: any) => (r as any).sheet_id === sheetId);
-      const linkedRowTotals = sumLinkedRowTotals(linkedRows, customRowLineItems);
+      const linkedRowTotals = sumLinkedRowTotals(linkedRows, displayCustomRowLineItems);
       const linkedSubs = linkedSubcontractors[sheetId] || [];
       const linkedSubsMaterialsTotal = sumLinkedSubMaterialsFromSubs(linkedSubs, subcontractorLineItems);
 
@@ -11035,7 +13640,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
   }, [
     allItems,
     materialsBreakdown.sheetBreakdowns,
-    customRowLineItems,
+    displayCustomRowLineItems,
     customRows,
     linkedSubcontractors,
     subcontractorLineItems,
@@ -11959,7 +14564,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
                         setSheetMarkups={setSheetMarkups}
                         categoryMarkups={categoryMarkups}
                         setCategoryMarkups={setCategoryMarkups}
-                        customRowLineItems={customRowLineItems}
+                        customRowLineItems={displayCustomRowLineItems}
                         sheetLabor={sheetLabor}
                         customRowLabor={customRowLabor}
                         subcontractorLineItems={subcontractorLineItems}
@@ -11998,6 +14603,8 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
                         loadCustomRows={loadCustomRows}
                         loadSubcontractorEstimates={loadSubcontractorEstimates}
                         customRows={customRows}
+                        materialSheets={materialSheets}
+                        sheetMetaById={sheetMetaById}
                         savingMarkupsRef={savingMarkupsRef}
                         emptyNotesById={emptyNotesById}
                         setEmptyNotesById={setEmptyNotesById}
@@ -12079,7 +14686,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
                               setSheetMarkups={setSheetMarkups}
                               categoryMarkups={categoryMarkups}
                               setCategoryMarkups={setCategoryMarkups}
-                              customRowLineItems={customRowLineItems}
+                              customRowLineItems={displayCustomRowLineItems}
                               sheetLabor={sheetLabor}
                               customRowLabor={customRowLabor}
                               subcontractorLineItems={subcontractorLineItems}
@@ -12118,6 +14725,8 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
                               loadCustomRows={loadCustomRows}
                               loadSubcontractorEstimates={loadSubcontractorEstimates}
                               customRows={customRows}
+                              materialSheets={materialSheets}
+                              sheetMetaById={sheetMetaById}
                               savingMarkupsRef={savingMarkupsRef}
                               emptyNotesById={emptyNotesById}
                               setEmptyNotesById={setEmptyNotesById}
@@ -12199,7 +14808,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
                               setSheetMarkups={setSheetMarkups}
                               categoryMarkups={categoryMarkups}
                               setCategoryMarkups={setCategoryMarkups}
-                              customRowLineItems={customRowLineItems}
+                              customRowLineItems={displayCustomRowLineItems}
                               sheetLabor={sheetLabor}
                               customRowLabor={customRowLabor}
                               subcontractorLineItems={subcontractorLineItems}
@@ -12238,6 +14847,8 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
                               loadCustomRows={loadCustomRows}
                               loadSubcontractorEstimates={loadSubcontractorEstimates}
                               customRows={customRows}
+                              materialSheets={materialSheets}
+                              sheetMetaById={sheetMetaById}
                               savingMarkupsRef={savingMarkupsRef}
                               emptyNotesById={emptyNotesById}
                               setEmptyNotesById={setEmptyNotesById}

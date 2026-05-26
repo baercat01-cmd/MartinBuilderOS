@@ -1,5 +1,6 @@
 import { supabase } from '@/lib/supabase';
 import { isFieldRequestSheetName } from '@/lib/materialWorkbook';
+import { fetchJobQuotesForJob, jobHasMultipleFormalProposals } from '@/lib/quotesSchemaFallback';
 
 export type LoadProposalDataOptions = { forChangeOrderDocument?: boolean };
 export async function loadProposalDataForQuote(
@@ -9,6 +10,9 @@ export async function loadProposalDataForQuote(
     opts?: LoadProposalDataOptions
   ) {
     try {
+      const { data: jobQuotesForScope } = await fetchJobQuotesForJob(supabase, jobId);
+      const isolateFormalProposals = jobHasMultipleFormalProposals(jobQuotesForScope || []);
+
       const { data: coQuoteEarly } = await supabase
         .from('quotes')
         .select('id')
@@ -65,7 +69,7 @@ export async function loadProposalDataForQuote(
           workbookData = wb2 ?? null;
         }
       }
-      if (!workbookData) {
+      if (!workbookData && !isolateFormalProposals) {
         const { data: wb } = await supabase
           .from('material_workbooks')
           .select('id')
@@ -78,12 +82,16 @@ export async function loadProposalDataForQuote(
         workbookData = wb ?? null;
       }
       if (!workbookData) {
-        const { data: allWbs } = await supabase
+        let wbQuery = supabase
           .from('material_workbooks')
           .select('id')
           .eq('job_id', jobId)
           .order('status', { ascending: false })
           .order('updated_at', { ascending: false });
+        if (isolateFormalProposals && quoteId) {
+          wbQuery = wbQuery.eq('quote_id', quoteId);
+        }
+        const { data: allWbs } = await wbQuery;
         workbookData = (allWbs || [])[0] ?? null;
       }
 
@@ -128,17 +136,22 @@ export async function loadProposalDataForQuote(
         // proposal sections match what office users see in Proposal/Materials.
         const { data: allWbs } = await supabase
           .from('material_workbooks')
-          .select('id')
+          .select('id, quote_id')
           .eq('job_id', jobId)
           .order('status', { ascending: false })
           .order('updated_at', { ascending: false });
+
+        const comparableWbs = (allWbs || []).filter((wb: { id: string; quote_id?: string | null }) => {
+          if (wb.id === workbookData!.id) return false;
+          if (isolateFormalProposals && quoteId) return wb.quote_id === quoteId;
+          return true;
+        });
 
         // Prefer workbooks with more proposal sections/descriptions; item count is only a tie-breaker.
         const score = (s: { describedSheetsCount: number; sheetsCount: number; itemsCount: number }) =>
           (s.describedSheetsCount * 1_000_000) + (s.sheetsCount * 1_000) + s.itemsCount;
         let best = await summarizeWorkbook(workbookData.id);
-        for (const wb of allWbs || []) {
-          if (wb.id === workbookData.id) continue;
+        for (const wb of comparableWbs) {
           const candidate = await summarizeWorkbook(wb.id);
           if (score(candidate) > score(best)) best = candidate;
         }
@@ -273,9 +286,13 @@ export async function loadProposalDataForQuote(
           supabase.from('custom_financial_rows').select('*, custom_financial_row_items(*)').eq('quote_id', quoteId).order('order_index'),
           supabase.from('custom_financial_rows').select('*, custom_financial_row_items(*)').eq('job_id', jobId).is('quote_id', null).order('order_index'),
         ]);
-        const quoteRowIds = new Set((forQuote.data || []).map((r: any) => r.id));
-        const jobOnlyRows = (forJob.data || []).filter((r: any) => !quoteRowIds.has(r.id));
-        customRowsData = [...(forQuote.data || []), ...jobOnlyRows].sort((a, b) => (a.order_index ?? 0) - (b.order_index ?? 0));
+        customRowsData = [...(forQuote.data || [])];
+        if (!isolateFormalProposals) {
+          const quoteRowIds = new Set((forQuote.data || []).map((r: any) => r.id));
+          const jobOnlyRows = (forJob.data || []).filter((r: any) => !quoteRowIds.has(r.id));
+          customRowsData = [...customRowsData, ...jobOnlyRows];
+        }
+        customRowsData.sort((a, b) => (a.order_index ?? 0) - (b.order_index ?? 0));
       } else {
         const { data } = await supabase.from('custom_financial_rows').select('*, custom_financial_row_items(*)').eq('job_id', jobId).order('order_index');
         customRowsData = data || [];
@@ -288,9 +305,13 @@ export async function loadProposalDataForQuote(
           supabase.from('subcontractor_estimates').select('*, subcontractor_estimate_line_items(*)').eq('quote_id', quoteId).order('order_index'),
           supabase.from('subcontractor_estimates').select('*, subcontractor_estimate_line_items(*)').eq('job_id', jobId).is('quote_id', null).order('order_index'),
         ]);
-        const quoteSubIds = new Set((forQuote.data || []).map((r: any) => r.id));
-        const jobOnlySubs = (forJob.data || []).filter((r: any) => !quoteSubIds.has(r.id));
-        subEstimatesData = [...(forQuote.data || []), ...jobOnlySubs].sort((a, b) => (a.order_index ?? 0) - (b.order_index ?? 0));
+        subEstimatesData = [...(forQuote.data || [])];
+        if (!isolateFormalProposals) {
+          const quoteSubIds = new Set((forQuote.data || []).map((r: any) => r.id));
+          const jobOnlySubs = (forJob.data || []).filter((r: any) => !quoteSubIds.has(r.id));
+          subEstimatesData = [...subEstimatesData, ...jobOnlySubs];
+        }
+        subEstimatesData.sort((a, b) => (a.order_index ?? 0) - (b.order_index ?? 0));
       } else {
         const { data } = await supabase.from('subcontractor_estimates').select('*, subcontractor_estimate_line_items(*)').eq('job_id', jobId).order('order_index');
         subEstimatesData = data || [];

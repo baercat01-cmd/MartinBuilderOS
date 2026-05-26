@@ -3,6 +3,7 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react-swc";
 import { VitePWA } from "vite-plugin-pwa";
 import path from "path";
+import fs from "fs";
 
 // https://vitejs.dev/config/
 export default defineConfig({
@@ -26,6 +27,32 @@ export default defineConfig({
   },
   plugins: [
     react(),
+    {
+      name: "debug-log-ingest",
+      configureServer(server) {
+        const logPath = path.join(__dirname, ".cursor", "debug-ca9250.log");
+        server.middlewares.use("/__debug/log", (req, res, next) => {
+          if (req.method !== "POST") {
+            next();
+            return;
+          }
+          let body = "";
+          req.on("data", (chunk) => {
+            body += chunk;
+          });
+          req.on("end", () => {
+            try {
+              fs.mkdirSync(path.dirname(logPath), { recursive: true });
+              fs.appendFileSync(logPath, `${body.trim()}\n`);
+            } catch {
+              /* ignore */
+            }
+            res.statusCode = 204;
+            res.end();
+          });
+        });
+      },
+    },
     VitePWA({
       registerType: "autoUpdate",
       includeAssets: ["martin-logo.png", "favicon.ico"],

@@ -1,6 +1,7 @@
-import { useState, useEffect, lazy, Suspense } from 'react';
+import { useState, useEffect, useCallback, useRef, lazy, Suspense } from 'react';
 import { useAuth } from '@/hooks/useAuth';
 import { supabase } from '@/lib/supabase';
+import { fetchJobQuotesForJob } from '@/lib/quotesSchemaFallback';
 import { isQuoteContractFrozen } from '@/lib/quoteProposalLock';
 import type { Job } from '@/types';
 import { DocumentPanelContext } from '@/contexts/DocumentPanelContext';
@@ -40,21 +41,45 @@ export function ProposalAndMaterialsView({ job, userId: userIdProp, viewMode: vi
   const [showDocumentsInPanel, setShowDocumentsInPanel] = useState(false);
   const [breakdownSheetPrices, setBreakdownSheetPrices] = useState<BreakdownSheetPrice[]>([]);
   const [materialsWorkbookView, setMaterialsWorkbookView] = useState<{ workbookId: string | null; status: 'working' | 'locked' | null } | null>(null);
+  const [materialsWorkbookReady, setMaterialsWorkbookReady] = useState(true);
+  const [materialsSyncGen, setMaterialsSyncGen] = useState(0);
   const [jobWorkbookMaterialsTotal, setJobWorkbookMaterialsTotal] = useState<number | null>(null);
   /** Session-only unlock; shared with JobFinancials + Materials so the proposal workbook matches the left panel lock. */
   const [historicalUnlockedQuoteId, setHistoricalUnlockedQuoteId] = useState<string | null>(null);
+  /** JobFinancials already bumps syncGen via handleJobFinancialsQuoteChange — skip duplicate in selectedQuoteId effect. */
+  const quoteChangeFromFinancialsRef = useRef(false);
 
   const isControlled = controlledQuoteId !== undefined;
   const selectedQuoteId = isControlled ? (controlledQuoteId ?? null) : internalQuoteId;
   const setSelectedQuoteId = isControlled ? (onQuoteChange ?? (() => {})) : setInternalQuoteId;
 
+  const handleJobFinancialsQuoteChange = useCallback(
+    (quoteId: string | null) => {
+      quoteChangeFromFinancialsRef.current = true;
+      setMaterialsWorkbookReady(false);
+      setMaterialsWorkbookView(null);
+      setBreakdownSheetPrices([]);
+      setMaterialsSyncGen((g) => g + 1);
+      if (isControlled) {
+        onQuoteChange?.(quoteId);
+      } else {
+        setInternalQuoteId(quoteId);
+      }
+    },
+    [isControlled, onQuoteChange],
+  );
+
   useEffect(() => {
+    if (quoteChangeFromFinancialsRef.current) {
+      quoteChangeFromFinancialsRef.current = false;
+      return;
+    }
     setJobWorkbookMaterialsTotal(null);
     setHistoricalUnlockedQuoteId(null);
-    // Avoid applying the previous proposal's workbook breakdown / view to the newly selected quote
-    // (Materials may still hold the old workbook for one frame while loadWorkbook runs).
     setBreakdownSheetPrices([]);
     setMaterialsWorkbookView(null);
+    setMaterialsWorkbookReady(false);
+    setMaterialsSyncGen((g) => g + 1);
   }, [selectedQuoteId]);
 
   // When uncontrolled and job changes, set proposal to most recent only if we don't already have a valid selection for this job
@@ -62,13 +87,7 @@ export function ProposalAndMaterialsView({ job, userId: userIdProp, viewMode: vi
     if (isControlled) return;
     let mounted = true;
     (async () => {
-      const { data: quotes, error } = await supabase
-        .from('quotes')
-        .select(
-          'id, proposal_number, quote_number, estimate_number, is_customer_estimate, created_at, sent_at, locked_for_editing, signed_version, customer_signed_at, is_change_order_proposal'
-        )
-        .eq('job_id', job.id)
-        .order('created_at', { ascending: false });
+      const { data: quotes, error } = await fetchJobQuotesForJob(supabase, job.id);
       if (!mounted) return;
       if (error || !quotes?.length) {
         setInternalQuoteId(null);
@@ -137,13 +156,16 @@ export function ProposalAndMaterialsView({ job, userId: userIdProp, viewMode: vi
               <JobFinancials
                 job={job}
                 controlledQuoteId={selectedQuoteId ?? undefined}
-                onQuoteChange={setSelectedQuoteId}
+                onQuoteChange={handleJobFinancialsQuoteChange}
                 onSheetSelect={setLinkedSheetId}
                 externalBreakdownSheetPrices={breakdownSheetPrices}
                 externalMaterialsWorkbookView={materialsWorkbookView}
                 externalJobWorkbookMaterialsTotal={jobWorkbookMaterialsTotal}
                 historicalUnlockedQuoteId={historicalUnlockedQuoteId}
                 onHistoricalUnlockedQuoteIdChange={setHistoricalUnlockedQuoteId}
+                materialsPanelActive={showMaterials}
+                materialsWorkbookReady={showMaterials ? materialsWorkbookReady : true}
+                materialsSyncGen={materialsSyncGen}
               />
             </div>
           </div>
@@ -170,10 +192,11 @@ export function ProposalAndMaterialsView({ job, userId: userIdProp, viewMode: vi
                   job={job}
                   userId={userId}
                   controlledQuoteId={selectedQuoteId ?? undefined}
-                  onQuoteChange={setSelectedQuoteId}
+                  onQuoteChange={handleJobFinancialsQuoteChange}
                   externalActiveSheetId={linkedSheetId}
                   onBreakdownPriceSync={setBreakdownSheetPrices}
                   onWorkbookViewSync={setMaterialsWorkbookView}
+                  onWorkbookLoadSettled={() => setMaterialsWorkbookReady(true)}
                   onJobWorkbookMaterialsTotalSync={setJobWorkbookMaterialsTotal}
                   historicalUnlockedQuoteId={historicalUnlockedQuoteId}
                   jobWorkbookMaterialsTotalForStrip={

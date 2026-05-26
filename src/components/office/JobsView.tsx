@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useMemo } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useSearchParams } from 'react-router-dom';
 import { supabase } from '@/lib/supabase';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -49,36 +49,177 @@ import { Warehouse, ShoppingCart } from 'lucide-react';
 import { JobBudgetManagement } from './JobBudgetManagement';
 import { MaterialOrdersManagement } from './MaterialOrdersManagement';
 import { isAbortLikeError } from '@/lib/error-handler';
+import {
+  readPersistedOpenJobId,
+  readPersistedOpenJobTab,
+  persistOpenJob,
+  agentLog,
+} from '@/lib/officeViewPersistence';
 
 interface JobsViewProps {
   showArchived?: boolean;
   selectedJobId?: string | null;
   openMaterialsTab?: boolean; // New prop to auto-open materials tab
   onAddTask?: () => void; // Callback to open task creation dialog
+  onOpenJobChange?: (jobId: string | null) => void;
+  /** When false, hide the job dialog but keep internal state (e.g. user switched office tabs). */
+  jobsTabActive?: boolean;
+  /** When true, hide the jobs list UI but keep the detail dialog mountable. */
+  hideJobList?: boolean;
+  /** Parent owns the fullscreen job dialog (OfficeDashboard). */
+  delegateJobDialog?: boolean;
+  onRequestOpenJob?: (job: Job, tab?: string) => void;
+  onRequestCloseJob?: () => void;
 }
 
-export function JobsView({ showArchived = false, selectedJobId, openMaterialsTab = false, onAddTask }: JobsViewProps) {
+export function JobsView({
+  showArchived = false,
+  selectedJobId,
+  openMaterialsTab = false,
+  onAddTask,
+  onOpenJobChange,
+  jobsTabActive = true,
+  hideJobList = false,
+  delegateJobDialog = false,
+  onRequestOpenJob,
+  onRequestCloseJob,
+}: JobsViewProps) {
   const { profile } = useAuth();
+  const [searchParams, setSearchParams] = useSearchParams();
   const [jobs, setJobs] = useState<Job[]>([]);
   const [loading, setLoading] = useState(true);
   const [showCreateDialog, setShowCreateDialog] = useState(false);
   const [showEditDialog, setShowEditDialog] = useState(false);
   const [selectedJob, setSelectedJob] = useState<Job | null>(null);
   /** Single source of truth for which job the detail dialog is for. Used for portal link so it never points at the wrong job. */
-  const [detailDialogJobId, setDetailDialogJobId] = useState<string | null>(null);
+  const initialOpenJobId = (() => {
+    if (typeof window === 'undefined') return null;
+    const params = new URLSearchParams(window.location.search);
+    return params.get('jobId') || readPersistedOpenJobId();
+  })();
+  const [detailDialogJobId, setDetailDialogJobId] = useState<string | null>(initialOpenJobId);
   /** Ref set synchronously when dialog opens so portal "Save & create link" always uses the job the user opened (avoids stale state). */
-  const portalJobIdRef = useRef<string | null>(null);
-  const [selectedTab, setSelectedTab] = useState('overview');
+  const portalJobIdRef = useRef<string | null>(initialOpenJobId);
+  const [selectedTab, setSelectedTab] = useState(() => {
+    if (typeof window === 'undefined') return 'overview';
+    const params = new URLSearchParams(window.location.search);
+    return params.get('jobTab') || readPersistedOpenJobTab() || 'overview';
+  });
+  const restoredJobRef = useRef(false);
+  const selectedJobRef = useRef<Job | null>(null);
+  const jobsRef = useRef(jobs);
+  const loadingRef = useRef(loading);
+  const selectedTabRef = useRef(selectedTab);
+  const detailDialogJobIdRef = useRef(detailDialogJobId);
+  const searchParamsRef = useRef(searchParams);
+  selectedJobRef.current = selectedJob;
+  jobsRef.current = jobs;
+  loadingRef.current = loading;
+  selectedTabRef.current = selectedTab;
+  detailDialogJobIdRef.current = detailDialogJobId;
+  searchParamsRef.current = searchParams;
 
-  function openJobDetail(job: Job) {
+  function syncJobToUrl(jobId: string | null, tab?: string | null) {
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      if (jobId) {
+        next.set('jobId', jobId);
+        if (tab) next.set('jobTab', tab);
+      } else {
+        next.delete('jobId');
+        next.delete('jobTab');
+      }
+      return next;
+    }, { replace: true });
+  }
+
+  function tryRestoreOpenJob(source: string) {
+    if (selectedJobRef.current) {
+      agentLog({ location: 'JobsView.tsx:tryRestoreOpenJob', message: 'skip: selectedJob set', data: { source }, hypothesisId: 'H' });
+      return false;
+    }
+    if (loadingRef.current) {
+      agentLog({ location: 'JobsView.tsx:tryRestoreOpenJob', message: 'skip: still loading', data: { source }, hypothesisId: 'H' });
+      return false;
+    }
+    if (jobsRef.current.length === 0) {
+      agentLog({ location: 'JobsView.tsx:tryRestoreOpenJob', message: 'skip: no jobs', data: { source }, hypothesisId: 'H' });
+      return false;
+    }
+    const urlJobId = searchParamsRef.current.get('jobId');
+    const persistedId = urlJobId || selectedJobId || readPersistedOpenJobId() || detailDialogJobIdRef.current;
+    if (!persistedId) {
+      agentLog({ location: 'JobsView.tsx:tryRestoreOpenJob', message: 'skip: no persisted id', data: { source, urlJobId }, hypothesisId: 'H' });
+      return false;
+    }
+    const job = jobsRef.current.find((j) => j.id === persistedId);
+    if (!job) {
+      agentLog({ location: 'JobsView.tsx:tryRestoreOpenJob', message: 'skip: job not in list', data: { source, persistedId }, hypothesisId: 'H' });
+      return false;
+    }
+    const tab =
+      searchParamsRef.current.get('jobTab') ||
+      readPersistedOpenJobTab() ||
+      (openMaterialsTab ? 'proposal-materials' : 'overview');
+    setSelectedTab(tab);
+    openJobDetail(job, tab);
+    agentLog({
+      location: 'JobsView.tsx:tryRestoreOpenJob',
+      message: 'restored persisted job',
+      data: { source, jobId: persistedId, tab, urlJobId },
+      hypothesisId: 'F',
+      runId: 'post-fix',
+    });
+    return true;
+  }
+
+  function handleJobDialogOpenChange(open: boolean) {
+    agentLog({
+      location: 'JobsView.tsx:handleJobDialogOpenChange',
+      message: 'dialog onOpenChange',
+      data: {
+        open,
+        visibility: document.visibilityState,
+        persistedJobId: readPersistedOpenJobId(),
+        detailDialogJobId: detailDialogJobIdRef.current,
+        hasSelectedJob: !!selectedJobRef.current,
+      },
+      hypothesisId: 'E',
+      runId: 'post-fix',
+    });
+    if (open) return;
+  }
+
+  function openJobDetail(job: Job, tab?: string) {
+    const effectiveTab = tab ?? selectedTab;
+    if (delegateJobDialog && onRequestOpenJob) {
+      setSelectedTab(effectiveTab);
+      onRequestOpenJob(job, effectiveTab);
+      agentLog({ location: 'JobsView.tsx:openJobDetail', message: 'delegated openJobDetail', data: { jobId: job.id, tab: effectiveTab }, hypothesisId: 'J' });
+      return;
+    }
     portalJobIdRef.current = job.id;
     setSelectedJob(job);
     setDetailDialogJobId(job.id);
+    setSelectedTab(effectiveTab);
+    persistOpenJob(job.id, effectiveTab);
+    syncJobToUrl(job.id, effectiveTab);
+    onOpenJobChange?.(job.id);
+    agentLog({ location: 'JobsView.tsx:openJobDetail', message: 'openJobDetail', data: { jobId: job.id, tab: effectiveTab }, hypothesisId: 'F' });
   }
   function closeJobDetail() {
+    if (delegateJobDialog && onRequestCloseJob) {
+      onRequestCloseJob();
+      agentLog({ location: 'JobsView.tsx:closeJobDetail', message: 'delegated closeJobDetail', data: {}, hypothesisId: 'J' });
+      return;
+    }
     portalJobIdRef.current = null;
     setSelectedJob(null);
     setDetailDialogJobId(null);
+    persistOpenJob(null);
+    syncJobToUrl(null);
+    onOpenJobChange?.(null);
+    agentLog({ location: 'JobsView.tsx:closeJobDetail', message: 'closeJobDetail', data: { visibility: document.visibilityState }, hypothesisId: 'B' });
   }
   const [stats, setStats] = useState<Record<string, any>>({});
   const [statusFilter, setStatusFilter] = useState<'active' | 'quoting' | 'on_hold'>('active');
@@ -189,31 +330,125 @@ export function JobsView({ showArchived = false, selectedJobId, openMaterialsTab
     };
   }, []);
 
-  // PWA / bfcache: restoring the page can bring back an open job dialog; close so reopen lands on jobs home.
+  // #region agent log
   useEffect(() => {
+    agentLog({
+      location: 'JobsView.tsx:mount',
+      message: 'JobsView mounted',
+      data: {
+        initialOpenJobId,
+        jobsTabActive,
+        persistedJobId: readPersistedOpenJobId(),
+        url: typeof window !== 'undefined' ? window.location.search : '',
+      },
+      hypothesisId: 'H',
+    });
+  }, []);
+  // #endregion
+
+  // Keep dialog job id in sync when parent sets selectedJobId (e.g. after app resume).
+  useEffect(() => {
+    if (delegateJobDialog) return;
+    if (!selectedJobId) return;
+    if (detailDialogJobId !== selectedJobId) {
+      setDetailDialogJobId(selectedJobId);
+      portalJobIdRef.current = selectedJobId;
+      const tab = searchParams.get('jobTab') || readPersistedOpenJobTab() || selectedTab;
+      persistOpenJob(selectedJobId, tab);
+      syncJobToUrl(selectedJobId, tab);
+    }
+  }, [selectedJobId, detailDialogJobId, searchParams, selectedTab]);
+
+  // Hydrate selectedJob when jobs list loads and we already know which job should be open.
+  useEffect(() => {
+    if (delegateJobDialog) return;
+    if (selectedJob || !detailDialogJobId || jobs.length === 0) return;
+    const job = jobs.find((j) => j.id === detailDialogJobId);
+    if (job) {
+      setSelectedJob(job);
+      agentLog({
+        location: 'JobsView.tsx:hydrateSelectedJob',
+        message: 'hydrated selectedJob from detailDialogJobId',
+        data: { jobId: detailDialogJobId },
+        hypothesisId: 'H',
+      });
+    }
+  }, [jobs, selectedJob, detailDialogJobId]);
+
+  // Restore open job after reload/remount or when URL has jobId but dialog is closed.
+  useEffect(() => {
+    if (delegateJobDialog) return;
+    if (restoredJobRef.current && selectedJob) return;
+    if (tryRestoreOpenJob('mount-or-url')) restoredJobRef.current = true;
+  }, [jobs, loading, selectedJob, selectedJobId, openMaterialsTab, searchParams]);
+
+  // Re-open from URL if dialog was lost while app was backgrounded.
+  useEffect(() => {
+    if (delegateJobDialog) return;
+    const urlJobId = searchParams.get('jobId');
+    if (!urlJobId || selectedJob || loading || jobs.length === 0) return;
+    tryRestoreOpenJob('url-watch');
+  }, [searchParams, jobs, loading, selectedJob]);
+
+  // Snapshot on hide; restore on visible if the dialog was lost while backgrounded.
+  useEffect(() => {
+    if (delegateJobDialog) return;
+    const onVis = () => {
+      if (document.visibilityState === 'hidden') {
+        const jobId = detailDialogJobIdRef.current || portalJobIdRef.current;
+        if (jobId) persistOpenJob(jobId, readPersistedOpenJobTab() || selectedTabRef.current);
+        agentLog({ location: 'JobsView.tsx:visibility:hidden', message: 'snapshot open job', data: { jobId }, hypothesisId: 'E', runId: 'post-fix' });
+        return;
+      }
+      agentLog({
+        location: 'JobsView.tsx:visibility:visible',
+        message: 'attempt restore',
+        data: { persistedJobId: readPersistedOpenJobId(), hasSelectedJob: !!selectedJobRef.current },
+        hypothesisId: 'E',
+        runId: 'post-fix',
+      });
+      tryRestoreOpenJob('visibility');
+    };
+    document.addEventListener('visibilitychange', onVis);
+    return () => document.removeEventListener('visibilitychange', onVis);
+  }, [selectedJobId, openMaterialsTab]);
+
+  // #region agent log
+  useEffect(() => {
+    if (delegateJobDialog) return;
     const onPageShow = (e: PageTransitionEvent) => {
-      if (e.persisted) closeJobDetail();
+      agentLog({
+        location: 'JobsView.tsx:pageshow',
+        message: 'pageshow',
+        data: { persisted: e.persisted, persistedJobId: readPersistedOpenJobId(), hasSelectedJob: !!selectedJob },
+        hypothesisId: 'B',
+      });
+      if (e.persisted) tryRestoreOpenJob('pageshow');
     };
     window.addEventListener('pageshow', onPageShow as EventListener);
     return () => window.removeEventListener('pageshow', onPageShow as EventListener);
-  }, []);
+  }, [selectedJob]);
+  // #endregion
 
   // When dialog is closed, open the job for selectedJobId (e.g. from notification or calendar).
   // When dialog is already open, do NOT overwrite selectedJob — otherwise the detail view would
   // switch to another job (e.g. last created) and "Save & create link" would create for the wrong job.
   useEffect(() => {
     if (!selectedJobId) return;
-    const job = jobs.find(j => j.id === selectedJobId);
+    const job = jobs.find((j) => j.id === selectedJobId);
     if (!job) return;
-    // Only sync when no job is currently selected (dialog closed). If user has a job open, leave it.
+    if (selectedJob?.id === selectedJobId) return;
     if (selectedJob) return;
-    openJobDetail(job);
-    setSelectedTab('proposal-materials');
+    const tab =
+      searchParams.get('jobTab') ||
+      readPersistedOpenJobTab() ||
+      (openMaterialsTab ? 'proposal-materials' : selectedTab);
+    openJobDetail(job, tab);
     setTimeout(() => {
       const element = document.getElementById(`job-${selectedJobId}`);
       if (element) element.scrollIntoView({ behavior: 'smooth', block: 'center' });
     }, 100);
-  }, [selectedJobId, jobs, openMaterialsTab, selectedJob]);
+  }, [selectedJobId, jobs, openMaterialsTab, selectedJob, searchParams, selectedTab]);
 
   async function loadJobs() {
     try {
@@ -681,7 +916,8 @@ export function JobsView({ showArchived = false, selectedJobId, openMaterialsTab
   }
 
   return (
-    <div className="flex flex-col lg:flex-row gap-3 sm:gap-6">
+    <>
+    <div className={hideJobList ? 'hidden' : 'flex flex-col lg:flex-row gap-3 sm:gap-6'} aria-hidden={hideJobList}>
       {/* Left Sidebar - Today's Tasks */}
       {!showArchived && (
         <div className="w-full lg:w-80 flex-shrink-0 overflow-hidden relative max-h-[400px] lg:max-h-[calc(100vh-12rem)]">
@@ -689,9 +925,8 @@ export function JobsView({ showArchived = false, selectedJobId, openMaterialsTab
           <div className="absolute top-0 right-0 w-1 h-full bg-gradient-to-b from-yellow-500 via-yellow-600 to-yellow-700 opacity-80 rounded-full"></div>
           <TodayTasksSidebar 
             onJobSelect={(jobId) => {
-              const j = jobs.find(j => j.id === jobId) || null;
-              openJobDetail(j);
-              if (j) setSelectedTab('proposal-materials');
+              const j = jobs.find((j) => j.id === jobId) || null;
+              if (j) openJobDetail(j, 'proposal-materials');
             }}
             onAddTask={onAddTask}
           />
@@ -2317,16 +2552,23 @@ export function JobsView({ showArchived = false, selectedJobId, openMaterialsTab
           </div>
         </DialogContent>
       </Dialog>
+    </div>
 
-      {/* Job Details Dialog - Full Screen */}
-      {/* Resolve job from detailDialogJobId so portal link and content always match the job the user opened */}
-      {(() => {
-        const dialogJob = selectedJob && detailDialogJobId
+      {/* Job Details Dialog - Full Screen (archived / internal only; main jobs tab uses OfficeOpenJobDialog) */}
+      {!delegateJobDialog && (() => {
+        const dialogJob = detailDialogJobId
           ? (jobs.find(j => j.id === detailDialogJobId) ?? selectedJob)
           : selectedJob;
+        const dialogOpen = !!detailDialogJobId && jobsTabActive;
         return (
-          <Dialog open={!!selectedJob} onOpenChange={() => closeJobDetail()}>
-            <DialogContent className="h-screen w-screen max-w-none flex flex-col p-0 m-0 rounded-none">
+          <Dialog open={dialogOpen} onOpenChange={handleJobDialogOpenChange}>
+            <DialogContent
+              className="h-screen w-screen max-w-none flex flex-col p-0 m-0 rounded-none"
+              showCloseButton={false}
+              onInteractOutside={(e) => e.preventDefault()}
+              onPointerDownOutside={(e) => e.preventDefault()}
+              onEscapeKeyDown={() => closeJobDetail()}
+            >
               <DialogHeader className="px-2 pt-2 pb-2 border-b shrink-0 bg-white">
                 <div className="flex items-center justify-between">
                   <DialogTitle className="text-xl">
@@ -2344,7 +2586,7 @@ export function JobsView({ showArchived = false, selectedJobId, openMaterialsTab
                   </Button>
                 </div>
               </DialogHeader>
-              {dialogJob && (
+              {dialogJob ? (
                 <div className="flex-1 overflow-y-auto w-full">
                   <JobDetailedView
                     job={dialogJob}
@@ -2356,13 +2598,22 @@ export function JobsView({ showArchived = false, selectedJobId, openMaterialsTab
                     }}
                     onJobUpdate={reloadSelectedJob}
                     initialTab={selectedTab}
+                    onTabChange={(tab) => {
+                      setSelectedTab(tab);
+                      const jobId = portalJobIdRef.current ?? detailDialogJobId;
+                      if (jobId) syncJobToUrl(jobId, tab);
+                    }}
                   />
+                </div>
+              ) : (
+                <div className="flex-1 flex items-center justify-center text-muted-foreground">
+                  Loading job…
                 </div>
               )}
             </DialogContent>
           </Dialog>
         );
       })()}
-    </div>
+    </>
   );
 }

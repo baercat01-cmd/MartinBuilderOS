@@ -2,6 +2,12 @@ import { useState, useEffect, useRef, Fragment, useMemo } from 'react';
 import { createPortal } from 'react-dom';
 import { useNavigate } from 'react-router-dom';
 import { supabase } from '@/lib/supabase';
+import {
+  fetchChangeOrderQuoteForJob,
+  fetchJobQuotesForJob,
+  fetchQuoteContractRowWithId,
+} from '@/lib/quotesSchemaFallback';
+import { isWorkbookQuoteMismatch } from '@/lib/proposalIsolation';
 import { FunctionsHttpError } from '@supabase/supabase-js';
 import { useMaterialsToolbarSlot } from '@/contexts/JobDetailMaterialsToolbarContext';
 
@@ -80,6 +86,10 @@ function isFlatstockColumnMissingError(message: string): boolean {
     m.includes('flatstock_width_inches') &&
     (m.includes('schema cache') || m.includes('could not find'))
   );
+}
+
+async function fetchJobQuotesForMaterials(jobId: string) {
+  return fetchJobQuotesForJob(supabase, jobId);
 }
 /** Long “add DB column” warning only once per tab session so switching 41″/42″ isn’t noisy. */
 const FLATSTOCK_SCHEMA_WARN_SESSION_KEY = 'mb_flatstock_schema_warn_shown_v1';
@@ -309,6 +319,8 @@ interface MaterialsManagementProps {
   onBreakdownPriceSync?: (prices: BreakdownSheetPrice[]) => void;
   /** Sync which workbook (working vs locked) the materials panel is currently viewing. */
   onWorkbookViewSync?: (view: { workbookId: string | null; status: 'working' | 'locked' | null }) => void;
+  /** Fired when the outermost loadWorkbook finishes (success or failure) for the active quote. */
+  onWorkbookLoadSettled?: () => void;
   /** Signed contract: extended sell total of the job workbook (`working` row) for display separate from proposal materials. */
   onJobWorkbookMaterialsTotalSync?: (total: number | null) => void;
   /** Session unlock from split-view parent — matches JobFinancials read-only so the proposal workbook locks with the left panel. */
@@ -335,6 +347,7 @@ export function MaterialsManagement({
   externalActiveSheetId,
   onBreakdownPriceSync,
   onWorkbookViewSync,
+  onWorkbookLoadSettled,
   onJobWorkbookMaterialsTotalSync,
   historicalUnlockedQuoteId = null,
   jobWorkbookMaterialsTotalForStrip,
@@ -380,6 +393,16 @@ export function MaterialsManagement({
   categoryNameEditRef.current = categoryNameEdit;
   const skipCategoryRenameBlurRef = useRef(false);
   const categoryRenameInFlightRef = useRef(false);
+  const [sheetNameEdit, setSheetNameEdit] = useState<{
+    sheetId: string;
+    oldName: string;
+    value: string;
+  } | null>(null);
+  const [savingSheetRename, setSavingSheetRename] = useState(false);
+  const sheetNameEditRef = useRef(sheetNameEdit);
+  sheetNameEditRef.current = sheetNameEdit;
+  const skipSheetRenameBlurRef = useRef(false);
+  const sheetRenameInFlightRef = useRef(false);
   const [metalCatalogBySku, setMetalCatalogBySku] = useState<Record<string, { purchase_cost: number; unit_price: number }>>({});
   const scrollPositionRef = useRef<number>(0);
 
@@ -394,6 +417,7 @@ export function MaterialsManagement({
 
   useEffect(() => {
     setCategoryNameEdit(null);
+    setSheetNameEdit(null);
   }, [activeSheetId]);
 
   // Split view sync: when left panel selects a sheet, mirror it in Materials tabs/selectors.
@@ -1113,11 +1137,7 @@ export function MaterialsManagement({
   useEffect(() => {
     let mounted = true;
     (async () => {
-      const { data, error } = await supabase
-        .from('quotes')
-        .select('id, proposal_number, quote_number, estimate_number, is_customer_estimate, created_at, sent_at, locked_for_editing, is_change_order_proposal, signed_version, customer_signed_at')
-        .eq('job_id', job.id)
-        .order('created_at', { ascending: false });
+      const { data, error } = await fetchJobQuotesForMaterials(job.id);
       if (!mounted) return;
       if (error) {
         console.error('Error loading job quotes:', error);
@@ -1146,11 +1166,7 @@ export function MaterialsManagement({
     if (!isControlled || !effectiveQuoteId || jobQuotes.some((q: any) => q.id === effectiveQuoteId)) return;
     let mounted = true;
     (async () => {
-      const { data, error } = await supabase
-        .from('quotes')
-        .select('id, proposal_number, quote_number, estimate_number, is_customer_estimate, created_at, sent_at, locked_for_editing, is_change_order_proposal, signed_version, customer_signed_at')
-        .eq('job_id', job.id)
-        .order('created_at', { ascending: false });
+      const { data, error } = await fetchJobQuotesForMaterials(job.id);
       if (!mounted) return;
       if (error) return;
       const quotes = (data || []) as JobQuote[];
@@ -1178,21 +1194,17 @@ export function MaterialsManagement({
       return;
     }
     (async () => {
-      const { data, error } = await supabase
-        .from('quotes')
-        .select('sent_at, locked_for_editing, signed_version, customer_signed_at')
-        .eq('id', effectiveQuoteId)
-        .maybeSingle();
+      const { data, error } = await fetchQuoteContractRow(supabase, effectiveQuoteId);
       if (cancelled) return;
       if (error || !data) {
         setContractQuoteFields(null);
         return;
       }
       setContractQuoteFields({
-        sent_at: data.sent_at ?? null,
-        locked_for_editing: data.locked_for_editing ?? null,
-        signed_version: data.signed_version ?? null,
-        customer_signed_at: data.customer_signed_at ?? null,
+        sent_at: (data.sent_at as string | null) ?? null,
+        locked_for_editing: (data.locked_for_editing as boolean | null) ?? null,
+        signed_version: (data.signed_version as number | null) ?? null,
+        customer_signed_at: (data.customer_signed_at as string | null) ?? null,
       });
     })();
     return () => {
@@ -1230,6 +1242,10 @@ export function MaterialsManagement({
     // Snapshot view is quote-specific; clear it when proposal changes so we don't keep showing
     // a locked workbook from a different quote.
     setSnapshotWorkbookId(null);
+    setWorkbook(null);
+    for (const key of workbookCache.keys()) {
+      if (key.startsWith(`${job.id}:`)) workbookCache.delete(key);
+    }
   }, [job.id, effectiveQuoteId ?? null]);
 
   // Load workbook once we know which quote to use.
@@ -1298,13 +1314,7 @@ export function MaterialsManagement({
         if (key.startsWith(`${job.id}:`)) workbookCache.delete(key);
       }
       void (async () => {
-        const { data: jq, error } = await supabase
-          .from('quotes')
-          .select(
-            'id, proposal_number, quote_number, estimate_number, is_customer_estimate, created_at, sent_at, locked_for_editing, is_change_order_proposal, signed_version, customer_signed_at',
-          )
-          .eq('job_id', job.id)
-          .order('created_at', { ascending: false });
+        const { data: jq, error } = await fetchJobQuotesForMaterials(job.id);
         if (!error && jq) setJobQuotes(jq as JobQuote[]);
         await loadWorkbook(true);
         setJobWbMaterialsRefreshSeq((s) => s + 1);
@@ -1590,8 +1600,11 @@ export function MaterialsManagement({
   ): Promise<{ landedOnEditableWorking: boolean } | undefined> {
     workbookLoadDepthRef.current += 1;
     const loadDepth = workbookLoadDepthRef.current;
+    let workbookForViewSync: { id?: string; status?: string; quote_id?: string | null } | null | undefined;
+    let quoteIdForSettled: string | null = null;
     try {
       const quoteIdForLoad = overrideQuoteId !== undefined ? overrideQuoteId : (effectiveQuoteId ?? null);
+      quoteIdForSettled = quoteIdForLoad;
       let snapActive: string | null;
       if (snapshotIdOverride === null) snapActive = null;
       else if (typeof snapshotIdOverride === 'string') snapActive = snapshotIdOverride;
@@ -1634,11 +1647,7 @@ export function MaterialsManagement({
         .eq('job_id', job.id)
         .order('updated_at', { ascending: false });
       const quoteFreshPromise = quoteIdForLoad
-        ? supabase
-            .from('quotes')
-            .select('sent_at, locked_for_editing, signed_version, customer_signed_at')
-            .eq('id', quoteIdForLoad)
-            .maybeSingle()
+        ? fetchQuoteContractRowWithId(supabase, quoteIdForLoad)
         : Promise.resolve({ data: null as any, error: null as any });
 
       const [{ data: allWorkbooks, error: wbError }, { data: fqRow }] = await Promise.all([wbQuery, quoteFreshPromise]);
@@ -1677,27 +1686,6 @@ export function MaterialsManagement({
         !!quoteIdForLoad &&
         !!historicalUnlockedQuoteId &&
         historicalUnlockedQuoteId === quoteIdForLoad;
-      const sameProposalQuoteIds = selectedQuote
-        ? (() => {
-            const ids = new Set<string>([selectedQuote.id]);
-            for (const q of jobQuotes) {
-              if (
-                (selectedQuote.proposal_number != null &&
-                  q.proposal_number != null &&
-                  q.proposal_number === selectedQuote.proposal_number) ||
-                (selectedQuote.quote_number != null &&
-                  q.quote_number != null &&
-                  q.quote_number === selectedQuote.quote_number)
-              ) {
-                ids.add(q.id);
-              }
-            }
-            return ids;
-          })()
-        : new Set<string>();
-      const matchProposalFamily = (w: (typeof wbs)[0]) =>
-        !!w.quote_id && sameProposalQuoteIds.has(w.quote_id);
-
       const lockedList = wbs
         .filter((w) => matchQuote(w) && w.status === 'locked')
         .sort((a, b) => (b.version_number ?? 0) - (a.version_number ?? 0));
@@ -1729,39 +1717,27 @@ export function MaterialsManagement({
         }
       }
       if (!workbookData && quoteIdForLoad) {
-        // Quote-scoped view: never fall back to another quote's workbook.
-        // Proposal-family fallback: allow workbooks tied to another quote row with the same proposal number.
-        // Legacy fallback: allow quote_id NULL workbooks for this job (older data before per-proposal linkage).
+        // Strict per-proposal binding: only workbooks owned by this quote_id (never sibling proposals).
+        const forQuote = (status: string) =>
+          wbs.find((w) => w.quote_id === quoteIdForLoad && w.status === status) ?? null;
         workbookData =
           shouldDefaultToLockedWorkbook && preferWorkingForSessionUnlock
-            ? (wbs.find((w) => w.status === 'working' && w.quote_id === quoteIdForLoad) ??
-                wbs.find((w) => w.status === 'locked' && w.quote_id === quoteIdForLoad) ??
-                wbs.find((w) => w.status === 'working' && matchProposalFamily(w)) ??
-                wbs.find((w) => w.status === 'locked' && matchProposalFamily(w)) ??
-                wbs.find((w) => w.status === 'working' && !w.quote_id) ??
-                wbs.find((w) => w.status === 'locked' && !w.quote_id) ??
-                null)
+            ? (forQuote('working') ?? forQuote('locked'))
             : shouldDefaultToLockedWorkbook
-              ? (wbs.find((w) => w.status === 'locked' && w.quote_id === quoteIdForLoad) ??
-                  wbs.find((w) => w.status === 'working' && w.quote_id === quoteIdForLoad) ??
-                  wbs.find((w) => w.status === 'locked' && matchProposalFamily(w)) ??
-                  wbs.find((w) => w.status === 'working' && matchProposalFamily(w)) ??
-                  wbs.find((w) => w.status === 'locked' && !w.quote_id) ??
-                  wbs.find((w) => w.status === 'working' && !w.quote_id) ??
-                  null)
-              : (wbs.find((w) => w.status === 'working' && w.quote_id === quoteIdForLoad) ??
-                  wbs.find((w) => w.status === 'locked' && w.quote_id === quoteIdForLoad) ??
-                  wbs.find((w) => w.status === 'working' && matchProposalFamily(w)) ??
-                  wbs.find((w) => w.status === 'locked' && matchProposalFamily(w)) ??
-                  wbs.find((w) => w.status === 'working' && !w.quote_id) ??
-                  wbs.find((w) => w.status === 'locked' && !w.quote_id) ??
-                  null);
+              ? (forQuote('locked') ?? forQuote('working'))
+              : (forQuote('working') ?? forQuote('locked'));
+        // Single-proposal jobs only: legacy job-level workbook (quote_id null).
+        if (!workbookData && jobQuotes.filter((q) => q.is_customer_estimate !== true).length <= 1) {
+          workbookData =
+            wbs.find((w) => !w.quote_id && w.status === 'working') ??
+            wbs.find((w) => !w.quote_id && w.status === 'locked') ??
+            null;
+        }
       }
       if (!workbookData && !quoteIdForLoad) {
         workbookData = wbs.find((w) => w.status === 'working') ?? wbs[0] ?? null;
       }
-      // If we still have no workbook but this job has workbooks, show the most recent one so the user can access their data
-      if (!workbookData && wbs.length > 0) {
+      if (!workbookData && wbs.length > 0 && !quoteIdForLoad) {
         workbookData = wbs[0];
       }
 
@@ -1782,6 +1758,21 @@ export function MaterialsManagement({
             break;
           }
         }
+      }
+
+      if (workbookData && quoteIdForLoad && isWorkbookQuoteMismatch(workbookData.quote_id, quoteIdForLoad, jobQuotes)) {
+        console.warn(
+          `[proposal-isolation] Materials rejected workbook ${workbookData.id} for proposal ${quoteIdForLoad}`,
+        );
+        workbookData = null;
+      }
+
+      if (!workbookData) {
+        workbookForViewSync = null;
+        setWorkbook(null);
+        setLockedSnapshotsMeta([]);
+        if (!silent) setLoading(false);
+        return { landedOnEditableWorking: false };
       }
 
       // Keep the "contract snapshot toggle" consistent with the workbook we actually selected:
@@ -1957,6 +1948,7 @@ export function MaterialsManagement({
 
       const fullWorkbook = mergeWorkbookLocalOverrides({ ...workbookData, sheets });
       setWorkbook(fullWorkbook);
+      workbookForViewSync = workbookData;
 
       // Write to cache so the next visit is instant
       workbookCache.set(cacheKey, { workbook: fullWorkbook, categories, cachedAt: Date.now() });
@@ -1977,6 +1969,7 @@ export function MaterialsManagement({
       };
     } catch (error: any) {
       console.error('Error loading workbook:', error);
+      workbookForViewSync = null;
       const msg = error?.message || error?.error_description || String(error);
       const short = msg.length > 120 ? msg.slice(0, 117) + '…' : msg;
       toast.error(short ? `Failed to load materials: ${short}` : 'Failed to load materials');
@@ -1984,6 +1977,20 @@ export function MaterialsManagement({
     } finally {
       workbookLoadDepthRef.current -= 1;
       setLoading(false);
+      if (workbookLoadDepthRef.current === 0) {
+        if (workbookForViewSync !== undefined) {
+          const qid = quoteIdForSettled;
+          if (workbookForViewSync && qid && !isWorkbookQuoteMismatch(workbookForViewSync.quote_id, qid, jobQuotes)) {
+            onWorkbookViewSync?.({
+              workbookId: workbookForViewSync.id ?? null,
+              status: (workbookForViewSync.status as 'working' | 'locked') ?? null,
+            });
+          } else {
+            onWorkbookViewSync?.({ workbookId: null, status: null });
+          }
+        }
+        onWorkbookLoadSettled?.();
+      }
     }
   }
 
@@ -2394,6 +2401,25 @@ export function MaterialsManagement({
       newSet.delete(materialId);
     } else {
       newSet.add(materialId);
+    }
+    setSelectedMaterialsForMove(newSet);
+  }
+
+  /**
+   * Toggle every material in a section/category for the bulk-move selection.
+   * If at least one item in the category is unselected, this selects ALL of
+   * them; otherwise it deselects all of them. Used by the "Select all" button
+   * in each category header when bulk-move mode is on.
+   */
+  function toggleCategoryForMove(catGroup: CategoryGroup) {
+    const ids = catGroup.items.map((i) => i.id);
+    if (ids.length === 0) return;
+    const newSet = new Set(selectedMaterialsForMove);
+    const allSelected = ids.every((id) => newSet.has(id));
+    if (allSelected) {
+      ids.forEach((id) => newSet.delete(id));
+    } else {
+      ids.forEach((id) => newSet.add(id));
     }
     setSelectedMaterialsForMove(newSet);
   }
@@ -2953,6 +2979,11 @@ export function MaterialsManagement({
 
   async function saveCellEdit(item: MaterialItem) {
     if (!editingCell) return;
+    if (!workbook || isWorkbookQuoteMismatch(workbook.quote_id, effectiveQuoteId, jobQuotes)) {
+      toast.error('Cannot save: materials workbook does not match the selected proposal.');
+      cancelCellEdit();
+      return;
+    }
 
     try {
       const { field } = editingCell;
@@ -3464,12 +3495,7 @@ export function MaterialsManagement({
       customer_signed_at?: string | null;
     };
   }> {
-    const { data: changeOrderQuotes } = await supabase
-      .from('quotes')
-      .select('id, sent_at, locked_for_editing, signed_version, customer_signed_at')
-      .eq('job_id', job.id)
-      .eq('is_change_order_proposal', true)
-      .limit(1);
+    const { data: changeOrderQuotes } = await fetchChangeOrderQuoteForJob(supabase, job.id);
     let quoteId: string;
     let quote: {
       sent_at: string | null;
@@ -3478,7 +3504,8 @@ export function MaterialsManagement({
       customer_signed_at?: string | null;
     };
     if (changeOrderQuotes?.length) {
-      quoteId = changeOrderQuotes[0].id;
+      quoteId = String(changeOrderQuotes[0].id ?? '');
+      if (!quoteId) throw new Error('Change order quote is missing an id');
       quote = {
         sent_at: changeOrderQuotes[0].sent_at ?? null,
         locked_for_editing: changeOrderQuotes[0].locked_for_editing ?? null,
@@ -3493,15 +3520,17 @@ export function MaterialsManagement({
           is_change_order_proposal: true,
           created_by: userId,
         } as Record<string, unknown>)
-        .select('id, sent_at, locked_for_editing, signed_version, customer_signed_at')
+        .select('id, sent_at')
         .single();
-      if (quoteErr || !newQuote) throw new Error(newQuote ? quoteErr?.message : 'Failed to create change order proposal');
+      if (quoteErr || !newQuote) throw new Error(quoteErr?.message ?? 'Failed to create change order proposal');
       quoteId = newQuote.id;
+      const { data: freshCo } = await fetchChangeOrderQuoteForJob(supabase, job.id);
+      const coRow = freshCo?.[0];
       quote = {
-        sent_at: newQuote.sent_at ?? null,
-        locked_for_editing: newQuote.locked_for_editing ?? null,
-        signed_version: newQuote.signed_version,
-        customer_signed_at: (newQuote as any).customer_signed_at ?? null,
+        sent_at: coRow?.sent_at ?? newQuote.sent_at ?? null,
+        locked_for_editing: coRow?.locked_for_editing ?? null,
+        signed_version: coRow?.signed_version,
+        customer_signed_at: coRow?.customer_signed_at ?? null,
       };
     }
     const { data: workbooks } = await supabase
@@ -3629,11 +3658,7 @@ export function MaterialsManagement({
 
       if (isChangeOrder && changeOrderQuoteId) {
         workbookCache.delete(`${job.id}:${changeOrderQuoteId}`);
-        const { data: quotes } = await supabase
-          .from('quotes')
-          .select('id, proposal_number, quote_number, estimate_number, is_customer_estimate, created_at, sent_at, locked_for_editing, is_change_order_proposal')
-          .eq('job_id', job.id)
-          .order('created_at', { ascending: false });
+        const { data: quotes } = await fetchJobQuotesForMaterials(job.id);
         if (quotes?.length) setJobQuotes(quotes as JobQuote[]);
         onQuoteChange?.(changeOrderQuoteId);
         setSelectedQuoteId(changeOrderQuoteId);
@@ -4103,7 +4128,7 @@ export function MaterialsManagement({
   useEffect(() => {
     const qid = effectiveQuoteId ?? null;
     const wbQuoteId = (workbook as { quote_id?: string | null } | null)?.quote_id ?? null;
-    const quoteMismatch = qid != null && wbQuoteId != null && wbQuoteId !== qid;
+    const quoteMismatch = isWorkbookQuoteMismatch(wbQuoteId, qid, jobQuotes);
 
     if (!workbook?.sheets?.length || quoteMismatch) {
       onBreakdownPriceSync?.([]);
@@ -4134,7 +4159,7 @@ export function MaterialsManagement({
   useEffect(() => {
     const qid = effectiveQuoteId ?? null;
     const wbQuoteId = (workbook as { quote_id?: string | null } | null)?.quote_id ?? null;
-    const quoteMismatch = qid != null && wbQuoteId != null && wbQuoteId !== qid;
+    const quoteMismatch = isWorkbookQuoteMismatch(wbQuoteId, qid, jobQuotes);
 
     if (!workbook || quoteMismatch) {
       onWorkbookViewSync?.({ workbookId: null, status: null });
@@ -4397,6 +4422,107 @@ export function MaterialsManagement({
       setSavingCategoryRename(false);
     }
   }
+
+  async function finalizeSheetRename() {
+    const edit = sheetNameEditRef.current;
+    if (!edit || savingSheetRename || sheetRenameInFlightRef.current) return;
+    if (isWorkbookReadOnly) {
+      setSheetNameEdit(null);
+      return;
+    }
+    const trimmed = edit.value.trim();
+    if (trimmed === edit.oldName) {
+      setSheetNameEdit(null);
+      return;
+    }
+    if (!trimmed) {
+      toast.error('Sheet name cannot be empty');
+      setSheetNameEdit(null);
+      return;
+    }
+    const sheet = workbook?.sheets.find((s) => s.id === edit.sheetId);
+    if (!sheet) {
+      setSheetNameEdit(null);
+      return;
+    }
+    // Block name collisions inside the same workbook (case-insensitive) so the
+    // category-rename style "two tabs with the same name" never happens here.
+    const collides = workbook?.sheets.some(
+      (s) => s.id !== edit.sheetId && s.sheet_name.trim().toLowerCase() === trimmed.toLowerCase()
+    );
+    if (collides) {
+      toast.error('A sheet with that name already exists in this workbook');
+      return;
+    }
+
+    sheetRenameInFlightRef.current = true;
+    setSavingSheetRename(true);
+    try {
+      const now = new Date().toISOString();
+      let { error } = await supabase
+        .from('material_sheets')
+        .update({ sheet_name: trimmed, updated_at: now })
+        .eq('id', edit.sheetId);
+      // Some older DBs don't have material_sheets.updated_at — retry without it
+      // so the rename still succeeds instead of being silently rejected.
+      if (
+        error &&
+        typeof (error as { message?: string }).message === 'string' &&
+        /column .*updated_at.* does not exist/i.test((error as { message: string }).message)
+      ) {
+        const retry = await supabase
+          .from('material_sheets')
+          .update({ sheet_name: trimmed })
+          .eq('id', edit.sheetId);
+        error = retry.error;
+      }
+      if (error) throw error;
+
+      setWorkbook((prev) => {
+        if (!prev) return prev;
+        return {
+          ...prev,
+          sheets: prev.sheets.map((s) =>
+            s.id === edit.sheetId ? { ...s, sheet_name: trimmed } : s
+          ),
+        };
+      });
+
+      for (const key of workbookCache.keys()) {
+        if (key.startsWith(`${job.id}:`)) workbookCache.delete(key);
+      }
+
+      setSheetNameEdit(null);
+      toast.success(`Renamed sheet to "${trimmed}"`);
+      // Same broadcast as category rename so JobFinancials' sibling-sheet
+      // remap (which keys on sheet_name) rebuilds with the new name and
+      // labor / subs stay attached on the proposal totals panel.
+      window.dispatchEvent(
+        new CustomEvent('materials-workbook-updated', {
+          detail: { quoteId: effectiveQuoteId ?? null, jobId: job.id },
+        })
+      );
+    } catch (e: unknown) {
+      // Supabase / Postgrest errors aren't Error instances — they're plain
+      // objects with `message`, `details`, `hint`, `code`. The previous
+      // `e instanceof Error` check always missed them, so the toast just
+      // showed the generic fallback. Surface whatever we get so the actual
+      // cause (RLS, missing column, schema cache, etc.) shows up to the user.
+      const errObj = e as { message?: unknown; details?: unknown; hint?: unknown; code?: unknown };
+      const msg =
+        (typeof errObj?.message === 'string' && errObj.message) ||
+        (typeof errObj?.details === 'string' && errObj.details) ||
+        (typeof errObj?.hint === 'string' && errObj.hint) ||
+        (e instanceof Error ? e.message : '') ||
+        'Failed to rename sheet';
+      console.error('Sheet rename failed:', e);
+      toast.error(`Failed to rename sheet: ${msg}`);
+    } finally {
+      sheetRenameInFlightRef.current = false;
+      setSavingSheetRename(false);
+    }
+  }
+
   /** Shop / trim / Zoho / workbook-level mutations — only when the visible grid is editable. */
   const canUseShopTrimAndZohoOnThisWorkbook =
     !isWorkbookReadOnly &&
@@ -4989,20 +5115,66 @@ export function MaterialsManagement({
                             </span>
                           )}
                         <div className="group/tab relative flex-shrink-0 pr-1 border-r border-slate-300/80 last:border-r-0 flex items-center gap-1">
-                          <Button
-                            variant={activeSheetId === sheet.id ? 'default' : 'ghost'}
-                            size="sm"
-                            onClick={() => handleSheetChange(sheet.id)}
-                            title={sheet.sheet_name}
-                            className={`flex items-center gap-1 min-w-[100px] max-w-[min(280px,40vw)] justify-start h-7 px-2.5 text-sm leading-tight ${
-                              activeSheetId === sheet.id
-                                ? 'font-bold text-slate-900 bg-slate-100 shadow-sm border-2 border-primary/90 ring-1 ring-primary/20 hover:bg-slate-100'
-                                : 'font-semibold text-slate-700 hover:text-slate-900 hover:bg-slate-100/80 border border-transparent'
-                            }`}
-                          >
-                            <span className="truncate">{sheet.sheet_name}</span>
-                          </Button>
-                          {workbook.status === 'working' && activeSheetId === sheet.id && (
+                          {sheetNameEdit?.sheetId === sheet.id ? (
+                            <Input
+                              autoFocus
+                              disabled={savingSheetRename}
+                              className="h-7 min-w-[120px] max-w-[min(280px,40vw)] text-sm font-bold text-slate-900 border-primary/60 ring-1 ring-primary/20 bg-white px-2"
+                              value={sheetNameEdit.value}
+                              onChange={(e) =>
+                                setSheetNameEdit((p) => (p ? { ...p, value: e.target.value } : null))
+                              }
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter') {
+                                  e.preventDefault();
+                                  skipSheetRenameBlurRef.current = true;
+                                  void finalizeSheetRename();
+                                } else if (e.key === 'Escape') {
+                                  e.preventDefault();
+                                  skipSheetRenameBlurRef.current = true;
+                                  setSheetNameEdit(null);
+                                }
+                              }}
+                              onBlur={() => {
+                                if (skipSheetRenameBlurRef.current) {
+                                  skipSheetRenameBlurRef.current = false;
+                                  return;
+                                }
+                                void finalizeSheetRename();
+                              }}
+                            />
+                          ) : (
+                            <Button
+                              variant={activeSheetId === sheet.id ? 'default' : 'ghost'}
+                              size="sm"
+                              onClick={() => handleSheetChange(sheet.id)}
+                              onDoubleClick={(e) => {
+                                if (workbook.status !== 'working' || isWorkbookReadOnly) return;
+                                e.stopPropagation();
+                                e.preventDefault();
+                                if (activeSheetId !== sheet.id) handleSheetChange(sheet.id);
+                                setSheetDeleteConfirmId(null);
+                                setSheetNameEdit({
+                                  sheetId: sheet.id,
+                                  oldName: sheet.sheet_name,
+                                  value: sheet.sheet_name,
+                                });
+                              }}
+                              title={
+                                workbook.status === 'working' && !isWorkbookReadOnly
+                                  ? `${sheet.sheet_name} — double-click to rename`
+                                  : sheet.sheet_name
+                              }
+                              className={`flex items-center gap-1 min-w-[100px] max-w-[min(280px,40vw)] justify-start h-7 px-2.5 text-sm leading-tight ${
+                                activeSheetId === sheet.id
+                                  ? 'font-bold text-slate-900 bg-slate-100 shadow-sm border-2 border-primary/90 ring-1 ring-primary/20 hover:bg-slate-100'
+                                  : 'font-semibold text-slate-700 hover:text-slate-900 hover:bg-slate-100/80 border border-transparent'
+                              }`}
+                            >
+                              <span className="truncate">{sheet.sheet_name}</span>
+                            </Button>
+                          )}
+                          {workbook.status === 'working' && activeSheetId === sheet.id && sheetNameEdit?.sheetId !== sheet.id && (
                             sheetDeleteConfirmId === sheet.id ? (
                               <div className="flex items-center gap-0.5 shrink-0 animate-in fade-in duration-150">
                                 <Button
@@ -5033,7 +5205,25 @@ export function MaterialsManagement({
                                 </Button>
                               </div>
                             ) : (
-                              <div className="shrink-0 opacity-0 transition-opacity duration-150 group-hover/tab:opacity-100 focus-within:opacity-100">
+                              <div className="flex items-center gap-0.5 shrink-0 opacity-0 transition-opacity duration-150 group-hover/tab:opacity-100 focus-within:opacity-100">
+                                <Button
+                                  type="button"
+                                  variant="ghost"
+                                  size="sm"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setSheetDeleteConfirmId(null);
+                                    setSheetNameEdit({
+                                      sheetId: sheet.id,
+                                      oldName: sheet.sheet_name,
+                                      value: sheet.sheet_name,
+                                    });
+                                  }}
+                                  className="h-7 w-7 p-0 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded-md shadow-sm"
+                                  title="Rename this sheet"
+                                >
+                                  <Pencil className="w-3.5 h-3.5" />
+                                </Button>
                                 <Button
                                   type="button"
                                   variant="ghost"
@@ -5204,6 +5394,46 @@ export function MaterialsManagement({
                                       <Badge variant="outline" className="bg-white text-[10px] px-1">
                                         {catGroup.items.length} items
                                       </Badge>
+                                      {bulkMoveMode && catGroup.items.length > 0 && (() => {
+                                        const ids = catGroup.items.map((i) => i.id);
+                                        const selectedInCat = ids.filter((id) => selectedMaterialsForMove.has(id)).length;
+                                        const allSelected = selectedInCat === ids.length;
+                                        const someSelected = selectedInCat > 0 && !allSelected;
+                                        return (
+                                          <Button
+                                            type="button"
+                                            size="sm"
+                                            variant="outline"
+                                            onClick={(e) => {
+                                              e.stopPropagation();
+                                              toggleCategoryForMove(catGroup);
+                                            }}
+                                            className={`h-6 text-[10px] px-2 border-orange-400 ${
+                                              allSelected
+                                                ? 'bg-orange-500 text-white hover:bg-orange-600'
+                                                : someSelected
+                                                ? 'bg-orange-100 text-orange-900 hover:bg-orange-200'
+                                                : 'bg-white text-orange-800 hover:bg-orange-50'
+                                            }`}
+                                            title={
+                                              allSelected
+                                                ? `Deselect all ${ids.length} items in ${catGroup.category}`
+                                                : `Select all ${ids.length} items in ${catGroup.category}`
+                                            }
+                                          >
+                                            {allSelected ? (
+                                              <CheckSquare className="w-3 h-3 mr-1" />
+                                            ) : (
+                                              <Square className="w-3 h-3 mr-1" />
+                                            )}
+                                            {allSelected
+                                              ? `Deselect all`
+                                              : someSelected
+                                              ? `Select all (${selectedInCat}/${ids.length})`
+                                              : `Select all`}
+                                          </Button>
+                                        );
+                                      })()}
                                     </div>
                                     {catGroup.category === 'Metal' && categoryHasLinealFootPricing(catGroup) && (
                                       <div className="flex items-center gap-2 flex-shrink-0 flex-wrap">

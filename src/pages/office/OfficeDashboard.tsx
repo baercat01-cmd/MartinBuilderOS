@@ -1,4 +1,4 @@
-import { useState, useEffect, useLayoutEffect, useRef } from 'react';
+import { useState, useEffect, useLayoutEffect } from 'react';
 import { useSearchParams, useLocation } from 'react-router-dom';
 import { supabase } from '@/lib/supabase';
 import { useAuth } from '@/hooks/useAuth';
@@ -50,6 +50,18 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { PayrollDashboard } from '@/pages/payroll/PayrollDashboard';
+import { readPersistedOpenJobId, readPersistedOpenJobTab, persistOpenJob, persistOpenJobTab, flushAgentDebugLogs, agentLog } from '@/lib/officeViewPersistence';
+import { OfficeOpenJobDialog } from '@/components/office/OfficeOpenJobDialog';
+import type { Job } from '@/types';
+
+function readInitialOpenJobState() {
+  if (typeof window === 'undefined') return { id: null as string | null, tab: 'overview' };
+  const params = new URLSearchParams(window.location.search);
+  return {
+    id: params.get('jobId') || readPersistedOpenJobId(),
+    tab: params.get('jobTab') || readPersistedOpenJobTab() || 'overview',
+  };
+}
 
 export function OfficeDashboard() {
   const { profile, clearUser } = useAuth();
@@ -62,43 +74,126 @@ export function OfficeDashboard() {
     return tabParam || 'jobs';
   });
 
+  const initialOpenJob = readInitialOpenJobState();
   const [unreadCount, setUnreadCount] = useState(0);
-  const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
-  /** Bump on every OfficeDashboard mount so JobsView remounts (clears open job dialog; avoids stale PWA/bfcache state). */
-  const [jobsViewEpoch, setJobsViewEpoch] = useState(0);
+  const [selectedJobId, setSelectedJobId] = useState<string | null>(initialOpenJob.id);
+  const [openJobTab, setOpenJobTab] = useState(initialOpenJob.tab);
+
+  function syncOpenJob(jobId: string | null, tab?: string) {
+    const effectiveTab = tab ?? openJobTab;
+    setSelectedJobId(jobId);
+    if (jobId) setOpenJobTab(effectiveTab);
+    persistOpenJob(jobId, jobId ? effectiveTab : null);
+    agentLog({
+      location: 'OfficeDashboard.tsx:syncOpenJob',
+      message: 'syncOpenJob',
+      data: { jobId, tab: effectiveTab },
+      hypothesisId: 'J',
+    });
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      if (jobId) {
+        next.set('jobId', jobId);
+        next.set('jobTab', effectiveTab);
+      } else {
+        next.delete('jobId');
+        next.delete('jobTab');
+      }
+      return next;
+    }, { replace: true });
+  }
+
+  function handleOpenJobFromList(job: Job, tab?: string) {
+    const effectiveTab = tab ?? openJobTab;
+    setActiveTab('jobs');
+    syncOpenJob(job.id, effectiveTab);
+  }
+
+  // On load: if localStorage has an open job but URL was reset (PWA start_url), restore URL params.
+  useLayoutEffect(() => {
+    if (!initialOpenJob.id) return;
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('jobId')) return;
+    agentLog({
+      location: 'OfficeDashboard.tsx:mount-sync',
+      message: 'restoring jobId to URL from storage',
+      data: { jobId: initialOpenJob.id, tab: initialOpenJob.tab },
+      hypothesisId: 'J',
+    });
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      next.set('jobId', initialOpenJob.id!);
+      next.set('jobTab', initialOpenJob.tab);
+      return next;
+    }, { replace: true });
+    persistOpenJob(initialOpenJob.id, initialOpenJob.tab);
+  }, []);
 
   // Before paint: default to jobs only when URL has no explicit tab.
-  // Do not override deep links like ?tab=trim-calculator.
+  // Preserve jobId, jobTab, and other params when adding tab=jobs.
   useLayoutEffect(() => {
     if (location.pathname !== '/office') return;
     if (tabParam) return;
-    navigate('/office?tab=jobs', { replace: true });
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      next.set('tab', 'jobs');
+      return next;
+    }, { replace: true });
     setActiveTab('jobs');
-    setSelectedJobId(null);
-    setJobsViewEpoch((e) => e + 1);
-  }, [location.pathname, tabParam, navigate]);
+  }, [location.pathname, tabParam, setSearchParams]);
 
-  // Installed PWA: reopening from the taskbar often resumes the same JS heap without remounting — reset jobs view.
-  const officeHiddenAtRef = useRef<number | null>(null);
+  // #region agent log
   useEffect(() => {
-    const isStandalone = () =>
-      window.matchMedia('(display-mode: standalone)').matches || (window.navigator as any).standalone === true;
+    flushAgentDebugLogs();
     const onVis = () => {
       if (document.visibilityState === 'hidden') {
-        officeHiddenAtRef.current = Date.now();
+        if (selectedJobId) persistOpenJob(selectedJobId, openJobTab);
         return;
       }
-      if (!isStandalone()) return;
-      const t = officeHiddenAtRef.current;
-      if (t != null && Date.now() - t > 1500) {
-        setSelectedJobId(null);
-        setJobsViewEpoch((e) => e + 1);
+      const jobId = readPersistedOpenJobId();
+      if (jobId) {
+        const tab = readPersistedOpenJobTab() || openJobTab;
+        setSelectedJobId(jobId);
+        setOpenJobTab(tab);
+        persistOpenJob(jobId, tab);
+        setSearchParams((prev) => {
+          const next = new URLSearchParams(prev);
+          next.set('jobId', jobId);
+          next.set('jobTab', tab);
+          return next;
+        }, { replace: true });
       }
-      officeHiddenAtRef.current = null;
+      agentLog({
+        location: 'OfficeDashboard.tsx:visibility',
+        message: 'visibilitychange',
+        data: {
+          state: document.visibilityState,
+          persistedJobId: readPersistedOpenJobId(),
+          selectedJobId,
+          activeTab,
+          url: typeof window !== 'undefined' ? window.location.search : '',
+        },
+        hypothesisId: 'G',
+      });
     };
     document.addEventListener('visibilitychange', onVis);
-    return () => document.removeEventListener('visibilitychange', onVis);
-  }, []);
+    const onPageHide = () => {
+      if (selectedJobId) persistOpenJob(selectedJobId, openJobTab);
+    };
+    window.addEventListener('pagehide', onPageHide);
+    return () => {
+      document.removeEventListener('visibilitychange', onVis);
+      window.removeEventListener('pagehide', onPageHide);
+    };
+  }, [selectedJobId, activeTab, openJobTab]);
+  // #endregion
+
+  // Keep localStorage in sync when URL carries jobId (survives PWA reload to start_url).
+  useEffect(() => {
+    const urlJobId = searchParams.get('jobId');
+    if (!urlJobId) return;
+    persistOpenJob(urlJobId, searchParams.get('jobTab'));
+  }, [searchParams]);
 
   // When the URL tab changes (deep link, back/forward), sync state. Do NOT depend on `activeTab`:
   // after a tab click, `activeTab` updates before `tabParam`, and the old effect would reset the tab
@@ -515,24 +610,24 @@ export function OfficeDashboard() {
 
       {/* Main Content - mobile: more padding for thumbs; desktop: unchanged */}
       <main className="w-full px-4 py-4 md:px-2 md:py-6">
-        {activeTab === 'jobs' && (
-          <div className="space-y-6">
-            <JobsView 
-              key={jobsViewEpoch}
-              selectedJobId={selectedJobId} 
-              openMaterialsTab={openMaterialsTab}
-              onAddTask={() => setShowCreateTaskDialog(true)}
-            />
-            
-            {/* Master Calendar - Full Width Below Jobs */}
+      {/* JobsView stays mounted (dialog uses portal). Only hide calendar when not on Jobs tab. */}
+      <JobsView 
+        delegateJobDialog
+        onRequestOpenJob={handleOpenJobFromList}
+        onRequestCloseJob={() => syncOpenJob(null)}
+        hideJobList={activeTab !== 'jobs'}
+        selectedJobId={selectedJobId} 
+        openMaterialsTab={openMaterialsTab}
+        onAddTask={() => setShowCreateTaskDialog(true)}
+      />
+      <div className={activeTab === 'jobs' ? 'space-y-6' : 'hidden'} aria-hidden={activeTab !== 'jobs'}>
             <MasterCalendar 
               onJobSelect={(jobId) => {
-                setSelectedJobId(jobId);
-                // JobsView will auto-scroll to the selected job
+                syncOpenJob(jobId, openJobTab);
+                setActiveTab('jobs');
               }} 
             />
-          </div>
-        )}
+      </div>
 
         {activeTab === 'quotes' && (
           <div className="space-y-6">
@@ -880,6 +975,24 @@ export function OfficeDashboard() {
           </div>
         )}
       </main>
+
+      <OfficeOpenJobDialog
+        jobId={selectedJobId}
+        jobTab={openJobTab}
+        visible
+        onClose={() => syncOpenJob(null)}
+        onTabChange={(tab) => {
+          setOpenJobTab(tab);
+          persistOpenJobTab(tab);
+          if (selectedJobId) {
+            setSearchParams((prev) => {
+              const next = new URLSearchParams(prev);
+              next.set('jobTab', tab);
+              return next;
+            }, { replace: true });
+          }
+        }}
+      />
 
       {/* PWA Install Button */}
       <PWAInstallButton />

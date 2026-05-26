@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "open": "start http://localhost:8080",
+    "open": "start http://localhost:8082",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "test": "vitest run",

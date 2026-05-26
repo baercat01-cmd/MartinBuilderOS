@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useMemo } from 'react';
 import { supabase } from '@/lib/supabase';
+import { readPersistedOpenJobId, readPersistedOpenJobTab, persistOpenJobTab } from '@/lib/officeViewPersistence';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { Badge } from '@/components/ui/badge';
@@ -42,6 +43,7 @@ import { format } from 'date-fns';
 
 import { useAuth } from '@/hooks/useAuth';
 import { isQuoteContractFrozen } from '@/lib/quoteProposalLock';
+import { fetchJobQuotesForJob } from '@/lib/quotesSchemaFallback';
 import { loadProposalFinancialData } from '@/lib/loadProposalFinancialData';
 import { computeProposalCostBudget } from '@/lib/proposalCostBudget';
 import type { Job } from '@/types';
@@ -61,6 +63,7 @@ interface JobDetailedViewProps {
   /** Refetch job from DB after nested edits (e.g. components, documents) so `job` prop stays in sync. */
   onJobUpdate?: () => void;
   initialTab?: string;
+  onTabChange?: (tab: string) => void;
 }
 
 interface ComponentWorkEntry {
@@ -417,7 +420,7 @@ function readStoredProposalMaterialsViewMode(): ProposalMaterialsLayoutMode {
   return 'split';
 }
 
-export function JobDetailedView({ job, portalJobId, getPortalJobId, onBack, onEdit, onJobUpdate, initialTab = 'overview' }: JobDetailedViewProps) {
+export function JobDetailedView({ job, portalJobId, getPortalJobId, onBack, onEdit, onJobUpdate, initialTab = 'overview', onTabChange }: JobDetailedViewProps) {
   const { profile } = useAuth();
   const [loading, setLoading] = useState(true);
   const [proposalNumber, setProposalNumber] = useState<string | null>(null);
@@ -446,7 +449,17 @@ export function JobDetailedView({ job, portalJobId, getPortalJobId, onBack, onEd
   const [emailStats, setEmailStats] = useState({ total: 0, customer: 0, vendor: 0, subcontractor: 0, unread: 0 });
   const [showEmailDialog, setShowEmailDialog] = useState(false);
   const [exporting, setExporting] = useState(false);
-  const [activeTab, setActiveTab] = useState(initialTab === 'financials' || initialTab === 'materials' ? 'proposal-materials' : initialTab);
+  const [activeTab, setActiveTab] = useState(() => {
+    const persistedTab = readPersistedOpenJobId() === job.id ? readPersistedOpenJobTab() : null;
+    const tab = persistedTab || initialTab;
+    return tab === 'financials' || tab === 'materials' ? 'proposal-materials' : tab;
+  });
+
+  function handleActiveTabChange(tab: string) {
+    setActiveTab(tab);
+    persistOpenJobTab(tab);
+    onTabChange?.(tab);
+  }
   const [proposalToolbarContent, setProposalToolbarContent] = useState<React.ReactNode>(null);
   type ProposalViewMode = ProposalMaterialsLayoutMode;
   const [proposalViewMode, setProposalViewMode] = useState<ProposalViewMode>(() => readStoredProposalMaterialsViewMode());
@@ -582,13 +595,7 @@ export function JobDetailedView({ job, portalJobId, getPortalJobId, onBack, onEd
     setHeaderProposalCostTotal(null);
     (async () => {
       try {
-        const { data: quotes, error } = await supabase
-          .from('quotes')
-          .select(
-            'id, proposal_number, quote_number, created_at, sent_at, locked_for_editing, signed_version, customer_signed_at, is_change_order_proposal'
-          )
-          .eq('job_id', job.id)
-          .order('created_at', { ascending: false });
+        const { data: quotes, error } = await fetchJobQuotesForJob(supabase, job.id);
         if (!mounted) return;
         if (error || !quotes?.length) {
           setSelectedProposalQuoteId(null);
@@ -1541,7 +1548,7 @@ export function JobDetailedView({ job, portalJobId, getPortalJobId, onBack, onEd
     <div className="w-full min-h-0 bg-background">
       <Tabs
         value={activeTab}
-        onValueChange={setActiveTab}
+        onValueChange={handleActiveTabChange}
         className={`w-full ${
           activeTab === 'proposal-materials'
             ? /* Fixed black (min-h-14) + green (h-8 row + py-1); slightly under old 6rem to remove gray gap */
@@ -1568,7 +1575,7 @@ export function JobDetailedView({ job, portalJobId, getPortalJobId, onBack, onEd
             </h1>
             <button
               type="button"
-              onClick={() => setActiveTab('job-budget')}
+              onClick={() => handleActiveTabChange('job-budget')}
               className="hidden md:inline-flex flex-row items-center gap-1.5 shrink-0 border-l border-yellow-600/50 pl-2.5 ml-1 py-0 max-w-[min(200px,22vw)] rounded-md hover:bg-yellow-950/50 focus:outline-none focus-visible:ring-2 focus-visible:ring-yellow-500 transition-colors self-center"
               title={jobBudgetHeaderTitle}
             >
@@ -1970,7 +1977,7 @@ export function JobDetailedView({ job, portalJobId, getPortalJobId, onBack, onEd
                       variant="outline"
                       size="sm"
                       className="border-emerald-600 text-emerald-900 hover:bg-emerald-100"
-                      onClick={() => setActiveTab('job-budget')}
+                      onClick={() => handleActiveTabChange('job-budget')}
                     >
                       Open full budget breakdown
                     </Button>
@@ -2127,7 +2134,7 @@ export function JobDetailedView({ job, portalJobId, getPortalJobId, onBack, onEd
                       Click a row for each worker&apos;s totals and a dated entry log.
                     </p>
                   </div>
-                  <Button type="button" variant="outline" size="sm" onClick={() => setActiveTab('components')}>
+                  <Button type="button" variant="outline" size="sm" onClick={() => handleActiveTabChange('components')}>
                     Components tab
                   </Button>
                 </div>
@@ -2370,7 +2377,7 @@ export function JobDetailedView({ job, portalJobId, getPortalJobId, onBack, onEd
                   Uses the same proposal as the header and Proposal & Materials. Switch proposal there if you need a different version.
                 </p>
               </div>
-              <Button type="button" variant="outline" size="sm" onClick={() => setActiveTab('overview')}>
+              <Button type="button" variant="outline" size="sm" onClick={() => handleActiveTabChange('overview')}>
                 Back to overview
               </Button>
             </div>
