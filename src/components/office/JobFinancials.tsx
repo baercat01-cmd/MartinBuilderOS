@@ -3753,7 +3753,12 @@ export function JobFinancials({
     quoteId: string | null;
     allJobQuotesFirstId: string | undefined;
     historicalUnlockedQuoteId: string | null; // effective session unlock id (parent or internal)
-    loadMaterialsData: (targetQuoteId: string | null, isHistorical?: boolean) => void;
+    loadMaterialsData: (
+      targetQuoteId: string | null,
+      isHistorical?: boolean,
+      overlayOverride?: Record<string, boolean>,
+      cooperativeGen?: number,
+    ) => void;
     loadSubcontractorEstimates: (targetQuoteId: string | null, isHistorical?: boolean) => Promise<void>;
   }>({
     jobId: job.id,

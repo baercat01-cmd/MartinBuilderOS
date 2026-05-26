@@ -276,6 +276,7 @@ interface MaterialSheet {
 interface MaterialWorkbook {
   id: string;
   job_id: string;
+  quote_id?: string | null;
   version_number: number;
   status: 'working' | 'locked';
   sheets: MaterialSheet[];
@@ -1194,7 +1195,7 @@ export function MaterialsManagement({
       return;
     }
     (async () => {
-      const { data, error } = await fetchQuoteContractRow(supabase, effectiveQuoteId);
+      const { data, error } = await fetchQuoteContractRowWithId(supabase, effectiveQuoteId);
       if (cancelled) return;
       if (error || !data) {
         setContractQuoteFields(null);

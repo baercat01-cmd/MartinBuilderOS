@@ -66,7 +66,7 @@ export function persistOpenJobTab(tab: string): void {
 }
 
 export function agentLog(payload: Record<string, unknown>): void {
-  const entry = { sessionId: 'ca9250', ...payload, timestamp: Date.now() };
+  const entry: Record<string, unknown> = { sessionId: 'ca9250', ...payload, timestamp: Date.now() };
   try {
     const raw = localStorage.getItem(DEBUG_RING_KEY);
     const arr: Record<string, unknown>[] = raw ? JSON.parse(raw) : [];

@@ -60,33 +60,32 @@ export async function fetchJobQuotesForJob(
   supabase: SupabaseClient,
   jobId: string,
 ): Promise<{ data: any[] | null; error: unknown }> {
-  let result = await supabase
+  const full = await supabase
     .from('quotes')
     .select(JOB_QUOTES_SELECT_FULL)
     .eq('job_id', jobId)
     .order('created_at', { ascending: false });
-  if (result.error && isPostgrestSchemaError(result.error)) {
-    result = await supabase
-      .from('quotes')
-      .select(JOB_QUOTES_SELECT_LEGACY)
-      .eq('job_id', jobId)
-      .order('created_at', { ascending: false });
-  }
-  if (result.error && isPostgrestSchemaError(result.error)) {
-    result = await supabase
-      .from('quotes')
-      .select(JOB_QUOTES_SELECT_MIN)
-      .eq('job_id', jobId)
-      .order('created_at', { ascending: false });
-  }
-  if (result.error && isPostgrestSchemaError(result.error)) {
-    result = await supabase
-      .from('quotes')
-      .select('*')
-      .eq('job_id', jobId)
-      .order('created_at', { ascending: false });
-  }
-  return result;
+  if (!full.error || !isPostgrestSchemaError(full.error)) return full;
+
+  const legacy = await supabase
+    .from('quotes')
+    .select(JOB_QUOTES_SELECT_LEGACY)
+    .eq('job_id', jobId)
+    .order('created_at', { ascending: false });
+  if (!legacy.error || !isPostgrestSchemaError(legacy.error)) return legacy;
+
+  const min = await supabase
+    .from('quotes')
+    .select(JOB_QUOTES_SELECT_MIN)
+    .eq('job_id', jobId)
+    .order('created_at', { ascending: false });
+  if (!min.error || !isPostgrestSchemaError(min.error)) return min;
+
+  return supabase
+    .from('quotes')
+    .select('*')
+    .eq('job_id', jobId)
+    .order('created_at', { ascending: false });
 }
 
 const QUOTE_CONTRACT_SELECT_WITH_ID = `id, ${QUOTE_CONTRACT_SELECT_FULL}`;
