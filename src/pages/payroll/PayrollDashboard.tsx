@@ -38,6 +38,7 @@ import { FunctionsHttpError } from '@supabase/supabase-js';
 import { UnavailableCalendar } from '@/components/foreman/UnavailableCalendar';
 import { format } from 'date-fns';
 import { ensureDefaultTimeEntryJobs, prioritizeDefaultJobs } from '@/lib/defaultJobs';
+import type { Job } from '@/types';
 
 // ⚠️ CRITICAL: ALL TIMES MUST DISPLAY IN EASTERN TIME (EST/EDT)
 // This ensures payroll times match when employees actually clocked in/out
@@ -401,7 +402,7 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
         .order('name');
 
       if (error) throw error;
-      setJobs(prioritizeDefaultJobs(data || [], defaultJobs));
+      setJobs(prioritizeDefaultJobs((data || []) as Job[], defaultJobs));
     } catch (error: any) {
       console.error('Error loading jobs:', error);
     }

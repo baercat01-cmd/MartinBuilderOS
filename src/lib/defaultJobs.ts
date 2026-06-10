@@ -123,8 +123,8 @@ export function dedupeDefaultJobNames(jobs: Job[]): Job[] {
 }
 
 /** Put default jobs first (NCC, then Training) and dedupe by id and default name. */
-export function prioritizeDefaultJobs(jobs: Job[], defaultJobs: Job[]): Job[] {
-  let result = jobs;
+export function prioritizeDefaultJobs<T extends Job>(jobs: T[], defaultJobs: Job[]): T[] {
+  let result: Job[] = jobs;
   for (let i = defaultJobs.length - 1; i >= 0; i--) {
     const job = defaultJobs[i];
     const nameKey = job.name.trim().toLowerCase();
@@ -134,7 +134,7 @@ export function prioritizeDefaultJobs(jobs: Job[], defaultJobs: Job[]): Job[] {
     );
     result = [job, ...result];
   }
-  return dedupeDefaultJobNames(result);
+  return dedupeDefaultJobNames(result) as T[];
 }
 
 /** @deprecated Use prioritizeDefaultJobs */
