@@ -29,13 +29,15 @@ import {
   Edit,
   Trash2,
   CalendarDays,
-  Briefcase
+  Briefcase,
+  Search
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { useAuth } from '@/hooks/useAuth';
 import { FunctionsHttpError } from '@supabase/supabase-js';
 import { UnavailableCalendar } from '@/components/foreman/UnavailableCalendar';
 import { format } from 'date-fns';
+import { ensureDefaultTimeEntryJobs, prioritizeDefaultJobs } from '@/lib/defaultJobs';
 
 // ⚠️ CRITICAL: ALL TIMES MUST DISPLAY IN EASTERN TIME (EST/EDT)
 // This ensures payroll times match when employees actually clocked in/out
@@ -166,6 +168,70 @@ function filterPayrollTimeEntries(entries: any[]): any[] {
   );
 }
 
+function isMiscJobEntry(entryNotes: string | null): boolean {
+  if (!entryNotes) return false;
+  try {
+    const data = JSON.parse(entryNotes);
+    return data.type === 'misc_job';
+  } catch {
+    return false;
+  }
+}
+
+function isGenericPayrollNote(note: string): boolean {
+  const normalized = note.trim().toLowerCase();
+  return normalized === 'manual entry' || normalized === 'shop - manual entry';
+}
+
+/** User-entered note text for display under the job name. */
+function getPayrollEntryDisplayNote(entryNotes: string | null): string {
+  if (!entryNotes) return '';
+  try {
+    const data = JSON.parse(entryNotes);
+    if (data.type === 'misc_job') {
+      const note = data.notes || '';
+      return isGenericPayrollNote(note) ? '' : note;
+    }
+  } catch {
+    return isGenericPayrollNote(entryNotes) ? '' : entryNotes;
+  }
+  return isGenericPayrollNote(entryNotes) ? '' : entryNotes;
+}
+
+function buildPayrollEntryNotesForSave(
+  originalNotes: string | null,
+  userNotes: string
+): string | null {
+  const trimmed = userNotes.trim();
+
+  if (originalNotes) {
+    try {
+      const data = JSON.parse(originalNotes);
+      if (data.type === 'misc_job') {
+        return JSON.stringify({ ...data, notes: trimmed });
+      }
+    } catch {
+      // fall through for plain-text notes
+    }
+  }
+
+  return trimmed || null;
+}
+
+/** Misc jobs and internal crew jobs use a generic "Internal" client tag — omit it in payroll. */
+function getPayrollEntryClientLabel(
+  jobClientName: string,
+  entryNotes: string | null
+): string {
+  if (isMiscJobEntry(entryNotes)) {
+    return '';
+  }
+  if (jobClientName.trim().toLowerCase() === 'internal') {
+    return '';
+  }
+  return jobClientName;
+}
+
 interface UserTimeData {
   userId: string;
   userName: string;
@@ -180,6 +246,84 @@ interface WeekData {
 }
 
 type PeriodType = 'weekly' | 'biweekly' | 'monthly' | 'quarterly' | 'yearly' | 'custom';
+
+function resolvePeriodBounds(
+  periodType: PeriodType,
+  selectedPeriod: string,
+  customStartDate: string,
+  customEndDate: string
+): { start: string; end: string } | null {
+  let periodStart: Date;
+  let periodEnd: Date;
+
+  if (periodType === 'custom') {
+    if (!customStartDate || !customEndDate) return null;
+    periodStart = new Date(customStartDate);
+    periodEnd = new Date(customEndDate);
+  } else {
+    if (!selectedPeriod) return null;
+    periodStart = new Date(selectedPeriod);
+    periodEnd = new Date(periodStart);
+
+    if (periodType === 'weekly') {
+      periodEnd.setDate(periodStart.getDate() + 6);
+    } else if (periodType === 'biweekly') {
+      periodEnd.setDate(periodStart.getDate() + 13);
+    } else if (periodType === 'monthly') {
+      periodEnd = new Date(periodStart.getFullYear(), periodStart.getMonth() + 1, 0);
+    } else if (periodType === 'quarterly') {
+      periodEnd = new Date(periodStart.getFullYear(), periodStart.getMonth() + 3, 0);
+    } else if (periodType === 'yearly') {
+      periodEnd = new Date();
+    }
+  }
+
+  return {
+    start: periodStart.toISOString().split('T')[0],
+    end: periodEnd.toISOString().split('T')[0],
+  };
+}
+
+function applyPayrollFilters(
+  users: UserTimeData[],
+  selectedUserId: string,
+  customerSearch: string
+): UserTimeData[] {
+  const baseUsers =
+    selectedUserId === 'all'
+      ? users
+      : users.filter((user) => user.userId === selectedUserId);
+
+  const query = customerSearch.trim().toLowerCase();
+  if (!query) return baseUsers;
+
+  return baseUsers
+    .map((user) => {
+      const dateEntries = user.dateEntries
+        .map((dateEntry) => {
+          const entries = dateEntry.entries.filter(
+            (entry) =>
+              entry.clientName.toLowerCase().includes(query) ||
+              entry.jobName.toLowerCase().includes(query)
+          );
+          const totalHours = entries.reduce(
+            (sum, entry) =>
+              sum + (entry.entryId.startsWith('timeoff-') ? 0 : entry.totalHours),
+            0
+          );
+          return { ...dateEntry, entries, totalHours };
+        })
+        .filter((dateEntry) => dateEntry.entries.length > 0);
+
+      const totalHours = dateEntries.reduce(
+        (sum, dateEntry) => sum + dateEntry.totalHours,
+        0
+      );
+
+      return { ...user, dateEntries, totalHours };
+    })
+    .filter((user) => user.dateEntries.length > 0);
+}
 
 export type PayrollDashboardProps = {
   /** When true, hides the standalone payroll header (logout). Used inside Office dashboard. */
@@ -197,6 +341,8 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
   const [weekData, setWeekData] = useState<WeekData | null>(null);
   const [expandedUsers, setExpandedUsers] = useState<Set<string>>(new Set());
   const [selectedUser, setSelectedUser] = useState<string>('all');
+  const [customerSearch, setCustomerSearch] = useState('');
+  const [jobSearch, setJobSearch] = useState('');
   const [editingEntry, setEditingEntry] = useState<TimeEntryData | null>(null);
   const [editForm, setEditForm] = useState({
     hours: '0',
@@ -247,13 +393,15 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
 
   async function loadJobs() {
     try {
+      const defaultJobs = await ensureDefaultTimeEntryJobs(profile?.id);
+
       const { data, error } = await supabase
         .from('jobs')
         .select('id, name, client_name, address')
         .order('name');
 
       if (error) throw error;
-      setJobs(data || []);
+      setJobs(prioritizeDefaultJobs(data || [], defaultJobs));
     } catch (error: any) {
       console.error('Error loading jobs:', error);
     }
@@ -656,7 +804,10 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
           dateData.entries.push({
             entryId: entry.id,
             jobName: entry.jobs?.name || 'Unknown Job',
-            clientName: entry.jobs?.client_name || '',
+            clientName: getPayrollEntryClientLabel(
+              entry.jobs?.client_name || '',
+              entry.notes
+            ),
             componentName: entry.components?.name ?? null,
             startTime: useEnteredShiftClock ? sessionClock.start : entry.start_time,
             endTime: useEnteredShiftClock ? sessionClock.end : entry.end_time,
@@ -694,26 +845,27 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
           // Format date in local timezone
           const dateStr = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
           
-          // Only add time off entry if there are no time entries for this date
-          const hasTimeEntries = userData.dateEntries.some(de => de.date === dateStr && de.entries.length > 0);
-          
-          if (!hasTimeEntries) {
-            // Find or create date entry
-            let dateData = userData.dateEntries.find(d => d.date === dateStr);
-            if (!dateData) {
-              dateData = {
-                date: dateStr,
-                entries: [],
-                totalHours: 0,
-              };
-              userData.dateEntries.push(dateData);
-            }
-            
+          // Find or create date entry
+          let dateData = userData.dateEntries.find(d => d.date === dateStr);
+          if (!dateData) {
+            dateData = {
+              date: dateStr,
+              entries: [],
+              totalHours: 0,
+            };
+            userData.dateEntries.push(dateData);
+          }
+
+          const alreadyHasTimeOff = dateData.entries.some((entry) =>
+            entry.entryId.startsWith('timeoff-')
+          );
+
+          if (!alreadyHasTimeOff) {
             // Add time off entry (use a special ID pattern to identify it)
             dateData.entries.push({
               entryId: `timeoff-${timeOff.user_id}-${dateStr}`,
               jobName: 'Time Off',
-              clientName: timeOff.reason || 'Scheduled Time Off',
+              clientName: timeOff.reason || 'Time Off',
               componentName: null,
               startTime: dateStr,
               endTime: null,
@@ -768,10 +920,11 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
     setLoading(true);
     
     try {
-      // Filter users based on selection
-      const usersToExport = selectedUser === 'all' 
-        ? weekData.users 
-        : weekData.users.filter(u => u.userId === selectedUser);
+      const usersToExport = applyPayrollFilters(
+        weekData.users,
+        selectedUser,
+        customerSearch
+      );
 
       let periodLabel = '';
       if (periodType === 'custom') {
@@ -830,6 +983,7 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
                 return {
                   jobName: entry.jobName,
                   clientName: entry.clientName,
+                  displayNote: isTimeOff ? '' : getPayrollEntryDisplayNote(entry.notes),
                   componentName: entry.componentName,
                   startTime: clock.startLabel,
                   endTime: clock.endLabel,
@@ -878,14 +1032,26 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
 
 
 
-  const filteredUsers = selectedUser === 'all' 
-    ? (weekData?.users || []) 
-    : (weekData?.users.filter(u => u.userId === selectedUser) || []);
+  const filteredUsers = applyPayrollFilters(
+    weekData?.users || [],
+    selectedUser,
+    customerSearch
+  );
+
+  const filteredJobs = jobs.filter(job => {
+    const query = jobSearch.trim().toLowerCase();
+    if (!query) return true;
+    return (
+      (job.client_name || '').toLowerCase().includes(query) ||
+      (job.name || '').toLowerCase().includes(query)
+    );
+  });
 
   const totalWeekHours = filteredUsers.reduce((sum, u) => sum + u.totalHours, 0);
   const totalEntries = filteredUsers.reduce((sum, u) => 
     sum + u.dateEntries.reduce((dateSum, d) => dateSum + d.entries.length, 0), 0
   );
+  const hasActiveFilters = Boolean(customerSearch.trim()) || selectedUser !== 'all';
 
   async function openEditDialog(entryId: string) {
     // Don't allow editing time off entries
@@ -910,7 +1076,7 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
       setEditForm({
         hours: hours.toString(),
         minutes: minutes.toString(),
-        notes: data.notes || '',
+        notes: getPayrollEntryDisplayNote(data.notes),
       });
       setEditingEntry(data);
     } catch (error: any) {
@@ -935,7 +1101,7 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
         .from('time_entries')
         .update({
           total_hours: Math.round(totalHours * 4) / 4, // Round to nearest 0.25
-          notes: editForm.notes || null,
+          notes: buildPayrollEntryNotesForSave(editingEntry.notes, editForm.notes),
         })
         .eq('id', editingEntry.id);
 
@@ -980,6 +1146,13 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
     }
   }
 
+  const periodBounds = resolvePeriodBounds(
+    periodType,
+    selectedPeriod,
+    customStartDate,
+    customEndDate
+  );
+
   return (
     <div className={embed ? 'min-h-0' : 'min-h-screen bg-muted/30'}>
       {!embed && (
@@ -1017,7 +1190,7 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
             </TabsTrigger>
             <TabsTrigger value="time-off" className="flex items-center gap-2">
               <CalendarDays className="w-4 h-4" />
-              Time Off Calendar
+              Time Off Log
             </TabsTrigger>
             <TabsTrigger value="job-hours" className="flex items-center gap-2">
               <Briefcase className="w-4 h-4" />
@@ -1087,7 +1260,7 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
               <div className="p-4 bg-muted/30 rounded-lg">
                 <div className="flex items-center gap-2 text-muted-foreground mb-2">
                   <Users className="w-4 h-4" />
-                  <span className="text-sm">Employees</span>
+                  <span className="text-sm">{hasActiveFilters ? 'Filtered Employees' : 'Employees'}</span>
                 </div>
                 <p className="text-3xl font-bold">
                   {loading ? '-' : filteredUsers.length}
@@ -1096,7 +1269,7 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
               <div className="p-4 bg-muted/30 rounded-lg">
                 <div className="flex items-center gap-2 text-muted-foreground mb-2">
                   <Clock className="w-4 h-4" />
-                  <span className="text-sm">Total Hours</span>
+                  <span className="text-sm">{hasActiveFilters ? 'Filtered Total Hours' : 'Total Hours'}</span>
                 </div>
                 <p className="text-3xl font-bold">
                   {loading ? '-' : totalWeekHours.toFixed(2)}
@@ -1105,7 +1278,7 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
               <div className="p-4 bg-muted/30 rounded-lg">
                 <div className="flex items-center gap-2 text-muted-foreground mb-2">
                   <Calendar className="w-4 h-4" />
-                  <span className="text-sm">Entries</span>
+                  <span className="text-sm">{hasActiveFilters ? 'Filtered Entries' : 'Entries'}</span>
                 </div>
                 <p className="text-3xl font-bold">
                   {loading ? '-' : totalEntries}
@@ -1119,6 +1292,19 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
         <Card>
           <CardContent className="pt-6">
             <div className="flex flex-col md:flex-row gap-4 items-end">
+              <div className="flex-1">
+                <Label htmlFor="customer-search">Search by Customer</Label>
+                <div className="relative">
+                  <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+                  <Input
+                    id="customer-search"
+                    value={customerSearch}
+                    onChange={(e) => setCustomerSearch(e.target.value)}
+                    placeholder="Search customer or job name..."
+                    className="pl-9"
+                  />
+                </div>
+              </div>
               <div className="flex-1">
                 <Label htmlFor="user-filter">Filter by Employee</Label>
                 <Select value={selectedUser} onValueChange={setSelectedUser}>
@@ -1150,6 +1336,27 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
                 </Button>
               </div>
             </div>
+            {hasActiveFilters && !loading && weekData && (
+              <div className="mt-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 rounded-lg bg-primary/10 px-4 py-3">
+                <div className="text-sm text-muted-foreground">
+                  {customerSearch.trim() ? (
+                    <>
+                      Matching <span className="font-medium text-foreground">"{customerSearch.trim()}"</span>
+                    </>
+                  ) : (
+                    <>Filtered by employee</>
+                  )}
+                  {' '}in this period
+                  <span className="block sm:inline sm:ml-2">
+                    · {filteredUsers.length} employee{filteredUsers.length !== 1 ? 's' : ''}
+                    · {totalEntries} entr{totalEntries !== 1 ? 'ies' : 'y'}
+                  </span>
+                </div>
+                <p className="text-2xl font-bold text-primary shrink-0">
+                  {totalWeekHours.toFixed(2)}h
+                </p>
+              </div>
+            )}
           </CardContent>
         </Card>
 
@@ -1166,7 +1373,11 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
             <CardContent className="py-12 text-center">
               <Clock className="w-12 h-12 mx-auto mb-4 text-muted-foreground" />
               <p className="text-muted-foreground">
-                No time entries found for this period
+                {hasActiveFilters
+                  ? customerSearch.trim()
+                    ? `No time entries matching "${customerSearch.trim()}" for this period`
+                    : 'No time entries found for the selected employee in this period'
+                  : 'No time entries found for this period'}
               </p>
             </CardContent>
           </Card>
@@ -1208,7 +1419,7 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
                           <thead>
                             <tr className="border-b bg-muted/20">
                               <th className="text-left p-2 font-semibold w-32">Date</th>
-                              <th className="text-left p-2 font-semibold">Job</th>
+                              <th className="text-left p-2 font-semibold">Customer</th>
                               <th className="text-left p-2 font-semibold w-20">Start</th>
                               <th className="text-left p-2 font-semibold w-20">End</th>
                               <th className="text-right p-2 font-semibold w-20">Hours</th>
@@ -1237,6 +1448,9 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
                                           entry.endTime,
                                           reconcile
                                         );
+                                    const displayNote = isTimeOff
+                                      ? ''
+                                      : getPayrollEntryDisplayNote(entry.notes);
 
                                     return (
                                       <tr 
@@ -1264,9 +1478,16 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
                                         
                                         <td className={`p-2 ${isTimeOff ? 'font-semibold text-amber-700' : ''}`}>
                                           <div>
-                                            <div className="font-medium">{entry.jobName}</div>
-                                            {entry.clientName && !isTimeOff && (
-                                              <div className="text-xs text-muted-foreground">{entry.clientName}</div>
+                                            <div className={`font-medium ${isTimeOff ? 'text-amber-700' : ''}`}>
+                                              {entry.clientName || entry.jobName}
+                                            </div>
+                                            {entry.clientName && entry.jobName && (
+                                              <div className="text-xs text-muted-foreground">{entry.jobName}</div>
+                                            )}
+                                            {displayNote && (
+                                              <div className="text-xs text-muted-foreground">
+                                                {displayNote}
+                                              </div>
                                             )}
                                             {!isTimeOff && entry.componentName && (
                                               <Badge variant="secondary" className="mt-1 text-xs font-normal">
@@ -1343,9 +1564,12 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
           </TabsContent>
 
           <TabsContent value="time-off" className="mt-6">
-            <div className="max-w-4xl mx-auto">
-              <UnavailableCalendar userId={profile?.id || ''} />
-            </div>
+            <UnavailableCalendar
+              userId={profile?.id || ''}
+              variant="log"
+              periodStart={periodBounds?.start}
+              periodEnd={periodBounds?.end}
+            />
           </TabsContent>
 
           <TabsContent value="job-hours" className="space-y-6 mt-6">
@@ -1361,18 +1585,31 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
                 <div className="flex items-end gap-4">
                   <div className="flex-1">
                     <Label htmlFor="job-select">Select Job</Label>
-                    <Select value={selectedJobId} onValueChange={setSelectedJobId}>
-                      <SelectTrigger id="job-select">
-                        <SelectValue placeholder="Choose a job..." />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {jobs.map(job => (
-                          <SelectItem key={job.id} value={job.id}>
-                            {job.name} - {job.client_name}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
+                    <div className="space-y-2">
+                      <Input
+                        id="job-select-search"
+                        value={jobSearch}
+                        onChange={(e) => setJobSearch(e.target.value)}
+                        placeholder="Search by customer or job..."
+                      />
+                      <Select value={selectedJobId} onValueChange={setSelectedJobId}>
+                        <SelectTrigger id="job-select">
+                          <SelectValue placeholder="Choose a job..." />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {filteredJobs.map(job => (
+                            <SelectItem key={job.id} value={job.id}>
+                              <div className="flex flex-col items-start">
+                                <span>{job.client_name || job.name}</span>
+                                {job.client_name && (
+                                  <span className="text-xs text-muted-foreground">{job.name}</span>
+                                )}
+                              </div>
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
                   </div>
                   <Button
                     onClick={printJobHours}
@@ -1541,6 +1778,11 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
 
             <div className="space-y-2">
               <Label>Job *</Label>
+              <Input
+                value={jobSearch}
+                onChange={(e) => setJobSearch(e.target.value)}
+                placeholder="Search by customer or job..."
+              />
               <Select
                 value={addTimeForm.jobId}
                 onValueChange={(value) => setAddTimeForm(prev => ({ ...prev, jobId: value }))}
@@ -1549,9 +1791,14 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
                   <SelectValue placeholder="Select job" />
                 </SelectTrigger>
                 <SelectContent>
-                  {jobs.map(job => (
+                  {filteredJobs.map(job => (
                     <SelectItem key={job.id} value={job.id}>
-                      {job.name} - {job.client_name}
+                      <div className="flex flex-col items-start">
+                        <span>{job.client_name || job.name}</span>
+                        {job.client_name && (
+                          <span className="text-xs text-muted-foreground">{job.name}</span>
+                        )}
+                      </div>
                     </SelectItem>
                   ))}
                 </SelectContent>

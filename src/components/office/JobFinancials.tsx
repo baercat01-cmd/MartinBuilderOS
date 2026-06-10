@@ -547,6 +547,24 @@ function agentDebugLog(payload: {
   }).catch(() => {});
 }
 
+/**
+ * TEMPORARY diagnostic logger for the "totals jump after deleting a material" bug.
+ * Posts to the Vite dev middleware (vite.config.ts → /__debug/log) which appends to
+ * .cursor/debug-ca9250.log so it can be read back from the workspace. Tagged "TOTBUG".
+ * Safe no-op in production (relative URL just 404s). Remove once the bug is fixed.
+ */
+function totBugLog(location: string, data: Record<string, unknown>) {
+  try {
+    fetch('/__debug/log', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ marker: 'TOTBUG', location, ts: Date.now(), data }),
+    }).catch(() => {});
+  } catch {
+    /* ignore */
+  }
+}
+
 /** Last resort: pull labor from every workbook/sheet for this quote onto displayed sections. */
 async function mergeLaborFromAllQuoteWorkbooks(
   targetQuoteId: string,
@@ -712,11 +730,54 @@ function payloadForClonedLineItem(
     ...rest,
     row_id: scope.row_id,
     sheet_id: scope.sheet_id,
-    quote_id: scope.quote_id,
   };
-  if (scope.workbook_id !== undefined) out.workbook_id = scope.workbook_id;
-  if (scope.section_name !== undefined) out.section_name = scope.section_name;
+  // Older / remote databases (e.g. OnSpace) may not have the proposal-scoping
+  // columns on custom_financial_row_items. Omit them when we know they're absent
+  // so the insert doesn't fail with a PostgREST "schema cache" error.
+  const skipQuoteId = shouldSkipCustomRowItemQuoteIdColumn();
+  const skipWorkbookId = shouldSkipCustomRowItemWorkbookFilter();
+  if (!skipQuoteId) {
+    out.quote_id = scope.quote_id;
+    if (scope.section_name !== undefined) out.section_name = scope.section_name;
+  }
+  if (!skipWorkbookId && scope.workbook_id !== undefined) out.workbook_id = scope.workbook_id;
   return out;
+}
+
+/**
+ * Insert cloned custom_financial_row_items, tolerating remote databases that are
+ * missing the quote_id / section_name / workbook_id columns. On a missing-column
+ * error we record the gap for the rest of the session and retry with a payload
+ * that omits the unsupported columns (rebuilt via `buildPayloads`).
+ */
+async function insertClonedRowItemsResilient(
+  buildPayloads: () => Record<string, unknown>[],
+): Promise<{ error: unknown }> {
+  // Try a few times, stripping whichever optional scoping column PostgREST
+  // reports as missing. Databases that lack quote_id (added 2026-03-25) also
+  // lack the later workbook_id column (2026-03-25 +), so once any of these is
+  // reported missing we drop all of them via markCustomRowItemsNoWorkbookIdColumn().
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const result = await supabase.from('custom_financial_row_items').insert(buildPayloads() as never);
+    if (!result.error) return { error: null };
+    lastError = result.error;
+
+    const missingScopingColumn =
+      isMissingColumnError(result.error, 'quote_id') ||
+      isMissingColumnError(result.error, 'section_name') ||
+      isMissingColumnError(result.error, 'workbook_id');
+    if (!missingScopingColumn) return { error: result.error };
+
+    const before = shouldSkipCustomRowItemQuoteIdColumn() && shouldSkipCustomRowItemWorkbookFilter();
+    // Sets both the no-quote_id and no-workbook_id flags so the rebuilt payload
+    // omits quote_id, section_name and workbook_id.
+    markCustomRowItemsNoWorkbookIdColumn();
+    // If the flags were already set and the column is still reported missing,
+    // there's nothing left to strip — surface the error.
+    if (before) return { error: result.error };
+  }
+  return { error: lastError };
 }
 
 /** Internal / crew workbooks — not shown in the proposal section list but share the same quote workbook. */
@@ -4063,8 +4124,23 @@ export function JobFinancials({
     }
     applySheetSectionLineItems(map, quoteId, opts);
     const copy = JSON.parse(JSON.stringify(map)) as Record<string, CustomRowLineItem[]>;
-    customRowLineItemsLiveRef.current = copy;
-    setCustomRowLineItems(copy);
+    // `map` only contains SHEET-section line items (keyed by sheet_id). Custom-row line
+    // items (keyed by row id, e.g. "Concrete") live in the same `customRowLineItems`
+    // state. Preserve those row-linked entries so a sheet refresh — e.g. the reload
+    // triggered by deleting a material item — doesn't wipe a custom row whose value
+    // lives entirely in its line items (total_cost = 0), which would zero out that
+    // section and corrupt the proposal total.
+    const prevMap = customRowLineItemsLiveRef.current || {};
+    const preservedRowLinked: Record<string, CustomRowLineItem[]> = {};
+    for (const [key, items] of Object.entries(prevMap)) {
+      if (copy[key]) continue; // sheet map already provides this key
+      if ((items || []).some((it) => it.row_id)) {
+        preservedRowLinked[key] = items;
+      }
+    }
+    const merged = { ...preservedRowLinked, ...copy };
+    customRowLineItemsLiveRef.current = merged;
+    setCustomRowLineItems(merged);
   }
 
   function resolvedSheetLineItemLaborForQuote(quoteId: string | null | undefined): number {
@@ -6538,7 +6614,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
       rowIdMap[row.id] = newRow.id;
       const { data: rItems } = await supabase.from('custom_financial_row_items').select('*').eq('row_id', row.id).order('order_index');
       if (rItems?.length) {
-        await supabase.from('custom_financial_row_items').insert(
+        await insertClonedRowItemsResilient(() =>
           rItems.map((item) => {
             const oldSid = item.sheet_id ? String(item.sheet_id) : null;
             const newSid = oldSid ? (sheetIdMap[oldSid] ?? null) : null;
@@ -6557,7 +6633,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
     if (oldSheetIdList.length > 0) {
       const { data: sItems } = await supabase.from('custom_financial_row_items').select('*').in('sheet_id', oldSheetIdList).is('row_id', null);
       if (sItems?.length) {
-        await supabase.from('custom_financial_row_items').insert(
+        await insertClonedRowItemsResilient(() =>
           sItems.map((item) => {
             const oldSid = item.sheet_id ? String(item.sheet_id) : null;
             const newSid = oldSid ? (sheetIdMap[oldSid] ?? null) : null;
@@ -7394,7 +7470,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
           .from('custom_financial_row_items').select('*').eq('row_id', row.id).order('order_index');
         if (riFetchErr) throw new Error(`Step 3 (fetch row items): ${riFetchErr.message}`);
         if (rItems?.length) {
-          const { error: riErr } = await supabase.from('custom_financial_row_items').insert(
+          const { error: riErr } = await insertClonedRowItemsResilient(() =>
             rItems.map((item) => {
               const oldSid = item.sheet_id ? String(item.sheet_id) : null;
               const newSid = oldSid ? (sheetIdMap[oldSid] ?? null) : null;
@@ -7407,7 +7483,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
               });
             }),
           );
-          if (riErr) throw new Error(`Step 3 (insert row items): ${riErr.message}`);
+          if (riErr) throw new Error(`Step 3 (insert row items): ${(riErr as { message?: string })?.message ?? String(riErr)}`);
         }
         snapshotFinancialRows.push({ ...row, line_items: rItems || [] });
       }
@@ -7419,7 +7495,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
           .from('custom_financial_row_items').select('*').in('sheet_id', oldSheetIdList).is('row_id', null);
         if (siFetchErr) throw new Error(`Step 3 (fetch sheet items): ${siFetchErr.message}`);
         if (sItems?.length) {
-          const { error: siErr } = await supabase.from('custom_financial_row_items').insert(
+          const { error: siErr } = await insertClonedRowItemsResilient(() =>
             sItems.map((item) => {
               const oldSid = item.sheet_id ? String(item.sheet_id) : null;
               const newSid = oldSid ? (sheetIdMap[oldSid] ?? null) : null;
@@ -7432,7 +7508,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
               });
             }),
           );
-          if (siErr) throw new Error(`Step 3 (insert sheet items): ${siErr.message}`);
+          if (siErr) throw new Error(`Step 3 (insert sheet items): ${(siErr as { message?: string })?.message ?? String(siErr)}`);
         }
       }
       console.log(`✅ Step 3 — copied ${oldRows?.length ?? 0} financial rows`);
@@ -9892,6 +9968,38 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
     Object.keys(rowLineItemsMap).forEach((k) => {
       rowLineItemsMap[k].sort((a, b) => (a.order_index ?? 0) - (b.order_index ?? 0));
     });
+
+    // TOTBUG: capture exactly what the reload produced per custom row so we can see
+    // a section's line items disappear (→ section shows $0 → top total wrong).
+    try {
+      const keepIdsForLog = new Set(dedupedRows.map((r: any) => r.id));
+      totBugLog('loadCustomRows:loaded', {
+        targetQuoteId,
+        cooperativeGen,
+        rawRowCount: rawRows.length,
+        dedupedRowCount: dedupedRows.length,
+        wouldAutoDeleteRowIds: rawRows
+          .map((r: any) => r.id)
+          .filter((id: string) => !keepIdsForLog.has(id)),
+        rows: dedupedRows.map((r: any) => {
+          const items = rowLineItemsMap[r.id] || [];
+          const matSum = items
+            .filter((i: any) => (i.item_type || 'material') === 'material')
+            .reduce((s: number, i: any) => s + (Number(i.total_cost) || 0) * (1 + (Number(i.markup_percent) || 0) / 100), 0);
+          return {
+            id: r.id,
+            desc: String(r.description || '').slice(0, 40),
+            total_cost: r.total_cost,
+            markup: r.markup_percent,
+            sheet_id: (r as any).sheet_id ?? null,
+            lineItems: items.length,
+            matSum: Math.round(matSum * 100) / 100,
+          };
+        }),
+      });
+    } catch {
+      /* ignore */
+    }
     const rowIds = new Set(dedupedRows.map((r) => r.id));
 
     if (targetQuoteId) {
@@ -13695,6 +13803,26 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
   const showingCatalogOrLegacyEstimate =
     estimateCatalogViewOpen || (quote as any)?.is_customer_estimate === true;
 
+  // Hold the header GRAND TOTAL until the figure has settled, so transient values
+  // during initial load, saves, deletes, or proposal switches don't flash a wrong
+  // number. Reveal only after the total holds steady briefly with no load in flight.
+  const headerTotalsLoading =
+    loadingProposalData || (materialsPanelActive && !materialsWorkbookReady);
+  const [headerTotalsReady, setHeaderTotalsReady] = useState(false);
+  useEffect(() => {
+    setHeaderTotalsReady(false);
+    if (headerTotalsLoading) return;
+    const t = setTimeout(() => setHeaderTotalsReady(true), 500);
+    return () => clearTimeout(t);
+  }, [
+    headerTotalsLoading,
+    financialBarMaterials,
+    financialBarLabor,
+    financialBarSubtotal,
+    financialBarTax,
+    financialBarGrand,
+  ]);
+
   // Optional categories (section-level options): list for the "Options" block at bottom of proposal
   const optionalCategoriesList: { sheetName: string; categoryName: string; totalCost: number; priceWithMarkup: number }[] = [];
   materialsBreakdown.sheetBreakdowns.forEach((sheet: any) => {
@@ -13971,6 +14099,32 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
     const prev = lastSyncedTotalsRef.current;
     if (prev && prev.quoteId === quote.id && prev.sub === sub && prev.tax === tax && prev.grand === grand) return;
     lastSyncedTotalsRef.current = { quoteId: quote.id, sub, tax, grand };
+
+    // TOTBUG: snapshot the header total whenever it changes, with the per-custom-row
+    // contribution (and whether it fell back to total_cost because line items are empty).
+    try {
+      totBugLog('header:totalsChanged', {
+        quoteId: quote.id,
+        materials: Math.round((Number(sumAllSectionBlueTotals) || 0) * 100) / 100,
+        labor: Math.round((Number(proposalLaborPrice) || 0) * 100) / 100,
+        sub,
+        tax,
+        grand,
+        customRows: customRows.map((r: any) => {
+          const items = customRowLineItems[r.id] || [];
+          return {
+            id: r.id,
+            desc: String(r.description || '').slice(0, 40),
+            sheet_id: r.sheet_id ?? null,
+            total_cost: r.total_cost,
+            lineItems: items.length,
+            fellBackToTotalCost: items.length === 0,
+          };
+        }),
+      });
+    } catch {
+      /* ignore */
+    }
     supabase
       .from('quotes')
       .update({
@@ -14132,11 +14286,18 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
                     : 'Customer proposal total'
               }
             >
-              GRAND TOTAL: $
-              {(Number.isFinite(financialBarGrand) ? financialBarGrand : 0).toLocaleString('en-US', {
-                minimumFractionDigits: 2,
-                maximumFractionDigits: 2,
-              })}
+              GRAND TOTAL:{' '}
+              {headerTotalsReady ? (
+                `$${(Number.isFinite(financialBarGrand) ? financialBarGrand : 0).toLocaleString('en-US', {
+                  minimumFractionDigits: 2,
+                  maximumFractionDigits: 2,
+                })}`
+              ) : (
+                <span className="inline-flex items-center gap-1.5 text-green-700/80">
+                  <span className="w-3.5 h-3.5 border-2 border-green-700 border-t-transparent rounded-full animate-spin" />
+                  Calculating…
+                </span>
+              )}
             </span>
           </div>
           {quote && (
@@ -14429,11 +14590,18 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
                     : 'Customer proposal total'
               }
             >
-              GRAND TOTAL: $
-              {(Number.isFinite(financialBarGrand) ? financialBarGrand : 0).toLocaleString('en-US', {
-                minimumFractionDigits: 2,
-                maximumFractionDigits: 2,
-              })}
+              GRAND TOTAL:{' '}
+              {headerTotalsReady ? (
+                `$${(Number.isFinite(financialBarGrand) ? financialBarGrand : 0).toLocaleString('en-US', {
+                  minimumFractionDigits: 2,
+                  maximumFractionDigits: 2,
+                })}`
+              ) : (
+                <span className="inline-flex items-center gap-1.5 text-green-700/80">
+                  <span className="w-3.5 h-3.5 border-2 border-green-700 border-t-transparent rounded-full animate-spin" />
+                  Calculating…
+                </span>
+              )}
             </span>
           </div>
           {typeof externalJobWorkbookMaterialsTotal === 'number' && (

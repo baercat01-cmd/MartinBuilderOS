@@ -1,10 +1,17 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { supabase } from '@/lib/supabase';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import { Textarea } from '@/components/ui/textarea';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
 import {
   Dialog,
   DialogContent,
@@ -27,12 +34,69 @@ interface UnavailableDate {
   };
 }
 
+export const TIME_OFF_REASONS = ['Off', 'Personal', 'Sick', 'Holiday'] as const;
+export type TimeOffReason = (typeof TIME_OFF_REASONS)[number];
+
+function normalizeTimeOffReason(value: string | null | undefined): string {
+  if (!value) return '';
+  return TIME_OFF_REASONS.includes(value as TimeOffReason) ? value : '';
+}
+
+/** Parse YYYY-MM-DD (or ISO string) as local date (avoids UTC midnight shifting day-of-week). */
+function parseLocalDate(dateStr: string): Date {
+  const datePart = typeof dateStr === 'string' && dateStr.length >= 10 ? dateStr.slice(0, 10) : dateStr;
+  const [y, m, d] = datePart.split('-').map(Number);
+  if (Number.isNaN(y) || Number.isNaN(m) || Number.isNaN(d)) return new Date(NaN);
+  return new Date(y, m - 1, d);
+}
+
+function formatTimeOffDateRange(startDate: string, endDate: string): string {
+  if (startDate === endDate) {
+    return parseLocalDate(startDate).toLocaleDateString('en-US', {
+      weekday: 'short',
+      month: 'short',
+      day: 'numeric',
+      year: 'numeric',
+    });
+  }
+
+  return `${parseLocalDate(startDate).toLocaleDateString('en-US', {
+    month: 'short',
+    day: 'numeric',
+  })} – ${parseLocalDate(endDate).toLocaleDateString('en-US', {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+  })}`;
+}
+
+function overlapsPeriod(
+  range: UnavailableDate,
+  periodStart?: string,
+  periodEnd?: string
+): boolean {
+  if (!periodStart || !periodEnd) return true;
+  const start = range.start_date.slice(0, 10);
+  const end = range.end_date.slice(0, 10);
+  return start <= periodEnd && end >= periodStart;
+}
+
 interface UnavailableCalendarProps {
   userId: string;
   onBack?: () => void;
+  /** Payroll view: read-only log of all staff time off. Default: interactive calendar. */
+  variant?: 'manage' | 'log';
+  periodStart?: string;
+  periodEnd?: string;
 }
 
-export function UnavailableCalendar({ userId, onBack }: UnavailableCalendarProps) {
+export function UnavailableCalendar({
+  userId,
+  onBack,
+  variant = 'manage',
+  periodStart,
+  periodEnd,
+}: UnavailableCalendarProps) {
   const [currentDate, setCurrentDate] = useState(new Date());
   const [unavailableDates, setUnavailableDates] = useState<UnavailableDate[]>([]);
   const [loading, setLoading] = useState(false);
@@ -54,7 +118,7 @@ export function UnavailableCalendar({ userId, onBack }: UnavailableCalendarProps
 
   useEffect(() => {
     loadUnavailableDates();
-  }, [userId, showAllStaff]);
+  }, [userId, showAllStaff, variant]);
 
   async function loadUnavailableDates() {
     try {
@@ -62,8 +126,8 @@ export function UnavailableCalendar({ userId, onBack }: UnavailableCalendarProps
         .from('user_unavailable_dates')
         .select('*, user_profiles(username)');
 
-      // If not showing all staff, filter by current user
-      if (!showAllStaff) {
+      // Log view always shows all staff; manage view can filter to current user
+      if (variant !== 'log' && !showAllStaff) {
         query = query.eq('user_id', userId);
       }
 
@@ -105,6 +169,11 @@ export function UnavailableCalendar({ userId, onBack }: UnavailableCalendarProps
       return;
     }
 
+    if (!reason || !TIME_OFF_REASONS.includes(reason as TimeOffReason)) {
+      toast.error('Please select a reason');
+      return;
+    }
+
     setLoading(true);
     try {
       const { error } = await supabase
@@ -113,7 +182,7 @@ export function UnavailableCalendar({ userId, onBack }: UnavailableCalendarProps
           user_id: userId,
           start_date: startDate,
           end_date: endDate,
-          reason: reason || null,
+          reason,
         });
 
       if (error) throw error;
@@ -132,7 +201,12 @@ export function UnavailableCalendar({ userId, onBack }: UnavailableCalendarProps
     }
   }
 
-  async function updateUnavailableDate(id: string, updates: { start_date: string; end_date: string; reason: string | null }) {
+  async function updateUnavailableDate(id: string, updates: { start_date: string; end_date: string; reason: string }) {
+    if (!updates.reason || !TIME_OFF_REASONS.includes(updates.reason as TimeOffReason)) {
+      toast.error('Please select a reason');
+      return;
+    }
+
     setLoading(true);
     try {
       const { error } = await supabase
@@ -140,7 +214,7 @@ export function UnavailableCalendar({ userId, onBack }: UnavailableCalendarProps
         .update({
           start_date: updates.start_date,
           end_date: updates.end_date,
-          reason: updates.reason || null,
+          reason: updates.reason,
         })
         .eq('id', id)
         .eq('user_id', userId);
@@ -182,17 +256,9 @@ export function UnavailableCalendar({ userId, onBack }: UnavailableCalendarProps
   function openEditDialog(range: UnavailableDate) {
     setStartDate(range.start_date);
     setEndDate(range.end_date);
-    setReason(range.reason || '');
+    setReason(normalizeTimeOffReason(range.reason));
     setEditingRange(range);
     setShowAddDialog(true);
-  }
-
-  /** Parse YYYY-MM-DD (or ISO string) as local date (avoids UTC midnight shifting day-of-week). */
-  function parseLocalDate(dateStr: string): Date {
-    const datePart = typeof dateStr === 'string' && dateStr.length >= 10 ? dateStr.slice(0, 10) : dateStr;
-    const [y, m, d] = datePart.split('-').map(Number);
-    if (Number.isNaN(y) || Number.isNaN(m) || Number.isNaN(d)) return new Date(NaN);
-    return new Date(y, m - 1, d);
   }
 
   function getDaysInMonth(date: Date): number {
@@ -300,8 +366,18 @@ export function UnavailableCalendar({ userId, onBack }: UnavailableCalendarProps
   }
 
   function openAddDialogForRange(range: { start: string; end: string }) {
+    setEditingRange(null);
     setStartDate(range.start);
     setEndDate(range.end);
+    setReason('');
+    setShowAddDialog(true);
+  }
+
+  function openNewTimeOffDialog() {
+    setEditingRange(null);
+    setStartDate(getLocalDateString());
+    setEndDate(getLocalDateString());
+    setReason('');
     setShowAddDialog(true);
   }
 
@@ -341,6 +417,73 @@ export function UnavailableCalendar({ userId, onBack }: UnavailableCalendarProps
     calendarDays.push(day);
   }
 
+  if (variant === 'log') {
+    const logEntries = unavailableDates
+      .filter((range) => overlapsPeriod(range, periodStart, periodEnd))
+      .sort(
+        (a, b) =>
+          parseLocalDate(b.start_date).getTime() - parseLocalDate(a.start_date).getTime()
+      );
+
+    return (
+      <Card className="w-full">
+        <CardHeader className="pb-3">
+          <CardTitle className="text-base flex items-center gap-2">
+            <CalendarIcon className="w-5 h-5 text-primary" />
+            Time Off Log
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          {!periodStart || !periodEnd ? (
+            <p className="text-sm text-muted-foreground">
+              Select a payroll period to view time off records.
+            </p>
+          ) : logEntries.length === 0 ? (
+            <p className="text-sm text-muted-foreground">
+              No time off recorded for this period.
+            </p>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b bg-muted/20">
+                    <th className="text-left p-3 font-semibold">Employee</th>
+                    <th className="text-left p-3 font-semibold">Dates</th>
+                    <th className="text-left p-3 font-semibold">Reason</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {logEntries.map((range) => (
+                    <tr key={range.id} className="border-b hover:bg-muted/20">
+                      <td className="p-3 font-medium">
+                        {range.user_profiles?.username || 'Unknown User'}
+                      </td>
+                      <td className="p-3">
+                        {formatTimeOffDateRange(range.start_date, range.end_date)}
+                      </td>
+                      <td className="p-3">
+                        {range.reason ? (
+                          <Badge
+                            variant="outline"
+                            className="bg-amber-50 text-amber-700 border-amber-200"
+                          >
+                            {range.reason}
+                          </Badge>
+                        ) : (
+                          <span className="text-muted-foreground">—</span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </CardContent>
+      </Card>
+    );
+  }
+
   return (
     <>
       <Card className="w-full">
@@ -367,7 +510,7 @@ export function UnavailableCalendar({ userId, onBack }: UnavailableCalendarProps
               </Button>
               <Button
                 size="sm"
-                onClick={() => setShowAddDialog(true)}
+                onClick={openNewTimeOffDialog}
                 className="h-9"
               >
                 <Plus className="w-4 h-4 mr-2" />
@@ -573,15 +716,19 @@ export function UnavailableCalendar({ userId, onBack }: UnavailableCalendarProps
             </div>
 
             <div className="space-y-2">
-              <Label htmlFor="reason">Reason (Optional)</Label>
-              <Textarea
-                id="reason"
-                value={reason}
-                onChange={(e) => setReason(e.target.value)}
-                placeholder="Vacation, Personal, etc."
-                rows={2}
-                className="resize-none"
-              />
+              <Label htmlFor="reason">Reason *</Label>
+              <Select value={reason || undefined} onValueChange={setReason}>
+                <SelectTrigger id="reason">
+                  <SelectValue placeholder="Select reason..." />
+                </SelectTrigger>
+                <SelectContent>
+                  {TIME_OFF_REASONS.map((option) => (
+                    <SelectItem key={option} value={option}>
+                      {option}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             </div>
 
             <div className="flex gap-2 pt-4">
@@ -595,11 +742,11 @@ export function UnavailableCalendar({ userId, onBack }: UnavailableCalendarProps
               </Button>
               <Button
                 onClick={() => editingRange
-                  ? updateUnavailableDate(editingRange.id, { start_date: startDate, end_date: endDate, reason: reason || null })
+                  ? updateUnavailableDate(editingRange.id, { start_date: startDate, end_date: endDate, reason })
                   : addUnavailableDate()
                 }
                 className="flex-1 gradient-primary"
-                disabled={loading}
+                disabled={loading || !reason}
               >
                 {loading ? (editingRange ? 'Updating...' : 'Adding...') : (editingRange ? 'Update Time Off' : 'Add Time Off')}
               </Button>

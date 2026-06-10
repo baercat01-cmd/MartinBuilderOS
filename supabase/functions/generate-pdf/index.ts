@@ -531,8 +531,9 @@ function generatePayrollHTML(data: any): string {
                     <tr${isTimeOff ? ' class="time-off-row"' : ''}>
                       ${isFirst ? `<td class="date-cell" rowspan="${dateEntry.entries.length}">${dateEntry.date}</td>` : ''}
                       <td class="job-cell">
-                        <div>${entry.jobName}</div>
-                        ${entry.clientName && !isTimeOff ? `<div class="client-name">${entry.clientName}</div>` : ''}
+                        <div>${entry.clientName || entry.jobName}</div>
+                        ${entry.clientName && entry.jobName ? `<div class="client-name">${entry.jobName}</div>` : ''}
+                        ${entry.displayNote && !isTimeOff ? `<div class="client-name">${String(entry.displayNote).replace(/</g, '&lt;')}</div>` : ''}
                         ${entry.componentName && !isTimeOff ? `<div><span class="component-tag">${String(entry.componentName).replace(/</g, '&lt;')}</span></div>` : ''}
                       </td>
                       <td class="time-cell">${entry.startTime}</td>

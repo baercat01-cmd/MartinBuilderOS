@@ -3212,6 +3212,21 @@ export function MaterialsManagement({
 
       if (error) throw error;
       toast.success('Material deleted');
+      // TOTBUG: mark the delete in the timeline so we can correlate the reloads it triggers.
+      try {
+        fetch('/__debug/log', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            marker: 'TOTBUG',
+            location: 'MaterialsManagement:deleteItem',
+            ts: Date.now(),
+            data: { itemId, quoteId: effectiveQuoteId ?? null, workbookStatus: workbook?.status ?? null },
+          }),
+        }).catch(() => {});
+      } catch {
+        /* ignore */
+      }
       window.dispatchEvent(new CustomEvent('materials-workbook-updated', { detail: { quoteId: effectiveQuoteId ?? null, jobId: job.id } }));
 
       // Restore scroll position

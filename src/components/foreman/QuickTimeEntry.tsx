@@ -1,5 +1,5 @@
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { supabase } from '@/lib/supabase';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -8,6 +8,9 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Textarea } from '@/components/ui/textarea';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
+import { ScrollArea } from '@/components/ui/scroll-area';
+import { cn } from '@/lib/utils';
 import {
   Dialog,
   DialogContent,
@@ -28,9 +31,29 @@ import {
   FileText,
   Package,
   CalendarIcon,
+  ChevronsUpDown,
+  Check,
+  Search,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import type { Job, Component } from '@/types';
+import { ensureDefaultTimeEntryJobs, prioritizeDefaultJobs } from '@/lib/defaultJobs';
+
+function getJobSearchLabel(job: Job): string {
+  return `${job.client_name || ''} ${job.name}`.trim();
+}
+
+function getJobDisplayPrimary(job: Job): string {
+  const client = job.client_name?.trim();
+  if (client && client.toLowerCase() !== 'internal') return client;
+  return job.name;
+}
+
+function getJobDisplaySecondary(job: Job): string | null {
+  const client = job.client_name?.trim();
+  if (client && client.toLowerCase() !== 'internal') return job.name;
+  return null;
+}
 
 /** Round duration to nearest 15 minutes for payroll. Returns hours in quarter-hour increments (.25, .5, .75, .00). */
 function roundToQuarterHours(exactMinutes: number): number {
@@ -167,6 +190,8 @@ export function QuickTimeEntry({ userId, onSuccess, onBack, allowedJobs, userRol
   const [mode, setMode] = useState<'timer' | 'manual'>('manual'); // Default to manual
   const [showDialog, setShowDialog] = useState(false);
   const [selectedJobId, setSelectedJobId] = useState<string>('');
+  const [jobPickerOpen, setJobPickerOpen] = useState(false);
+  const [jobSearchQuery, setJobSearchQuery] = useState('');
   const [manualData, setManualData] = useState({
     date: new Date().toISOString().split('T')[0],
     startTime: '06:00',
@@ -196,6 +221,12 @@ export function QuickTimeEntry({ userId, onSuccess, onBack, allowedJobs, userRol
 
   // Check if selected job is snowplowing (for overnight shift feature)
   const isSnowplowingJob = selectedJobId && jobs.find(j => j.id === selectedJobId)?.name?.toLowerCase().includes('snowplow');
+  const selectedJob = jobs.find((job) => job.id === selectedJobId) ?? null;
+  const filteredJobsForPicker = useMemo(() => {
+    const query = jobSearchQuery.trim().toLowerCase();
+    if (!query) return jobs;
+    return jobs.filter((job) => getJobSearchLabel(job).toLowerCase().includes(query));
+  }, [jobs, jobSearchQuery]);
 
   useEffect(() => {
     loadJobs();
@@ -279,9 +310,11 @@ export function QuickTimeEntry({ userId, onSuccess, onBack, allowedJobs, userRol
     try {
       if (isShopUser) return;
 
+      const defaultJobs = await ensureDefaultTimeEntryJobs(userId);
+
       // If allowedJobs is provided, use those instead of loading from database
       if (allowedJobs) {
-        setJobs(allowedJobs);
+        setJobs(prioritizeDefaultJobs(allowedJobs, defaultJobs));
         return;
       }
 
@@ -303,7 +336,7 @@ export function QuickTimeEntry({ userId, onSuccess, onBack, allowedJobs, userRol
         return a.is_internal ? 1 : -1;
       });
       
-      setJobs(sortedJobs);
+      setJobs(prioritizeDefaultJobs(sortedJobs, defaultJobs));
     } catch (error) {
       console.error('Error loading jobs:', error);
     }
@@ -833,6 +866,8 @@ export function QuickTimeEntry({ userId, onSuccess, onBack, allowedJobs, userRol
           setShowDialog(open);
           if (!open) {
             // Reset when closing
+            setJobPickerOpen(false);
+            setJobSearchQuery('');
             setMode('manual');
             setSelectedJobId('');
             setManualData({
@@ -968,23 +1003,96 @@ export function QuickTimeEntry({ userId, onSuccess, onBack, allowedJobs, userRol
                     <Briefcase className="w-5 h-5" />
                     Select Job *
                   </Label>
-                  <Select value={selectedJobId} onValueChange={setSelectedJobId}>
-                    <SelectTrigger id="dialog-job" className="h-12 text-base font-bold border-2 border-black bg-white shadow-md hover:border-yellow-600 hover:shadow-lg transition-all">
-                      <SelectValue placeholder="Choose a job..." />
-                    </SelectTrigger>
-                    <SelectContent className="max-h-[300px]">
-                      {jobs.map((job) => (
-                        <SelectItem key={job.id} value={job.id} className="py-3">
-                          <div className="flex flex-col">
-                            <span className="font-bold text-base">{job.name}</span>
-                            <span className="text-sm text-muted-foreground">
-                              {job.client_name}
-                            </span>
+                  <Popover
+                    open={jobPickerOpen}
+                    onOpenChange={(open) => {
+                      setJobPickerOpen(open);
+                      if (!open) setJobSearchQuery('');
+                    }}
+                  >
+                    <PopoverTrigger asChild>
+                      <Button
+                        id="dialog-job"
+                        type="button"
+                        variant="outline"
+                        role="combobox"
+                        aria-expanded={jobPickerOpen}
+                        className={cn(
+                          'h-12 w-full justify-between text-base font-bold border-2 border-black bg-white shadow-md hover:border-yellow-600 hover:shadow-lg transition-all px-3',
+                          !selectedJob && 'text-muted-foreground'
+                        )}
+                      >
+                        {selectedJob ? (
+                          <div className="flex flex-col items-start text-left min-w-0">
+                            <span className="truncate w-full">{getJobDisplayPrimary(selectedJob)}</span>
+                            {getJobDisplaySecondary(selectedJob) && (
+                              <span className="text-sm font-normal text-muted-foreground truncate w-full">
+                                {getJobDisplaySecondary(selectedJob)}
+                              </span>
+                            )}
                           </div>
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
+                        ) : (
+                          'Choose a job...'
+                        )}
+                        <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
+                      </Button>
+                    </PopoverTrigger>
+                    <PopoverContent
+                      className="w-[var(--radix-popover-trigger-width)] p-0"
+                      align="start"
+                      onWheel={(event) => event.stopPropagation()}
+                    >
+                      <div className="flex items-center border-b px-3">
+                        <Search className="mr-2 h-4 w-4 shrink-0 opacity-50" />
+                        <Input
+                          value={jobSearchQuery}
+                          onChange={(event) => setJobSearchQuery(event.target.value)}
+                          placeholder="Search job or customer (optional)..."
+                          className="h-11 border-0 bg-transparent px-0 shadow-none focus-visible:ring-0"
+                        />
+                      </div>
+                      <ScrollArea className="h-[min(280px,45vh)]">
+                        <div className="p-1">
+                          {filteredJobsForPicker.length === 0 ? (
+                            <p className="py-6 text-center text-sm text-muted-foreground">No jobs found.</p>
+                          ) : (
+                            filteredJobsForPicker.map((job) => (
+                              <button
+                                key={job.id}
+                                type="button"
+                                onClick={() => {
+                                  setSelectedJobId(job.id);
+                                  setJobPickerOpen(false);
+                                  setJobSearchQuery('');
+                                }}
+                                className={cn(
+                                  'flex w-full items-center rounded-sm px-2 py-3 text-left outline-none hover:bg-accent focus:bg-accent',
+                                  selectedJobId === job.id && 'bg-accent'
+                                )}
+                              >
+                                <Check
+                                  className={cn(
+                                    'mr-2 h-4 w-4 shrink-0',
+                                    selectedJobId === job.id ? 'opacity-100' : 'opacity-0'
+                                  )}
+                                />
+                                <div className="flex min-w-0 flex-col">
+                                  <span className="font-bold text-base truncate">
+                                    {getJobDisplayPrimary(job)}
+                                  </span>
+                                  {getJobDisplaySecondary(job) && (
+                                    <span className="text-sm text-muted-foreground truncate">
+                                      {getJobDisplaySecondary(job)}
+                                    </span>
+                                  )}
+                                </div>
+                              </button>
+                            ))
+                          )}
+                        </div>
+                      </ScrollArea>
+                    </PopoverContent>
+                  </Popover>
                 </div>
 
                 {/* Manual Entry Fields */}
