@@ -172,6 +172,7 @@ import {
   Ruler,
   Lock,
   LockOpen,
+  ArrowLeftRight,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import type { Job } from '@/types';
@@ -464,6 +465,14 @@ export function MaterialsManagement({
   const [addingCatalogBatch, setAddingCatalogBatch] = useState(false);
   const [catalogAddQuantity, setCatalogAddQuantity] = useState('1');
   const [catalogAddColor, setCatalogAddColor] = useState('');
+
+  // Replace material from catalog bank
+  const [replacingMaterialItem, setReplacingMaterialItem] = useState<MaterialItem | null>(null);
+  const [selectedReplaceCatalogItem, setSelectedReplaceCatalogItem] = useState<any | null>(null);
+  const [replaceCatalogQuery, setReplaceCatalogQuery] = useState('');
+  const [replaceCatalogCategory, setReplaceCatalogCategory] = useState('all');
+  const [replaceCatalogPage, setReplaceCatalogPage] = useState(0);
+  const [replacingMaterial, setReplacingMaterial] = useState(false);
   
   // Package state
   const [packages, setPackages] = useState<any[]>([]);
@@ -3477,6 +3486,112 @@ export function MaterialsManagement({
     setShowZohoOrderDialog(true);
   }
 
+  function openReplaceMaterialDialog(item: MaterialItem) {
+    if (isWorkbookReadOnly) {
+      toast.error('This workbook is read-only.');
+      return;
+    }
+    setReplacingMaterialItem(item);
+    setSelectedReplaceCatalogItem(null);
+    setReplaceCatalogQuery('');
+    setReplaceCatalogCategory('all');
+    setReplaceCatalogPage(0);
+    void loadCatalogMaterials();
+  }
+
+  function closeReplaceMaterialDialog() {
+    setReplacingMaterialItem(null);
+    setSelectedReplaceCatalogItem(null);
+    setReplaceCatalogQuery('');
+    setReplaceCatalogCategory('all');
+    setReplaceCatalogPage(0);
+  }
+
+  async function confirmReplaceMaterial() {
+    if (isWorkbookReadOnly) {
+      toast.error('This workbook is read-only.');
+      return;
+    }
+    if (!replacingMaterialItem || !selectedReplaceCatalogItem) {
+      toast.error('Select a material from the bank');
+      return;
+    }
+
+    const existing = replacingMaterialItem;
+    const catalogItem = selectedReplaceCatalogItem;
+    const { cost, price } = getCatalogCostAndPrice(catalogItem);
+    const costNum = typeof cost === 'number' && !isNaN(cost) ? cost : null;
+    const priceNum = typeof price === 'number' && !isNaN(price) ? price : null;
+    const markupDecimal =
+      costNum != null && costNum > 0 && priceNum != null
+        ? (priceNum - costNum) / costNum
+        : 0;
+    const length = catalogItem.part_length ?? null;
+    const mult = getEffectiveMultiplierForExtended(
+      { ...existing, length },
+      length,
+      existing.quantity
+    );
+    const updateData = {
+      sku: catalogItem.sku ?? null,
+      material_name: catalogItem.material_name ?? 'Unnamed',
+      length,
+      cost_per_unit: costNum,
+      markup_percent: markupDecimal,
+      price_per_unit: priceNum,
+      extended_cost: costNum != null ? Math.round(costNum * mult * 10000) / 10000 : null,
+      extended_price: priceNum != null ? Math.round(priceNum * mult * 10000) / 10000 : null,
+      trim_saved_config_id: catalogItem.default_trim_saved_config_id ?? null,
+      updated_at: new Date().toISOString(),
+    };
+
+    setReplacingMaterial(true);
+    try {
+      if (workbook) {
+        const updatedWorkbook = {
+          ...workbook,
+          sheets: workbook.sheets.map((sheet) => ({
+            ...sheet,
+            items: sheet.items.map((i) =>
+              i.id === existing.id ? { ...i, ...updateData } : i
+            ),
+          })),
+        };
+        setWorkbook(updatedWorkbook);
+        const cacheKey = `${job.id}:${effectiveQuoteId ?? null}`;
+        const cached = workbookCache.get(cacheKey);
+        if (cached) {
+          workbookCache.set(cacheKey, { ...cached, workbook: updatedWorkbook, cachedAt: Date.now() });
+        }
+      }
+
+      const { error } = await supabase
+        .from('material_items')
+        .update(updateData)
+        .eq('id', existing.id);
+
+      if (error) throw error;
+
+      toast.success(
+        `Replaced "${existing.material_name}" with "${catalogItem.material_name ?? 'material'}"`
+      );
+      window.dispatchEvent(
+        new CustomEvent('materials-workbook-updated', {
+          detail: { quoteId: effectiveQuoteId ?? null, jobId: job.id },
+        })
+      );
+      closeReplaceMaterialDialog();
+      await loadWorkbook();
+    } catch (error: any) {
+      console.error('Error replacing material:', error);
+      toast.error('Failed to replace material: ' + (error?.message ?? 'Unknown error'));
+      workbookCache.delete(`${job.id}:${effectiveQuoteId ?? null}`);
+      await loadWorkbook();
+    } finally {
+      setReplacingMaterial(false);
+    }
+  }
+
   function openAddDialog(categoryName?: string) {
     setAddToCategory(categoryName || '');
     setNewMaterialName('');
@@ -6104,6 +6219,12 @@ export function MaterialsManagement({
                                             <Pencil className="w-3.5 h-3.5 mr-2" />
                                             {item.trim_saved_config_id ? 'View / change trim drawing' : 'Link trim drawing'}
                                           </DropdownMenuItem>
+                                          {!materialsWorkbookLocked && (
+                                            <DropdownMenuItem onClick={() => openReplaceMaterialDialog(item)}>
+                                              <ArrowLeftRight className="w-3.5 h-3.5 mr-2" />
+                                              Switch material
+                                            </DropdownMenuItem>
+                                          )}
                                           <DropdownMenuItem onClick={() => openMoveItem(item)}>
                                             <MoveHorizontal className="w-3.5 h-3.5 mr-2" />
                                             Move
@@ -7219,6 +7340,222 @@ export function MaterialsManagement({
             </>
             )}
           </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* Switch Material Dialog */}
+      <Dialog
+        open={!!replacingMaterialItem}
+        onOpenChange={(open) => {
+          if (!open) closeReplaceMaterialDialog();
+        }}
+      >
+        <DialogContent className="sm:max-w-3xl max-h-[96vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <ArrowLeftRight className="w-5 h-5 text-primary" />
+              Switch Material
+            </DialogTitle>
+          </DialogHeader>
+          {replacingMaterialItem && (
+            <div className="space-y-4">
+              <p className="text-sm text-muted-foreground">
+                Replace <strong>{replacingMaterialItem.material_name}</strong> with a material from the bank.
+                Quantity, color, usage, and status will be kept.
+              </p>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div className="relative">
+                  <Input
+                    placeholder="Search by name, SKU, or category..."
+                    value={replaceCatalogQuery}
+                    onChange={(e) => {
+                      setReplaceCatalogQuery(e.target.value);
+                      setReplaceCatalogPage(0);
+                    }}
+                    className="pl-9"
+                  />
+                  <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+                </div>
+                <Select
+                  value={replaceCatalogCategory}
+                  onValueChange={(v) => {
+                    setReplaceCatalogCategory(v);
+                    setReplaceCatalogPage(0);
+                  }}
+                >
+                  <SelectTrigger>
+                    <SelectValue placeholder="All Categories" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">All Categories</SelectItem>
+                    {catalogCategories.map((cat) => (
+                      <SelectItem key={cat} value={cat}>
+                        {cat}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <div className="max-h-[50vh] overflow-y-auto border rounded-lg bg-white">
+                {(() => {
+                  const filtered = catalogMaterials.filter((material) => {
+                    const matchesSearch =
+                      replaceCatalogQuery === '' ||
+                      material.material_name
+                        .toLowerCase()
+                        .includes(replaceCatalogQuery.toLowerCase()) ||
+                      material.sku
+                        .toLowerCase()
+                        .includes(replaceCatalogQuery.toLowerCase()) ||
+                      (material.category &&
+                        material.category
+                          .toLowerCase()
+                          .includes(replaceCatalogQuery.toLowerCase()));
+                    const matchesCategory =
+                      replaceCatalogCategory === 'all' ||
+                      material.category === replaceCatalogCategory;
+                    return matchesSearch && matchesCategory;
+                  });
+
+                  if (loadingCatalog) {
+                    return (
+                      <div className="text-center py-8">
+                        <div className="w-6 h-6 border-4 border-primary border-t-transparent rounded-full animate-spin mx-auto mb-2" />
+                        <p className="text-xs text-muted-foreground">Loading...</p>
+                      </div>
+                    );
+                  }
+
+                  if (filtered.length === 0) {
+                    return (
+                      <div className="text-center py-8">
+                        <p className="text-sm text-muted-foreground">No materials found</p>
+                      </div>
+                    );
+                  }
+
+                  const PAGE_SIZE = 10;
+                  const totalPages = Math.ceil(filtered.length / PAGE_SIZE);
+                  const safePage = Math.min(replaceCatalogPage, Math.max(totalPages - 1, 0));
+                  const pageItems = filtered.slice(
+                    safePage * PAGE_SIZE,
+                    (safePage + 1) * PAGE_SIZE
+                  );
+
+                  return (
+                    <div className="divide-y">
+                      {pageItems.map((material) => {
+                        const selected =
+                          selectedReplaceCatalogItem &&
+                          catalogItemKey(selectedReplaceCatalogItem) === catalogItemKey(material);
+                        const { cost, price } = getCatalogCostAndPrice(material);
+                        return (
+                          <button
+                            key={catalogItemKey(material)}
+                            type="button"
+                            onClick={() => setSelectedReplaceCatalogItem(material)}
+                            className={`w-full text-left p-3 transition-colors flex items-center gap-3 ${
+                              selected
+                                ? 'bg-blue-100 border-l-4 border-blue-600'
+                                : 'hover:bg-blue-50'
+                            }`}
+                          >
+                            <div className="flex-1 min-w-0">
+                              <p className="font-semibold text-sm truncate">
+                                {material.material_name}
+                              </p>
+                              <div className="flex items-center gap-2 mt-1">
+                                <span className="text-xs text-muted-foreground font-mono">
+                                  {material.sku}
+                                </span>
+                                {material.category && (
+                                  <Badge variant="outline" className="text-xs">
+                                    {material.category}
+                                  </Badge>
+                                )}
+                                {material.part_length && (
+                                  <span className="text-xs text-muted-foreground">
+                                    {material.part_length}
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                            <div className="text-right ml-4 flex flex-col items-end gap-0.5">
+                              {price > 0 && (
+                                <p className="text-sm font-semibold">${price.toFixed(2)}</p>
+                              )}
+                              {cost > 0 && price === 0 && (
+                                <p className="text-sm font-semibold">${cost.toFixed(2)}</p>
+                              )}
+                              <span className="text-xs text-blue-600">
+                                {selected ? 'Selected' : 'Click to select'}
+                              </span>
+                            </div>
+                          </button>
+                        );
+                      })}
+                      {totalPages > 1 && (
+                        <div className="flex items-center justify-between px-3 py-2 bg-slate-50 border-t">
+                          <button
+                            type="button"
+                            onClick={() => setReplaceCatalogPage((p) => Math.max(0, p - 1))}
+                            disabled={safePage === 0}
+                            className="flex items-center gap-1 text-xs font-medium text-slate-600 hover:text-slate-900 disabled:opacity-30 disabled:cursor-not-allowed px-2 py-1 rounded hover:bg-slate-200 transition-colors"
+                          >
+                            ← Prev
+                          </button>
+                          <p className="text-xs text-muted-foreground">
+                            {safePage * PAGE_SIZE + 1}–
+                            {Math.min((safePage + 1) * PAGE_SIZE, filtered.length)} of{' '}
+                            {filtered.length} results
+                          </p>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setReplaceCatalogPage((p) => Math.min(totalPages - 1, p + 1))
+                            }
+                            disabled={safePage >= totalPages - 1}
+                            className="flex items-center gap-1 text-xs font-medium text-slate-600 hover:text-slate-900 disabled:opacity-30 disabled:cursor-not-allowed px-2 py-1 rounded hover:bg-slate-200 transition-colors"
+                          >
+                            Next →
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
+              </div>
+
+              <div className="flex gap-3 pt-2 border-t">
+                <Button
+                  onClick={confirmReplaceMaterial}
+                  disabled={replacingMaterial || !selectedReplaceCatalogItem}
+                  className="flex-1 bg-green-600 hover:bg-green-700"
+                >
+                  {replacingMaterial ? (
+                    <>
+                      <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin mr-2" />
+                      Replacing...
+                    </>
+                  ) : (
+                    <>
+                      <ArrowLeftRight className="w-4 h-4 mr-2" />
+                      Replace with selected material
+                    </>
+                  )}
+                </Button>
+                <Button
+                  variant="outline"
+                  onClick={closeReplaceMaterialDialog}
+                  disabled={replacingMaterial}
+                >
+                  Cancel
+                </Button>
+              </div>
+            </div>
+          )}
         </DialogContent>
       </Dialog>
 
