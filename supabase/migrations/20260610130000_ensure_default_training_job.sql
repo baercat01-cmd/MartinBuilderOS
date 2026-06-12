@@ -5,7 +5,7 @@ SELECT
   'Internal',
   'N/A',
   'active',
-  false,
+  true,
   '[]'::jsonb,
   '[]'::jsonb
 WHERE NOT EXISTS (

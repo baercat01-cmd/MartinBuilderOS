@@ -11,7 +11,7 @@ import { Search, MapPin, ExternalLink, Target, Calendar as CalendarIcon, Package
 import { toast } from 'sonner';
 import { MaterialsCatalogBrowser } from './MaterialsCatalogBrowser';
 import type { Job } from '@/types';
-import { ensureDefaultTimeEntryJobs, prioritizeDefaultJobs } from '@/lib/defaultJobs';
+import { excludeDefaultTimeEntryJobsFromCards } from '@/lib/defaultJobs';
 
 interface JobSelectorProps {
   onSelectJob: (job: Job) => void;
@@ -45,8 +45,6 @@ export function JobSelector({ onSelectJob, userId, userRole, onShowJobCalendar, 
 
   async function loadJobs() {
     try {
-      const defaultJobs = await ensureDefaultTimeEntryJobs(userId);
-
       // Get today's date in YYYY-MM-DD format (local timezone)
       const today = new Date();
       const todayStr = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
@@ -82,9 +80,10 @@ export function JobSelector({ onSelectJob, userId, userRole, onShowJobCalendar, 
         jobManHours.set(entry.job_id, current + manHours);
       });
 
-      // Filter out Misc Jobs (internal jobs already excluded from query)
-      const filteredJobs = (jobsData || [])
-        .filter(job => job.name !== 'Misc Jobs');
+      // Filter out Misc Jobs and time-entry-only jobs (NCC, Training)
+      const filteredJobs = excludeDefaultTimeEntryJobsFromCards(
+        (jobsData || []).filter((job) => job.name !== 'Misc Jobs')
+      );
 
       // Load ready materials count and pull from shop count for each job
       const jobsWithMaterials = await Promise.all(
@@ -172,7 +171,7 @@ export function JobSelector({ onSelectJob, userId, userRole, onShowJobCalendar, 
       const totalPull = jobsWithMaterials.reduce((sum, job) => sum + (job.pull_from_shop_count || 0), 0);
       setTotalReadyMaterials(totalReady);
       setTotalPullMaterials(totalPull);
-      setJobs(prioritizeDefaultJobs(jobsWithMaterials, defaultJobs));
+      setJobs(jobsWithMaterials);
     } catch (error) {
       console.error('Error loading jobs:', error);
     } finally {

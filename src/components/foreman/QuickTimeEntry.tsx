@@ -9,7 +9,6 @@ import { Label } from '@/components/ui/label';
 import { Textarea } from '@/components/ui/textarea';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
-import { ScrollArea } from '@/components/ui/scroll-area';
 import { cn } from '@/lib/utils';
 import {
   Dialog,
@@ -1038,11 +1037,12 @@ export function QuickTimeEntry({ userId, onSuccess, onBack, allowedJobs, userRol
                       </Button>
                     </PopoverTrigger>
                     <PopoverContent
-                      className="w-[var(--radix-popover-trigger-width)] p-0"
+                      className="w-[var(--radix-popover-trigger-width)] p-0 flex flex-col h-[var(--radix-popper-available-height,85dvh)] max-h-[var(--radix-popper-available-height,85dvh)]"
                       align="start"
+                      collisionPadding={12}
                       onWheel={(event) => event.stopPropagation()}
                     >
-                      <div className="flex items-center border-b px-3">
+                      <div className="flex shrink-0 items-center border-b px-3">
                         <Search className="mr-2 h-4 w-4 shrink-0 opacity-50" />
                         <Input
                           value={jobSearchQuery}
@@ -1051,7 +1051,7 @@ export function QuickTimeEntry({ userId, onSuccess, onBack, allowedJobs, userRol
                           className="h-11 border-0 bg-transparent px-0 shadow-none focus-visible:ring-0"
                         />
                       </div>
-                      <ScrollArea className="h-[min(280px,45vh)]">
+                      <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain touch-pan-y [-webkit-overflow-scrolling:touch]">
                         <div className="p-1">
                           {filteredJobsForPicker.length === 0 ? (
                             <p className="py-6 text-center text-sm text-muted-foreground">No jobs found.</p>
@@ -1090,7 +1090,7 @@ export function QuickTimeEntry({ userId, onSuccess, onBack, allowedJobs, userRol
                             ))
                           )}
                         </div>
-                      </ScrollArea>
+                      </div>
                     </PopoverContent>
                   </Popover>
                 </div>

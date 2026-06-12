@@ -43,7 +43,7 @@ async function ensureDefaultJob(
       const needsUpdate =
         existing.client_name !== spec.client_name ||
         existing.status !== 'active' ||
-        existing.is_internal === true;
+        existing.is_internal !== true;
 
       if (!needsUpdate) {
         return existing as Job;
@@ -54,7 +54,7 @@ async function ensureDefaultJob(
         .update({
           client_name: spec.client_name,
           status: 'active',
-          is_internal: false,
+          is_internal: true,
         })
         .eq('id', existing.id)
         .select('*')
@@ -73,7 +73,7 @@ async function ensureDefaultJob(
         documents: [],
         components: [],
         status: 'active',
-        is_internal: false,
+        is_internal: true,
         created_by: userId || null,
       })
       .select('*')
@@ -104,6 +104,15 @@ export async function ensureDefaultNccJob(userId?: string): Promise<Job | null> 
 const DEFAULT_JOB_NAME_KEYS = new Set(
   DEFAULT_TIME_ENTRY_JOBS.map((job) => job.name.trim().toLowerCase())
 );
+
+export function isDefaultTimeEntryJobName(name: string): boolean {
+  return DEFAULT_JOB_NAME_KEYS.has(name.trim().toLowerCase());
+}
+
+/** Hide NCC / Training from foreman job cards; they remain in time-entry pickers. */
+export function excludeDefaultTimeEntryJobsFromCards<T extends Job>(jobs: T[]): T[] {
+  return jobs.filter((job) => !isDefaultTimeEntryJobName(job.name));
+}
 
 /** Keep one row per default job name (NCC, Training) in picker lists. */
 export function dedupeDefaultJobNames(jobs: Job[]): Job[] {

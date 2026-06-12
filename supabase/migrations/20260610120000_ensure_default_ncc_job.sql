@@ -5,7 +5,7 @@ SELECT
   'Sheldon Weaver',
   'N/A',
   'active',
-  false,
+  true,
   '[]'::jsonb,
   '[]'::jsonb
 WHERE NOT EXISTS (
