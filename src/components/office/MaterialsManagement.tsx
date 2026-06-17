@@ -572,8 +572,10 @@ export function MaterialsManagement({
   }, [workbook]);
 
   // Fill Metal rows that have no workbook $/ft yet from materials_catalog (import). Never overwrite custom/workbook pricing.
+  // Only seed editable working workbooks — locked proposals keep their own per-ft prices.
   useEffect(() => {
     if (!workbook?.sheets?.length || Object.keys(metalCatalogBySku).length === 0) return;
+    if (workbook.status !== 'working' || snapshotWorkbookId || isWorkbookReadOnlyRef.current) return;
     const metalItems: MaterialItem[] = [];
     workbook.sheets.forEach((s: MaterialSheet) => {
       s.items.forEach((i: MaterialItem) => {
@@ -1365,11 +1367,14 @@ export function MaterialsManagement({
    * fetch materials_catalog and merge cost/price/length (part_length from books) into the items in memory.
    * Used so the first paint shows cost/price/length without waiting for DB backfill.
    */
-  async function enrichItemsWithCatalogPrices(items: any[]): Promise<any[]> {
+  async function enrichItemsWithCatalogPrices(
+    items: any[],
+    opts?: { allowCatalogPriceSeed?: boolean },
+  ): Promise<any[]> {
+    const allowCatalogPrice = opts?.allowCatalogPriceSeed === true;
     const needsEnrich = items.filter(
       (i: any) => i.sku && (
-        i.cost_per_unit == null ||
-        i.price_per_unit == null ||
+        (allowCatalogPrice && (i.cost_per_unit == null || i.price_per_unit == null)) ||
         (i.length == null || i.length === '')
       )
     );
@@ -1403,6 +1408,15 @@ export function MaterialsManagement({
       const rawPartLength = cat.part_length != null && String(cat.part_length).trim() !== '' ? String(cat.part_length).trim() : null;
       const unitOnly = /^(pcs|pc|bag|bags|lf|ft|piece|pieces|ea|each|units?|linear\s*ft)$/i;
       const catalogLength = rawPartLength && !unitOnly.test(rawPartLength) ? rawPartLength : null;
+      const rawItemLength = (item.length != null && item.length !== '') ? String(item.length).trim() : null;
+      const itemLengthIsUnit = rawItemLength && unitOnly.test(rawItemLength);
+      const mergedLength = !itemLengthIsUnit && rawItemLength ? rawItemLength : catalogLength;
+
+      if (!allowCatalogPrice) {
+        if (!mergedLength || mergedLength === item.length) return item;
+        return { ...item, length: mergedLength };
+      }
+
       if (cost === 0 && price === 0 && !catalogLength) return item;
 
       const safeCost = cost > 0 ? Math.round(cost * 10000) / 10000 : null;
@@ -1412,9 +1426,6 @@ export function MaterialsManagement({
           ? Math.round(((safePrice - safeCost) / safeCost) * 100 * 10000) / 10000
           : null;
       const qty = Number(item.quantity) || 1;
-      const rawItemLength = (item.length != null && item.length !== '') ? String(item.length).trim() : null;
-      const itemLengthIsUnit = rawItemLength && unitOnly.test(rawItemLength);
-      const mergedLength = !itemLengthIsUnit && rawItemLength ? rawItemLength : catalogLength;
       const mult = getEffectiveMultiplierForExtended(item, mergedLength ?? null, qty);
 
       return {
@@ -1440,9 +1451,9 @@ export function MaterialsManagement({
    * look up the catalog and patch the DB values in the background.
    * Does NOT block the render; triggers a silent reload if any rows were updated.
    */
-  async function backfillMissingPricesFromCatalog(items: any[]) {
+  async function backfillMissingPricesFromCatalog(items: any[], allowCatalogSeed = false) {
     try {
-      if (isWorkbookReadOnlyRef.current) return;
+      if (!allowCatalogSeed || isWorkbookReadOnlyRef.current) return;
       const needsPrice = items.filter(
         (i: any) => i.sku && (i.cost_per_unit == null || i.price_per_unit == null)
       );
@@ -1491,9 +1502,10 @@ export function MaterialsManagement({
       }
 
       if (patched > 0) {
-        // Invalidate cache so the reload gets fresh data from DB with persisted cost/price
+        // Invalidate cache for this proposal only so the reload gets fresh data from DB with persisted cost/price
+        const quoteKey = effectiveQuoteId ?? 'none';
         for (const key of workbookCache.keys()) {
-          if (key.startsWith(`${job.id}:`)) workbookCache.delete(key);
+          if (key.startsWith(`${job.id}:${quoteKey}:`)) workbookCache.delete(key);
         }
         loadWorkbook(true);
       }
@@ -1910,7 +1922,9 @@ export function MaterialsManagement({
 
       // Enrich items that have a SKU but missing cost/price with values from materials_catalog
       // so the sheet shows cost and price on first paint when the catalog has them.
-      itemsData = await enrichItemsWithCatalogPrices(itemsData);
+      // Locked/snapshot workbooks keep proposal-specific prices — catalog is only for editable working copies.
+      const allowCatalogPriceSeed = workbookData.status === 'working' && !snapActive;
+      itemsData = await enrichItemsWithCatalogPrices(itemsData, { allowCatalogPriceSeed });
 
       // Sort: proposal sheets first, then change order sheets (each group by order_index)
       sheetsData.sort((a: any, b: any) => {
@@ -1965,7 +1979,7 @@ export function MaterialsManagement({
 
       // Background: backfill cost/price from catalog for any item that has a SKU but no price.
       // Runs silently; if it patches any rows it triggers a silent reload so the user sees prices.
-      backfillMissingPricesFromCatalog(itemsData);
+      backfillMissingPricesFromCatalog(itemsData, allowCatalogPriceSeed);
 
       // Only set active sheet to first when current selection is empty or not in the new list.
       // Use ref so realtime/subscription callbacks (stale closure) don't overwrite user's choice.
@@ -2768,6 +2782,18 @@ export function MaterialsManagement({
       }));
 
     if (categoryOrder && categoryOrder.length > 0) {
+      const seen = new Set(groups.map((g) => g.category.trim().toLowerCase()));
+      for (const name of categoryOrder) {
+        const trimmed = String(name ?? '').trim();
+        if (!trimmed) continue;
+        const key = trimmed.toLowerCase();
+        if (seen.has(key)) continue;
+        groups.push({ category: trimmed, items: [], minOrderIndex: Infinity });
+        seen.add(key);
+      }
+    }
+
+    if (categoryOrder && categoryOrder.length > 0) {
       // User-defined order: known categories first (in their saved order), unknowns appended by minOrderIndex
       const orderMap = new Map(categoryOrder.map((name, idx) => [name, idx]));
       return groups.sort((a, b) => {
@@ -2823,6 +2849,38 @@ export function MaterialsManagement({
     return catGroup.items.some((i) => parseLengthToFeet(i.length) != null && parseLengthToFeet(i.length)! > 0);
   }
 
+  /** Global catalog $/ft is only for seeding editable working workbooks — not locked proposal snapshots. */
+  function shouldUseGlobalMetalCatalog(): boolean {
+    if (snapshotWorkbookId) return false;
+    if (workbook?.status === 'locked') return false;
+    return workbook?.status === 'working';
+  }
+
+  /** Derive per-ft cost/price from stored extended totals when per-unit fields are missing (locked snapshots). */
+  function deriveMetalPlfFromItem(item: MaterialItem): { costPerFoot: number | null; pricePerFoot: number | null } {
+    if (item.category !== 'Metal') return { costPerFoot: null, pricePerFoot: null };
+    if (item.cost_per_unit != null || item.price_per_unit != null) {
+      return {
+        costPerFoot: item.cost_per_unit != null ? Number(item.cost_per_unit) : null,
+        pricePerFoot: item.price_per_unit != null ? Number(item.price_per_unit) : null,
+      };
+    }
+    const lengthFeet = parseLengthToFeet(item.length);
+    const qty = Number(item.quantity) || 1;
+    const mult = lengthFeet != null && lengthFeet > 0 ? lengthFeet * qty : qty;
+    if (mult <= 0) return { costPerFoot: null, pricePerFoot: null };
+    return {
+      costPerFoot:
+        item.extended_cost != null
+          ? Math.round((Number(item.extended_cost) / mult) * 10000) / 10000
+          : null,
+      pricePerFoot:
+        item.extended_price != null
+          ? Math.round((Number(item.extended_price) / mult) * 10000) / 10000
+          : null,
+    };
+  }
+
   /** Get cost/price per foot for category header. Metal: prefer workbook (item) per-ft when set; else materials_catalog by SKU. */
   function getCategoryFootPrice(catGroup: CategoryGroup): { costPerFoot: number | null; pricePerFoot: number | null } {
     const linealItems = catGroup.items.filter((i) => {
@@ -2834,19 +2892,25 @@ export function MaterialsManagement({
 
     if (catGroup.category === 'Metal') {
       const fromItem = linealItems.find((i) => i.cost_per_unit != null || i.price_per_unit != null);
-      if (fromItem && (fromItem.cost_per_unit != null || fromItem.price_per_unit != null)) {
+      if (fromItem) {
         return {
           costPerFoot: fromItem.cost_per_unit ?? null,
           pricePerFoot: fromItem.price_per_unit ?? null,
         };
       }
-      if (withLength.sku && metalCatalogBySku[withLength.sku]) {
+      const withExtended = linealItems.find((i) => i.extended_cost != null || i.extended_price != null);
+      if (withExtended) {
+        const derived = deriveMetalPlfFromItem(withExtended);
+        if (derived.costPerFoot != null || derived.pricePerFoot != null) return derived;
+      }
+      if (shouldUseGlobalMetalCatalog() && withLength.sku && metalCatalogBySku[withLength.sku]) {
         const cat = metalCatalogBySku[withLength.sku];
         return {
           costPerFoot: cat.purchase_cost > 0 ? cat.purchase_cost : null,
           pricePerFoot: cat.unit_price > 0 ? cat.unit_price : null,
         };
       }
+      return { costPerFoot: null, pricePerFoot: null };
     }
     const hasItemPrices = withLength.cost_per_unit != null || withLength.price_per_unit != null;
     if (hasItemPrices) {
@@ -2868,6 +2932,7 @@ export function MaterialsManagement({
   function getMetalPlf(item: MaterialItem): { costPerFoot: number; pricePerFoot: number } | null {
     if (item.category !== 'Metal' || !item.sku) return null;
     if (item.cost_per_unit != null || item.price_per_unit != null) return null;
+    if (!shouldUseGlobalMetalCatalog()) return null;
     const cat = metalCatalogBySku[item.sku];
     if (!cat || (cat.purchase_cost === 0 && cat.unit_price === 0)) return null;
     return {
@@ -2880,12 +2945,14 @@ export function MaterialsManagement({
   function getMetalCostPerFootDisplay(item: MaterialItem): number | null {
     if (item.category !== 'Metal') return null;
     if (item.cost_per_unit != null) return Number(item.cost_per_unit);
+    if (!shouldUseGlobalMetalCatalog()) return deriveMetalPlfFromItem(item).costPerFoot;
     return getMetalPlf(item)?.costPerFoot ?? null;
   }
 
   function getMetalPricePerFootDisplay(item: MaterialItem): number | null {
     if (item.category !== 'Metal') return null;
     if (item.price_per_unit != null) return Number(item.price_per_unit);
+    if (!shouldUseGlobalMetalCatalog()) return deriveMetalPlfFromItem(item).pricePerFoot;
     return getMetalPlf(item)?.pricePerFoot ?? null;
   }
 
@@ -4341,7 +4408,7 @@ export function MaterialsManagement({
         if (itemsErr) return null;
         itemsData = itemsRes || [];
       }
-      itemsData = await enrichItemsWithCatalogPrices(itemsData);
+      itemsData = await enrichItemsWithCatalogPrices(itemsData, { allowCatalogPriceSeed: true });
       sheets.sort((a: any, b: any) => {
         const typeA = a.sheet_type === 'change_order' ? 1 : 0;
         const typeB = b.sheet_type === 'change_order' ? 1 : 0;

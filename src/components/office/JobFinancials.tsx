@@ -919,6 +919,78 @@ function isWorkbookLaborCategoryName(name: unknown): boolean {
   );
 }
 
+type SheetCategoryBreakdown = {
+  name: string;
+  itemCount: number;
+  items: any[];
+  totalCost: number;
+  totalPrice: number;
+  profit: number;
+  margin: number;
+  isCategoryOptional?: boolean;
+};
+
+function sortSheetCategoriesByOrder(
+  categories: SheetCategoryBreakdown[],
+  categoryOrder?: string[] | null
+): SheetCategoryBreakdown[] {
+  const order = (categoryOrder || []).map((n) => String(n ?? '').trim()).filter(Boolean);
+  if (!order.length) {
+    return [...categories].sort((a, b) => {
+      const aMinOrder = Math.min(...(a.items || []).map((it: any) => Number(it.order_index ?? Infinity)));
+      const bMinOrder = Math.min(...(b.items || []).map((it: any) => Number(it.order_index ?? Infinity)));
+      if (aMinOrder !== bMinOrder) return aMinOrder - bMinOrder;
+      return String(a.name || '').localeCompare(String(b.name || ''), undefined, { sensitivity: 'base' });
+    });
+  }
+  const orderMap = new Map(order.map((name, idx) => [name.toLowerCase(), idx]));
+  return [...categories].sort((a, b) => {
+    const ai = orderMap.has(a.name.trim().toLowerCase()) ? orderMap.get(a.name.trim().toLowerCase())! : Infinity;
+    const bi = orderMap.has(b.name.trim().toLowerCase()) ? orderMap.get(b.name.trim().toLowerCase())! : Infinity;
+    if (ai !== bi) return ai - bi;
+    const aMinOrder = Math.min(...(a.items || []).map((it: any) => Number(it.order_index ?? Infinity)));
+    const bMinOrder = Math.min(...(b.items || []).map((it: any) => Number(it.order_index ?? Infinity)));
+    if (aMinOrder !== bMinOrder) return aMinOrder - bMinOrder;
+    return String(a.name || '').localeCompare(String(b.name || ''), undefined, { sensitivity: 'base' });
+  });
+}
+
+/** Include workbook category_order rows even when no material_items exist yet (e.g. Drywall). */
+function mergeCategoryOrderPlaceholders(
+  categories: SheetCategoryBreakdown[],
+  categoryOrder: string[] | null | undefined,
+  options?: { sheetId?: string; categoryOptionalMap?: Map<string, boolean> }
+): SheetCategoryBreakdown[] {
+  const order = (categoryOrder || []).map((n) => String(n ?? '').trim()).filter(Boolean);
+  const byNameLower = new Map(
+    categories.map((c) => [String(c.name ?? '').trim().toLowerCase(), c])
+  );
+  const result = [...categories];
+
+  for (const name of order) {
+    const key = name.toLowerCase();
+    if (byNameLower.has(key)) continue;
+    const isCategoryOptional =
+      options?.sheetId && options.categoryOptionalMap
+        ? options.categoryOptionalMap.get(`${options.sheetId}_${name}`) === true
+        : false;
+    const placeholder: SheetCategoryBreakdown = {
+      name,
+      itemCount: 0,
+      items: [],
+      totalCost: 0,
+      totalPrice: 0,
+      profit: 0,
+      margin: 0,
+      isCategoryOptional,
+    };
+    result.push(placeholder);
+    byNameLower.set(key, placeholder);
+  }
+
+  return sortSheetCategoriesByOrder(result, order.length ? order : categoryOrder);
+}
+
 /**
  * `sheetLabor` can include rows merged from another workbook/sheet onto this section for display.
  * Those objects set `labor_source_sheet_id` to the DB row's real `material_sheets.id`.
@@ -1521,7 +1593,11 @@ function SortableRow({
                       ? categoryCostDisplay
                       : categoryCostDisplay * (1 + (Number(categoryMarkup) || 0) / 100);
                     
-                    const categoryIsOptional = category.items?.every((i: any) => i.isOptional) ?? false;
+                    const categoryIsOptional =
+                      category.isCategoryOptional === true ||
+                      (category.items?.length
+                        ? category.items.every((i: any) => i.isOptional)
+                        : false);
                     return (
                       <div key={catIdx} className={`bg-slate-50 border rounded p-2 ${categoryIsOptional ? 'border-amber-300 bg-amber-50/50' : 'border-slate-200'}`}>
                         <div className="flex items-center justify-between">
@@ -8727,7 +8803,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
             (item.extended_price != null && item.extended_price !== '')
               ? Number(item.extended_price)
               : (Number(item.quantity) || 0) * (Number(item.price_per_unit) || 0);
-          const categories = Array.from(categoryMap.entries()).map(([categoryName, items]) => {
+          const builtCategories = Array.from(categoryMap.entries()).map(([categoryName, items]) => {
             const totalCost = items
               .filter((item: any) => !toBool(item.is_optional))
               .reduce((sum, item) => {
@@ -8765,18 +8841,13 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
               totalPrice,
               profit,
               margin,
+              isCategoryOptional: items.length > 0 ? items.every((item: any) => toBool(item.is_optional)) : false,
             };
-          }).sort((a, b) => {
-            const categoryOrder = Array.isArray((sheet as any).category_order) ? (sheet as any).category_order as string[] : [];
-            const orderMap = new Map(categoryOrder.map((name, idx) => [name, idx]));
-            const ai = orderMap.has(a.name) ? orderMap.get(a.name)! : Infinity;
-            const bi = orderMap.has(b.name) ? orderMap.get(b.name)! : Infinity;
-            if (ai !== bi) return ai - bi;
-            const aMinOrder = Math.min(...(a.items || []).map((it: any) => Number(it.order_index ?? Infinity)));
-            const bMinOrder = Math.min(...(b.items || []).map((it: any) => Number(it.order_index ?? Infinity)));
-            if (aMinOrder !== bMinOrder) return aMinOrder - bMinOrder;
-            return String(a.name || '').localeCompare(String(b.name || ''), undefined, { sensitivity: 'base' });
           });
+          const categories = mergeCategoryOrderPlaceholders(
+            builtCategories,
+            (sheet as any).category_order
+          );
           
           // Calculate sheet totals
           const sheetTotalCost = categories.reduce((sum, cat) => sum + cat.totalCost, 0);
@@ -9586,7 +9657,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
           (item.extended_price != null && item.extended_price !== '')
             ? Number(item.extended_price)
             : (Number(item.quantity) || 0) * (Number(item.price_per_unit) || 0);
-          const categories = Array.from(categoryMap.entries()).map(([categoryName, items]) => {
+        const builtCategories = Array.from(categoryMap.entries()).map(([categoryName, items]) => {
           const isCategoryOptional = categoryOptionalMap.get(`${sheet.id}_${categoryName}`) === true;
           const totalCost = isCategoryOptional ? 0 : items.reduce((sum, item) => {
             const extended = Number(item.extended_cost) || 0;
@@ -9621,17 +9692,12 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
             totalPrice,
             profit,
             margin,
+            isCategoryOptional,
           };
-        }).sort((a, b) => {
-          const categoryOrder = Array.isArray((sheet as any).category_order) ? (sheet as any).category_order as string[] : [];
-          const orderMap = new Map(categoryOrder.map((name, idx) => [name, idx]));
-          const ai = orderMap.has(a.name) ? orderMap.get(a.name)! : Infinity;
-          const bi = orderMap.has(b.name) ? orderMap.get(b.name)! : Infinity;
-          if (ai !== bi) return ai - bi;
-          const aMinOrder = Math.min(...(a.items || []).map((it: any) => Number(it.order_index ?? Infinity)));
-          const bMinOrder = Math.min(...(b.items || []).map((it: any) => Number(it.order_index ?? Infinity)));
-          if (aMinOrder !== bMinOrder) return aMinOrder - bMinOrder;
-          return String(a.name || '').localeCompare(String(b.name || ''), undefined, { sensitivity: 'base' });
+        });
+        const categories = mergeCategoryOrderPlaceholders(builtCategories, (sheet as any).category_order, {
+          sheetId: sheet.id,
+          categoryOptionalMap,
         });
 
         // Calculate sheet totals
@@ -13828,7 +13894,9 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
   materialsBreakdown.sheetBreakdowns.forEach((sheet: any) => {
     if (isInternalWorkbookSheetName(sheet.sheetName)) return;
     (sheet.categories || []).forEach((cat: any) => {
-      const isOptional = cat.items?.every((i: any) => i.isOptional) ?? false;
+      const isOptional =
+        cat.isCategoryOptional === true ||
+        (cat.items?.length ? cat.items.every((i: any) => i.isOptional) : false);
       if (!isOptional) return;
       const key = `${sheet.sheetId}_${cat.name}`;
       const markup = categoryMarkups[key] ?? (sheet.markup_percent ?? 10);
