@@ -3,7 +3,7 @@ import { supabase } from '@/lib/supabase';
 import { useAuth } from '@/hooks/useAuth';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
-import { Building2, Settings, ArrowLeft } from 'lucide-react';
+import { Building2, LogOut, Settings, ArrowLeft } from 'lucide-react';
 import { toast } from 'sonner';
 import { VehicleManagement } from '@/components/fleet/VehicleManagement';
 import { FleetSettings } from '@/components/fleet/FleetSettings';
@@ -136,8 +136,18 @@ export function FleetDashboard({ hideHeader = false, defaultCompany }: FleetDash
                 size="sm"
                 onClick={() => setShowSettings(true)}
                 className="text-white hover:text-yellow-400"
+                aria-label="Fleet settings"
               >
                 <Settings className="w-5 h-5" />
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={handleLogout}
+                className="text-white hover:text-yellow-400"
+                aria-label="Sign out"
+              >
+                <LogOut className="w-5 h-5" />
               </Button>
             </div>
           </div>

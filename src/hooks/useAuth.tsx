@@ -8,6 +8,8 @@ interface AuthContextType {
   profile: UserProfile | null;
   loading: boolean;
   authState: AuthState;
+  /** Bumps on sign-out so the login screen remounts with a fresh user list. */
+  userSelectKey: number;
   selectUser: (user: UserProfile) => void;
   clearUser: () => void;
   markAuthenticated: () => void;
@@ -19,6 +21,7 @@ const AuthContext = createContext<AuthContextType>({
   profile: null,
   loading: true,
   authState: 'unauthenticated',
+  userSelectKey: 0,
   selectUser: () => {},
   clearUser: () => {},
   markAuthenticated: () => {},
@@ -29,6 +32,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [profile, setProfile] = useState<UserProfile | null>(null);
   const [loading, setLoading] = useState(true);
   const [authState, setAuthState] = useState<AuthState>('unauthenticated');
+  const [userSelectKey, setUserSelectKey] = useState(0);
 
   useEffect(() => {
     // Try to restore authenticated user from localStorage
@@ -127,6 +131,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
     setProfile(null);
     setAuthState('unauthenticated');
+    setUserSelectKey((k) => k + 1);
   }
 
   function markAuthenticated() {
@@ -139,7 +144,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }
 
   return (
-    <AuthContext.Provider value={{ profile, loading, authState, selectUser, clearUser, markAuthenticated, patchProfile }}>
+    <AuthContext.Provider
+      value={{ profile, loading, authState, userSelectKey, selectUser, clearUser, markAuthenticated, patchProfile }}
+    >
       {children}
     </AuthContext.Provider>
   );

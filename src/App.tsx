@@ -79,7 +79,7 @@ class ErrorBoundary extends Component<
 }
 
 function AppContent() {
-  const { profile, loading, selectUser, clearUser, authState } = useAuth();
+  const { profile, loading, selectUser, clearUser, authState, userSelectKey } = useAuth();
   
   // Debug logging in development only
   if (import.meta.env.DEV) {
@@ -104,7 +104,7 @@ function AppContent() {
 
   // Authentication flow based on state
   if (!profile) {
-    return <UserSelectPage onSelectUser={selectUser} />;
+    return <UserSelectPage key={userSelectKey} onSelectUser={selectUser} />;
   }
 
   // User selected but needs to set up PIN
