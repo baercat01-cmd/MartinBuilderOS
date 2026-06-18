@@ -1,5 +1,4 @@
-import { useState, useEffect } from 'react';
-import { supabase } from '@/lib/supabase';
+import { useState } from 'react';
 import {
   Dialog,
   DialogContent,
@@ -33,14 +32,18 @@ export function VehicleDetailsDialog({
   const [activeTab, setActiveTab] = useState('info');
 
   return (
-    <Dialog open={true} onOpenChange={onClose}>
-      <DialogContent className="max-w-4xl max-h-[90vh] overflow-hidden flex flex-col p-0">
-        <DialogHeader className="px-6 pt-6 pb-3 border-b">
-          <DialogTitle>{vehicle.vehicle_name}</DialogTitle>
+    <Dialog open={true} onOpenChange={(open) => !open && onClose()}>
+      <DialogContent
+        className="h-screen w-screen max-w-none flex flex-col p-0 m-0 rounded-none"
+        onInteractOutside={(e) => e.preventDefault()}
+        onPointerDownOutside={(e) => e.preventDefault()}
+      >
+        <DialogHeader className="px-4 pt-4 pb-3 border-b shrink-0 bg-white">
+          <DialogTitle className="text-xl">{vehicle.vehicle_name}</DialogTitle>
         </DialogHeader>
 
-        <Tabs value={activeTab} onValueChange={setActiveTab} className="flex-1 flex flex-col overflow-hidden">
-          <TabsList className="grid w-full grid-cols-4 mx-6 bg-slate-200">
+        <Tabs value={activeTab} onValueChange={setActiveTab} className="flex-1 flex flex-col min-h-0 overflow-hidden">
+          <TabsList className="grid w-full grid-cols-4 mx-4 mt-3 shrink-0 bg-slate-200">
             <TabsTrigger value="info" className="font-semibold data-[state=active]:bg-yellow-600 data-[state=active]:text-black">
               <Info className="w-4 h-4 mr-1" />
               Info
@@ -59,7 +62,7 @@ export function VehicleDetailsDialog({
             </TabsTrigger>
           </TabsList>
 
-          <div className="flex-1 overflow-y-auto px-6 py-4">
+          <div className="flex-1 min-h-0 overflow-y-auto px-4 py-4">
             <TabsContent value="info" className="mt-0">
               <VehicleInfoTab vehicle={vehicle} onVehicleUpdated={onVehicleUpdated} />
             </TabsContent>

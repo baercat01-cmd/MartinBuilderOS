@@ -100,12 +100,16 @@ export function FleetDashboard({ hideHeader = false, defaultCompany }: FleetDash
               {hideHeader ? 'Back to fleet' : 'Back'}
             </Button>
             <h1 className={`text-lg font-bold truncate ${hideHeader ? 'text-slate-900' : 'text-white'}`}>
-              Fleet Settings
+              Fleet Settings{selectedCompany ? ` — ${selectedCompany.name}` : ''}
             </h1>
             <div className="w-20 shrink-0 hidden sm:block" aria-hidden />
           </div>
         </div>
-        <FleetSettings onClose={() => setShowSettings(false)} onLogout={handleLogout} />
+        <FleetSettings
+          company={selectedCompany}
+          onClose={() => setShowSettings(false)}
+          onLogout={handleLogout}
+        />
       </div>
     );
   }

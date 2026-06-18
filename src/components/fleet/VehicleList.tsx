@@ -54,6 +54,8 @@ export function VehicleList({
   const [selectedVehicle, setSelectedVehicle] = useState<Vehicle | null>(null);
   const [serviceVehicleId, setServiceVehicleId] = useState<string | null>(null);
   const [serviceVehicleType, setServiceVehicleType] = useState<string>('');
+  const [serviceEditLogId, setServiceEditLogId] = useState<string | null>(null);
+  const [openTicketByVehicle, setOpenTicketByVehicle] = useState<Record<string, string>>({});
 
   useEffect(() => {
     loadVehicles();
@@ -76,7 +78,30 @@ export function VehicleList({
       const { data, error } = await query;
 
       if (error) throw error;
-      setVehicles(data || []);
+      const list = data || [];
+      setVehicles(list);
+
+      const vehicleIds = list.map((v) => v.id);
+      if (vehicleIds.length === 0) {
+        setOpenTicketByVehicle({});
+      } else {
+        const { data: openLogs, error: openError } = await supabase
+          .from('maintenance_logs')
+          .select('id, vehicle_id, date')
+          .in('vehicle_id', vehicleIds)
+          .neq('status', 'complete')
+          .order('date', { ascending: false });
+
+        if (openError) throw openError;
+
+        const byVehicle: Record<string, string> = {};
+        for (const log of openLogs || []) {
+          if (!byVehicle[log.vehicle_id]) {
+            byVehicle[log.vehicle_id] = log.id;
+          }
+        }
+        setOpenTicketByVehicle(byVehicle);
+      }
     } catch (error) {
       console.error('Error loading vehicles:', error);
       toast.error('Failed to load vehicles');
@@ -250,12 +275,13 @@ export function VehicleList({
                   e.stopPropagation();
                   setServiceVehicleId(vehicle.id);
                   setServiceVehicleType(vehicle.type);
+                  setServiceEditLogId(openTicketByVehicle[vehicle.id] ?? null);
                 }}
                 className="w-full bg-yellow-600 hover:bg-yellow-700 text-black font-semibold"
                 size="sm"
               >
                 <Wrench className="w-4 h-4 mr-2" />
-                Add Service/Repair
+                {openTicketByVehicle[vehicle.id] ? 'Open Ticket' : 'Add Service/Repair'}
               </Button>
             </CardContent>
           </Card>
@@ -279,15 +305,17 @@ export function VehicleList({
           onClose={() => {
             setServiceVehicleId(null);
             setServiceVehicleType('');
+            setServiceEditLogId(null);
           }}
           vehicleId={serviceVehicleId}
           vehicleType={serviceVehicleType}
+          editLogId={serviceEditLogId}
           onSuccess={() => {
             setServiceVehicleId(null);
             setServiceVehicleType('');
+            setServiceEditLogId(null);
             loadVehicles();
             onVehicleUpdated();
-            toast.success('Maintenance log added successfully');
           }}
         />
       )}

@@ -109,9 +109,38 @@ export function isDefaultTimeEntryJobName(name: string): boolean {
   return DEFAULT_JOB_NAME_KEYS.has(name.trim().toLowerCase());
 }
 
-/** Hide NCC / Training from foreman job cards; they remain in time-entry pickers. */
+function normalizeJobField(value: string | null | undefined): string {
+  return (value || '').trim().toLowerCase();
+}
+
+/** Jobs used only for clock-in (NCC, Training, etc.) — not shown as job cards. */
+export function isTimeEntryOnlyJob(
+  job: Pick<Job, 'name' | 'client_name' | 'is_internal'>
+): boolean {
+  if (job.is_internal) return true;
+
+  const name = normalizeJobField(job.name);
+  const client = normalizeJobField(job.client_name);
+
+  if (isDefaultTimeEntryJobName(job.name)) return true;
+
+  return DEFAULT_TIME_ENTRY_JOBS.some(
+    (spec) =>
+      normalizeJobField(spec.name) === name &&
+      normalizeJobField(spec.client_name) === client
+  );
+}
+
+/** Whether a job should appear as a card in office/foreman job lists. */
+export function isVisibleJobCard(
+  job: Pick<Job, 'name' | 'client_name' | 'is_internal'>
+): boolean {
+  return !isTimeEntryOnlyJob(job);
+}
+
+/** Hide time-entry-only jobs from job cards; they remain in clock-in pickers. */
 export function excludeDefaultTimeEntryJobsFromCards<T extends Job>(jobs: T[]): T[] {
-  return jobs.filter((job) => !isDefaultTimeEntryJobName(job.name));
+  return jobs.filter((job) => isVisibleJobCard(job));
 }
 
 /** Keep one row per default job name (NCC, Training) in picker lists. */

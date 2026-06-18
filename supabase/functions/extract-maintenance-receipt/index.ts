@@ -1,23 +1,31 @@
 import { corsHeaders } from '../_shared/cors.ts';
 
-const EXTRACTION_PROMPT = `Extract all parts line items from this maintenance or auto parts receipt (PDF or image).
+const EXTRACTION_PROMPT = `Extract maintenance or auto parts receipt data from this PDF or image.
 Return a JSON object:
 {
-  "parts": [
+  "invoices": [
     {
-      "part_number": "SKU or part number if visible, otherwise null",
-      "description": "Item description",
-      "cost": 12.34
+      "invoice_number": "Invoice or receipt number as printed",
+      "vendor": "Store or supplier name",
+      "parts": [
+        {
+          "part_number": "SKU or part number if visible, otherwise null",
+          "description": "Item description",
+          "cost": 12.34
+        }
+      ]
     }
   ],
   "total_amount": 123.45
 }
 
 Rules:
-- Include every distinct line item with its price.
+- If the document contains MULTIPLE invoices or receipts, return one object per invoice in "invoices".
+- Each invoice's "parts" must only include line items belonging to that invoice number.
 - "cost" is the line total for that item.
 - Use null for part_number when not printed.
 - Exclude tax/subtotal rows from "parts".
+- If invoice_number is missing, use null. If vendor is missing, use null.
 - Return ONLY the JSON object.`;
 
 Deno.serve(async (req) => {
@@ -60,7 +68,7 @@ Deno.serve(async (req) => {
             { type: 'image_url', image_url: { url: dataUrl } },
           ],
         }],
-        max_tokens: 4096,
+        max_tokens: 8192,
         temperature: 0,
       }),
     });
@@ -74,17 +82,48 @@ Deno.serve(async (req) => {
     const jsonMatch = extractedText.match(/\{[\s\S]*\}/);
     const extractedData = JSON.parse(jsonMatch ? jsonMatch[0] : extractedText);
 
-    const parts = (extractedData.parts || [])
-      .filter((item: { description?: string; part_number?: string; cost?: number }) =>
-        item.description || item.part_number || item.cost != null)
-      .map((item: { part_number?: string; description?: string; cost?: number }) => ({
-        part_number: item.part_number || '',
-        description: item.description || '',
-        cost: item.cost != null ? Number(item.cost) : null,
-      }));
+    type RawPart = { part_number?: string; description?: string; cost?: number | null };
+    type RawInvoice = { invoice_number?: string | null; vendor?: string | null; parts?: RawPart[] };
+
+    const normalizeParts = (items: RawPart[] = []) =>
+      items
+        .filter((item) => item.description || item.part_number || item.cost != null)
+        .map((item) => ({
+          part_number: item.part_number || '',
+          description: item.description || '',
+          cost: item.cost != null ? Number(item.cost) : null,
+        }));
+
+    let invoices: Array<{ invoice_number: string; vendor: string; parts: ReturnType<typeof normalizeParts> }> = [];
+
+    if (Array.isArray(extractedData.invoices) && extractedData.invoices.length > 0) {
+      invoices = (extractedData.invoices as RawInvoice[])
+        .map((inv) => ({
+          invoice_number: inv.invoice_number?.trim() || '',
+          vendor: inv.vendor?.trim() || '',
+          parts: normalizeParts(inv.parts),
+        }))
+        .filter((inv) => inv.parts.length > 0 || inv.invoice_number || inv.vendor);
+    }
+
+    // Legacy single-list shape
+    if (invoices.length === 0 && Array.isArray(extractedData.parts)) {
+      const parts = normalizeParts(extractedData.parts);
+      if (parts.length > 0) {
+        invoices = [{
+          invoice_number: extractedData.invoice_number?.trim() || '',
+          vendor: extractedData.vendor?.trim() || '',
+          parts,
+        }];
+      }
+    }
 
     return new Response(
-      JSON.stringify({ success: true, parts, total_amount: extractedData.total_amount ?? null }),
+      JSON.stringify({
+        success: true,
+        invoices,
+        total_amount: extractedData.total_amount ?? null,
+      }),
       { headers: { ...corsHeaders, 'Content-Type': 'application/json' } },
     );
   } catch (error: unknown) {

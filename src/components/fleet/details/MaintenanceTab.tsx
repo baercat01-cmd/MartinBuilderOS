@@ -12,6 +12,8 @@ interface MaintenanceLogPart {
   part_number: string | null;
   description: string | null;
   cost: number | null;
+  invoice_number?: string | null;
+  vendor?: string | null;
 }
 
 interface MaintenanceLogDocument {
@@ -67,7 +69,7 @@ export function MaintenanceTab({ vehicleId, vehicleType }: MaintenanceTabProps) 
       if (logIds.length) {
         const { data: parts } = await supabase
           .from('maintenance_log_parts')
-          .select('id, maintenance_log_id, part_number, description, cost')
+          .select('id, maintenance_log_id, part_number, description, cost, invoice_number, vendor')
           .in('maintenance_log_id', logIds)
           .order('order_index', { ascending: true });
 
@@ -232,6 +234,12 @@ export function MaintenanceTab({ vehicleId, vehicleType }: MaintenanceTabProps) 
                         {log.parts.slice(0, 3).map((part) => (
                           <div key={part.id} className="flex items-center justify-between text-xs text-slate-600">
                             <span className="truncate mr-2">
+                              {part.invoice_number && (
+                                <span className="text-slate-500">#{part.invoice_number} · </span>
+                              )}
+                              {part.vendor && (
+                                <span className="text-slate-500">{part.vendor} · </span>
+                              )}
                               {part.part_number || part.description || 'Part'}
                               {part.description && part.part_number && <span className="text-slate-400"> — {part.description}</span>}
                             </span>

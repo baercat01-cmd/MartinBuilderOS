@@ -55,6 +55,7 @@ import {
   persistOpenJob,
   agentLog,
 } from '@/lib/officeViewPersistence';
+import { isVisibleJobCard } from '@/lib/defaultJobs';
 
 interface JobsViewProps {
   showArchived?: boolean;
@@ -1110,7 +1111,7 @@ export function JobsView({
           <div className="grid gap-3 sm:gap-4 grid-cols-1 md:grid-cols-2 lg:grid-cols-3">
             {jobs
               .filter((job) => job.status === 'archived')
-              .filter((job) => !job.is_internal)
+              .filter((job) => isVisibleJobCard(job))
               .map((job) => {
               const jobStats = stats[job.id] || {};
               
@@ -1346,13 +1347,13 @@ export function JobsView({
                 <h3 className="text-base sm:text-lg font-bold text-green-900 flex items-center gap-2">
                   Active
                   <Badge variant="secondary" className="bg-green-200 text-green-900">
-                    {jobs.filter(j => j.status === 'active' && !j.is_internal && !isPrimaryProposalOnHold(j.id)).length}
+                    {jobs.filter(j => j.status === 'active' && isVisibleJobCard(j) && !isPrimaryProposalOnHold(j.id)).length}
                   </Badge>
                 </h3>
               </div>
               <div className="space-y-2 sm:space-y-3">
                 {jobs
-                  .filter((job) => job.status === 'active' && !job.is_internal && !isPrimaryProposalOnHold(job.id))
+                  .filter((job) => job.status === 'active' && isVisibleJobCard(job) && !isPrimaryProposalOnHold(job.id))
                   .map((job) => {
                     const jobStats = stats[job.id] || {};
                     
@@ -1637,13 +1638,13 @@ export function JobsView({
                 <h3 className="text-base sm:text-lg font-bold text-blue-900 flex items-center gap-2">
                   Prepping
                   <Badge variant="secondary" className="bg-blue-200 text-blue-900">
-                    {jobs.filter(j => j.status === 'prepping' && !j.is_internal && !isPrimaryProposalOnHold(j.id)).length}
+                    {jobs.filter(j => j.status === 'prepping' && isVisibleJobCard(j) && !isPrimaryProposalOnHold(j.id)).length}
                   </Badge>
                 </h3>
               </div>
               <div className="space-y-2 sm:space-y-3">
                 {jobs
-                  .filter((job) => job.status === 'prepping' && !job.is_internal && !isPrimaryProposalOnHold(job.id))
+                  .filter((job) => job.status === 'prepping' && isVisibleJobCard(job) && !isPrimaryProposalOnHold(job.id))
                   .map((job) => {
                     const jobStats = stats[job.id] || {};
                     
@@ -1867,13 +1868,13 @@ export function JobsView({
                 <h3 className="text-base sm:text-lg font-bold text-yellow-900 flex items-center gap-2">
                   Quoting
                   <Badge variant="secondary" className="bg-yellow-200 text-yellow-900">
-                    {jobs.filter(j => j.status === 'quoting' && !j.is_internal && !isPrimaryProposalOnHold(j.id)).length}
+                    {jobs.filter(j => j.status === 'quoting' && isVisibleJobCard(j) && !isPrimaryProposalOnHold(j.id)).length}
                   </Badge>
                 </h3>
               </div>
               <div className="space-y-2 sm:space-y-3">
                 {jobs
-                  .filter((job) => job.status === 'quoting' && !job.is_internal && !isPrimaryProposalOnHold(job.id))
+                  .filter((job) => job.status === 'quoting' && isVisibleJobCard(job) && !isPrimaryProposalOnHold(job.id))
                   .map((job) => {
                     const jobStats = stats[job.id] || {};
                     
@@ -2109,13 +2110,13 @@ export function JobsView({
                 <h3 className="text-base sm:text-lg font-bold text-orange-900 flex items-center gap-2">
                   On Hold
                   <Badge variant="secondary" className="bg-orange-200 text-orange-900">
-                    {jobs.filter(j => !j.is_internal && j.status !== 'archived' && j.status !== 'completed' && (j.status === 'on_hold' || isPrimaryProposalOnHold(j.id))).length}
+                    {jobs.filter(j => isVisibleJobCard(j) && j.status !== 'archived' && j.status !== 'completed' && (j.status === 'on_hold' || isPrimaryProposalOnHold(j.id))).length}
                   </Badge>
                 </h3>
               </div>
               <div className="space-y-2 sm:space-y-3">
                 {jobs
-                  .filter((job) => !job.is_internal && job.status !== 'archived' && job.status !== 'completed' && (job.status === 'on_hold' || isPrimaryProposalOnHold(job.id)))
+                  .filter((job) => isVisibleJobCard(job) && job.status !== 'archived' && job.status !== 'completed' && (job.status === 'on_hold' || isPrimaryProposalOnHold(job.id)))
                   .map((job) => {
                     const jobStats = stats[job.id] || {};
                     
@@ -2455,7 +2456,7 @@ export function JobsView({
                 </SelectTrigger>
                 <SelectContent>
                   {jobs
-                    .filter((j) => !j.is_internal && j.status !== 'archived')
+                    .filter((j) => isVisibleJobCard(j) && j.status !== 'archived')
                     .map((j) => (
                       <SelectItem key={j.id} value={j.id}>
                         {j.name} {j.client_name ? `(${j.client_name})` : ''}
