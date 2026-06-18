@@ -10,6 +10,8 @@ export interface ProposalSummary {
   grandTotal: number;
   /** Signed contract: job workbook materials extended sell; not part of proposal subtotal/grand total */
   jobWorkbookMaterials?: number | null;
+  /** Signed contract: locked proposal workbook materials (workbook-only, same math as jobWorkbookMaterials) */
+  proposalWorkbookMaterials?: number | null;
   /** Office-only rough pricing; hidden from customer portal until promoted */
   isCustomerEstimate?: boolean;
 }

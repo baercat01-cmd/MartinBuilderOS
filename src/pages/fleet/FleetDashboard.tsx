@@ -7,6 +7,7 @@ import { Building2, LogOut, Settings, ArrowLeft } from 'lucide-react';
 import { toast } from 'sonner';
 import { VehicleManagement } from '@/components/fleet/VehicleManagement';
 import { FleetSettings } from '@/components/fleet/FleetSettings';
+import { ensureMaintenanceLogSchema, probeMaintenanceLogSchema } from '@/lib/maintenanceLogSchema';
 
 interface Company {
   id: string;
@@ -17,7 +18,7 @@ interface Company {
 
 interface FleetDashboardProps {
   hideHeader?: boolean;
-  defaultCompany?: string; // Company name to auto-select (e.g., "Martin Builder")
+  defaultCompany?: string;
 }
 
 export function FleetDashboard({ hideHeader = false, defaultCompany }: FleetDashboardProps) {
@@ -29,9 +30,14 @@ export function FleetDashboard({ hideHeader = false, defaultCompany }: FleetDash
 
   useEffect(() => {
     loadCompanies();
+    void (async () => {
+      const status = await probeMaintenanceLogSchema();
+      if (!status.ready && status.rpcAvailable) {
+        await ensureMaintenanceLogSchema();
+      }
+    })();
   }, []);
 
-  // Auto-select default company when companies are loaded
   useEffect(() => {
     if (defaultCompany && companies.length > 0 && !selectedCompany) {
       const company = companies.find(c => c.name.toLowerCase().includes(defaultCompany.toLowerCase()));
@@ -59,7 +65,6 @@ export function FleetDashboard({ hideHeader = false, defaultCompany }: FleetDash
   }
 
   function handleLogout() {
-    // Clear auth state for PIN-login app
     clearUser();
   }
 
@@ -74,7 +79,6 @@ export function FleetDashboard({ hideHeader = false, defaultCompany }: FleetDash
     );
   }
 
-  // Settings view
   if (showSettings) {
     return (
       <div className={hideHeader ? '' : 'min-h-screen bg-slate-50'}>
@@ -114,7 +118,6 @@ export function FleetDashboard({ hideHeader = false, defaultCompany }: FleetDash
     );
   }
 
-  // Vehicle management view
   if (selectedCompany) {
     return (
       <VehicleManagement
@@ -125,10 +128,8 @@ export function FleetDashboard({ hideHeader = false, defaultCompany }: FleetDash
     );
   }
 
-  // Company selection view
   return (
     <div className={hideHeader ? '' : 'min-h-screen bg-gradient-to-br from-slate-100 to-slate-200'}>
-      {/* Header */}
       {!hideHeader && (
         <div className="bg-gradient-to-r from-slate-900 via-slate-800 to-slate-900 text-white px-3 py-2 border-b-4 border-yellow-600 shadow-lg">
           <div className="flex items-center justify-between">
@@ -158,7 +159,6 @@ export function FleetDashboard({ hideHeader = false, defaultCompany }: FleetDash
         </div>
       )}
 
-      {/* Company Selection */}
       <div className="p-4">
         <div className="max-w-4xl mx-auto">
           <div className="mb-4">

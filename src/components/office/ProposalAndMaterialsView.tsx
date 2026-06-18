@@ -44,6 +44,7 @@ export function ProposalAndMaterialsView({ job, userId: userIdProp, viewMode: vi
   const [materialsWorkbookReady, setMaterialsWorkbookReady] = useState(true);
   const [materialsSyncGen, setMaterialsSyncGen] = useState(0);
   const [jobWorkbookMaterialsTotal, setJobWorkbookMaterialsTotal] = useState<number | null>(null);
+  const [proposalWorkbookMaterialsTotal, setProposalWorkbookMaterialsTotal] = useState<number | null>(null);
   /** Session-only unlock; shared with JobFinancials + Materials so the proposal workbook matches the left panel lock. */
   const [historicalUnlockedQuoteId, setHistoricalUnlockedQuoteId] = useState<string | null>(null);
   /** JobFinancials already bumps syncGen via handleJobFinancialsQuoteChange — skip duplicate in selectedQuoteId effect. */
@@ -75,6 +76,7 @@ export function ProposalAndMaterialsView({ job, userId: userIdProp, viewMode: vi
       return;
     }
     setJobWorkbookMaterialsTotal(null);
+    setProposalWorkbookMaterialsTotal(null);
     setHistoricalUnlockedQuoteId(null);
     setBreakdownSheetPrices([]);
     setMaterialsWorkbookView(null);
@@ -161,6 +163,7 @@ export function ProposalAndMaterialsView({ job, userId: userIdProp, viewMode: vi
                 externalBreakdownSheetPrices={breakdownSheetPrices}
                 externalMaterialsWorkbookView={materialsWorkbookView}
                 externalJobWorkbookMaterialsTotal={jobWorkbookMaterialsTotal}
+                externalProposalWorkbookMaterialsTotal={proposalWorkbookMaterialsTotal}
                 historicalUnlockedQuoteId={historicalUnlockedQuoteId}
                 onHistoricalUnlockedQuoteIdChange={setHistoricalUnlockedQuoteId}
                 materialsPanelActive={showMaterials}
@@ -198,6 +201,7 @@ export function ProposalAndMaterialsView({ job, userId: userIdProp, viewMode: vi
                   onWorkbookViewSync={setMaterialsWorkbookView}
                   onWorkbookLoadSettled={() => setMaterialsWorkbookReady(true)}
                   onJobWorkbookMaterialsTotalSync={setJobWorkbookMaterialsTotal}
+                  onProposalWorkbookMaterialsTotalSync={setProposalWorkbookMaterialsTotal}
                   historicalUnlockedQuoteId={historicalUnlockedQuoteId}
                   jobWorkbookMaterialsTotalForStrip={
                     typeof jobWorkbookMaterialsTotal === 'number' ? jobWorkbookMaterialsTotal : undefined

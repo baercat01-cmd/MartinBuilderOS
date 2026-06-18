@@ -20,6 +20,24 @@ import {
 } from '@/components/ui/select';
 import { FileText, Loader2, Plus, ScanLine, Trash2, Upload, X } from 'lucide-react';
 import { toast } from 'sonner';
+import { invokeMaintenanceReceiptExtract } from '@/lib/maintenanceReceiptExtract';
+import {
+  mergeExtractedIntoInvoiceGroups,
+  mergeNormalizedInvoices,
+  normalizeExtractedInvoices,
+  sumNormalizedInvoiceParts,
+} from '@/lib/maintenanceInvoiceNormalize';
+import {
+  formatPersistenceError,
+  loadMaintenanceTicketArtifacts,
+  saveMaintenanceTicketInvoices,
+  uploadTempReceiptForScan,
+} from '@/lib/maintenanceLogPersistence';
+import {
+  MAX_MAINTENANCE_RECEIPT_BYTES,
+  RECEIPT_SCAN_URL_MIN_BYTES,
+  formatReceiptSizeLimitMessage,
+} from '@/lib/maintenanceReceiptLimits';
 
 interface MaintenanceLogPart {
   id?: string;
@@ -55,6 +73,8 @@ interface AddMaintenanceDialogProps {
   vehicleId: string;
   vehicleType: string;
   onSuccess: () => void;
+  onTicketSaved?: () => void;
+  onLogCreated?: (logId: string) => void;
   editLogId?: string | null;
 }
 
@@ -81,10 +101,6 @@ function createEmptyInvoiceGroup(): MaintenanceInvoiceGroup {
   };
 }
 
-function invoiceGroupKey(invoice_number: string, vendor: string): string {
-  return `${invoice_number.trim().toLowerCase()}::${vendor.trim().toLowerCase()}`;
-}
-
 function flattenParts(invoices: MaintenanceInvoiceGroup[]): MaintenanceLogPart[] {
   return invoices.flatMap((inv) => inv.parts);
 }
@@ -103,11 +119,42 @@ function formatPartNumbersFromInvoices(invoices: MaintenanceInvoiceGroup[]): str
 
 const RECEIPT_ACCEPT = '.pdf,application/pdf,image/jpeg,image/png,image/webp,image/gif';
 
-/** Matches Supabase storage bucket limit (50MiB in config.toml). */
-const MAX_RECEIPT_BYTES = 50 * 1024 * 1024;
+function appendPendingReceipt(receipts: TicketReceipt[], file: File): TicketReceipt[] {
+  const alreadyListed = receipts.some(
+    (receipt) =>
+      receipt.file === file ||
+      (receipt.fileName === file.name && !receipt.id),
+  );
+  if (alreadyListed) return receipts;
+  return [
+    ...receipts,
+    {
+      fileName: file.name,
+      fileType: file.type || null,
+      file,
+    },
+  ];
+}
 
-/** Above this size, upload to storage and pass a signed URL (avoids edge function body limits). */
-const RECEIPT_BASE64_MAX_BYTES = 8 * 1024 * 1024;
+function inferTicketTitle(
+  title: string,
+  receipts: TicketReceipt[],
+  invoiceGroups: MaintenanceInvoiceGroup[],
+): string {
+  const trimmed = title.trim();
+  if (trimmed) return trimmed;
+
+  const fromReceipt =
+    receipts.find((receipt) => receipt.fileName)?.fileName ||
+    invoiceGroups.find((inv) => inv.receiptFileName)?.receiptFileName ||
+    invoiceGroups.find((inv) => inv.receiptFile)?.receiptFile?.name;
+
+  if (fromReceipt) {
+    return fromReceipt.replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' ').trim();
+  }
+
+  return 'Maintenance ticket';
+}
 
 function isReceiptFile(file: File): boolean {
   if (file.type.startsWith('image/')) return true;
@@ -139,21 +186,26 @@ export function AddMaintenanceDialog({
   vehicleId,
   vehicleType,
   onSuccess,
+  onTicketSaved,
+  onLogCreated,
   editLogId,
 }: AddMaintenanceDialogProps) {
   const { profile } = useAuth();
   const [loading, setLoading] = useState(false);
+  const [autoSaving, setAutoSaving] = useState(false);
   const [loadingLog, setLoadingLog] = useState(false);
+  const [activeLogId, setActiveLogId] = useState<string | null>(editLogId ?? null);
   const [extractingInvoiceIndex, setExtractingInvoiceIndex] = useState<number | null>(null);
   const [dragOverInvoiceIndex, setDragOverInvoiceIndex] = useState<number | null>(null);
   const [formData, setFormData] = useState(INITIAL_FORM);
   const [invoices, setInvoices] = useState<MaintenanceInvoiceGroup[]>([createEmptyInvoiceGroup()]);
   const [ticketReceipts, setTicketReceipts] = useState<TicketReceipt[]>([]);
 
-  const isEditMode = Boolean(editLogId);
+  const isEditMode = Boolean(activeLogId);
 
   useEffect(() => {
     if (!open) return;
+    setActiveLogId(editLogId ?? null);
     if (editLogId) {
       loadExistingLog(editLogId);
     } else {
@@ -182,105 +234,33 @@ export function AddMaintenanceDialog({
         description: log.description || '',
       });
 
-      const { data: allDocs, error: docsError } = await supabase
-        .from('maintenance_log_documents')
-        .select('id, file_name, file_path, file_type, maintenance_log_part_id')
-        .eq('maintenance_log_id', logId)
-        .order('uploaded_at', { ascending: true });
-
-      if (docsError) throw docsError;
-
-      const docById = Object.fromEntries((allDocs || []).map((doc) => [doc.id, doc]));
+      const { receipts, invoices: loadedInvoices } = await loadMaintenanceTicketArtifacts(
+        vehicleId,
+        logId,
+        log.notes,
+      );
 
       setTicketReceipts(
-        (allDocs || []).map((doc) => ({
+        receipts.map((doc) => ({
           id: doc.id,
-          fileName: doc.file_name,
-          filePath: doc.file_path,
-          fileType: doc.file_type,
-          maintenanceLogPartId: doc.maintenance_log_part_id,
+          fileName: doc.fileName,
+          filePath: doc.filePath,
+          fileType: doc.fileType,
+          maintenanceLogPartId: doc.maintenanceLogPartId,
         })),
       );
 
-      const { data: existingParts, error: partsError } = await supabase
-        .from('maintenance_log_parts')
-        .select('id, part_number, description, cost, receipt_document_id, invoice_number, vendor')
-        .eq('maintenance_log_id', logId)
-        .order('order_index', { ascending: true });
-
-      if (partsError) {
-        setInvoices([createEmptyInvoiceGroup()]);
-      } else if (existingParts?.length) {
-        const groupMap = new Map<string, MaintenanceInvoiceGroup>();
-
-        for (const part of existingParts) {
-          const invNum = part.invoice_number || '';
-          const vendor = part.vendor || '';
-          const key = invoiceGroupKey(invNum, vendor) || `__ungrouped__${part.id}`;
-
-          const linkedDoc =
-            (part.receipt_document_id ? docById[part.receipt_document_id] : null) ||
-            (allDocs || []).find((doc) => doc.maintenance_log_part_id === part.id) ||
-            null;
-
-          if (!groupMap.has(key)) {
-            groupMap.set(key, {
-              clientKey: `inv-${part.id}`,
-              invoice_number: invNum,
-              vendor,
-              receiptDocumentId: linkedDoc?.id || part.receipt_document_id || null,
-              receiptFileName: linkedDoc?.file_name || null,
-              receiptFilePath: linkedDoc?.file_path || null,
-              receiptFileType: linkedDoc?.file_type || null,
-              receiptFile: null,
-              parts: [],
-            });
-          }
-
-          const group = groupMap.get(key)!;
-          if (!group.receiptDocumentId && linkedDoc) {
-            group.receiptDocumentId = linkedDoc.id;
-            group.receiptFileName = linkedDoc.file_name;
-            group.receiptFilePath = linkedDoc.file_path;
-            group.receiptFileType = linkedDoc.file_type;
-          }
-
-          group.parts.push({
-            id: part.id,
-            part_number: part.part_number || '',
-            description: part.description || '',
-            cost: part.cost != null ? String(part.cost) : '',
-          });
-        }
-
-        setInvoices([...groupMap.values()]);
+      if (loadedInvoices.length) {
+        setInvoices(loadedInvoices);
       } else {
         setInvoices([createEmptyInvoiceGroup()]);
       }
     } catch (error: any) {
-      toast.error('Failed to load maintenance ticket');
+      console.error('Failed to load maintenance ticket', error);
+      toast.error(error?.message || 'Failed to load maintenance ticket');
     } finally {
       setLoadingLog(false);
     }
-  }
-
-  function registerPendingReceipt(file: File) {
-    setTicketReceipts((prev) => {
-      const alreadyListed = prev.some(
-        (receipt) =>
-          receipt.file === file ||
-          (receipt.fileName === file.name && !receipt.id),
-      );
-      if (alreadyListed) return prev;
-      return [
-        ...prev,
-        {
-          fileName: file.name,
-          fileType: file.type || null,
-          file,
-        },
-      ];
-    });
   }
 
   function updateInvoice(invoiceIndex: number, updates: Partial<MaintenanceInvoiceGroup>) {
@@ -325,267 +305,74 @@ export function AddMaintenanceDialog({
     const mimeType = file.type || 'application/pdf';
     let invokeBody: { fileBase64?: string; fileUrl?: string; mimeType: string };
 
-    if (file.size > RECEIPT_BASE64_MAX_BYTES) {
-      const tempPath = `${vehicleId}/maintenance-logs/temp-receipts/${Date.now()}-${file.name}`;
-      const { error: uploadError } = await supabase.storage.from('vehicle-documents').upload(tempPath, file);
-      if (uploadError) throw uploadError;
-
-      const { data: signed, error: signError } = await supabase.storage
-        .from('vehicle-documents')
-        .createSignedUrl(tempPath, 3600);
-      if (signError || !signed?.signedUrl) {
-        throw signError || new Error('Could not prepare receipt for scanning');
-      }
-      invokeBody = { fileUrl: signed.signedUrl, mimeType };
+    if (file.size > RECEIPT_SCAN_URL_MIN_BYTES) {
+      const publicUrl = await uploadTempReceiptForScan(vehicleId, file);
+      invokeBody = { fileUrl: publicUrl, mimeType };
     } else {
       const base64 = await fileToBase64(file);
       invokeBody = { fileBase64: base64, mimeType };
     }
 
-    const { data, error } = await supabase.functions.invoke('extract-maintenance-receipt', {
-      body: invokeBody,
-    });
-    if (error) throw error;
-    if (data?.error) throw new Error(data.error);
+    const data = await invokeMaintenanceReceiptExtract(invokeBody);
 
-    const extracted = (data?.invoices || []) as Array<{
-      invoice_number?: string;
-      vendor?: string;
-      parts?: Array<{ part_number?: string; description?: string; cost?: number | null }>;
-    }>;
-
+    const extracted = normalizeExtractedInvoices(data?.invoices || []);
     if (!extracted.length) throw new Error('No invoices or parts found on this receipt');
 
     return extracted.map((inv) => ({
       clientKey: `inv-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
-      invoice_number: inv.invoice_number || '',
-      vendor: inv.vendor || '',
+      invoice_number: inv.invoice_number,
+      vendor: inv.vendor,
       receiptFile: file,
       receiptFileName: file.name,
       receiptFileType: file.type || null,
-      parts: (inv.parts || []).length
-        ? (inv.parts || []).map((item) => ({
-            part_number: item.part_number || '',
-            description: item.description || '',
-            cost: item.cost != null ? String(item.cost) : '',
-          }))
+      parts: inv.parts.length
+        ? inv.parts
         : [createEmptyPart()],
     }));
   }
 
-  async function handleReceiptUpload(invoiceIndex: number, file: File) {
-    if (!isReceiptFile(file)) {
-      toast.error('Please upload a PDF or image receipt');
-      return;
-    }
-    if (file.size > MAX_RECEIPT_BYTES) {
-      toast.error(`${file.name} must be less than 50MB`);
-      return;
-    }
-
-    setExtractingInvoiceIndex(invoiceIndex);
-    try {
-      toast.info('Scanning receipt...');
-      const extractedInvoices = await extractInvoicesFromReceipt(file);
-      registerPendingReceipt(file);
-
-      setInvoices((prev) => {
-        const next = [...prev];
-        if (extractedInvoices.length === 1) {
-          const scanned = extractedInvoices[0];
-          const current = next[invoiceIndex];
-          next[invoiceIndex] = {
-            ...current,
-            invoice_number: scanned.invoice_number || current.invoice_number,
-            vendor: scanned.vendor || current.vendor,
-            receiptFile: file,
-            receiptFileName: file.name,
-            receiptFileType: file.type || null,
-            parts: scanned.parts,
-          };
-        } else {
-          next.splice(invoiceIndex, 1, ...extractedInvoices);
-        }
-        return next;
-      });
-
-      const partCount = extractedInvoices.reduce((n, inv) => n + inv.parts.length, 0);
-      toast.success(
-        extractedInvoices.length === 1
-          ? partCount === 1
-            ? 'Receipt scanned — invoice and part details filled in'
-            : `${partCount} parts added from invoice`
-          : `${extractedInvoices.length} invoices separated (${partCount} parts total)`,
-      );
-    } catch (error: any) {
-      toast.error(error?.message || 'Could not extract parts from receipt');
-      registerPendingReceipt(file);
-      updateInvoice(invoiceIndex, {
-        receiptFile: file,
-        receiptFileName: file.name,
-        receiptFileType: file.type || null,
-      });
-    } finally {
-      setExtractingInvoiceIndex(null);
-    }
-  }
-
-  async function uploadInvoiceReceipt(
-    logId: string,
-    file: File,
-    partId: string | null,
-  ): Promise<string> {
-    const pathSegment = partId
-      ? `parts/${partId}`
-      : `invoices/${Date.now()}`;
-    const storagePath = `${vehicleId}/maintenance-logs/${logId}/${pathSegment}/${Date.now()}-${file.name}`;
-    const { error: uploadError } = await supabase.storage.from('vehicle-documents').upload(storagePath, file);
-    if (uploadError) throw uploadError;
-
-    const { data: { publicUrl } } = supabase.storage.from('vehicle-documents').getPublicUrl(storagePath);
-    const { data: doc, error: dbError } = await supabase
-      .from('maintenance_log_documents')
-      .insert({
-        maintenance_log_id: logId,
-        maintenance_log_part_id: partId,
-        file_name: file.name,
-        file_path: publicUrl,
-        file_size: file.size,
-        file_type: file.type || 'application/pdf',
-        uploaded_by: profile?.username || 'unknown',
-      })
-      .select('id')
-      .single();
-    if (dbError) throw dbError;
-    return doc.id;
-  }
-
-  async function saveInvoices(logId: string, invoicesToSave: MaintenanceInvoiceGroup[]) {
-    const rows: Array<{ part: MaintenanceLogPart; invoice: MaintenanceInvoiceGroup }> = [];
-
-    for (const invoice of invoicesToSave) {
-      const invoiceHasMeta =
-        invoice.invoice_number.trim() ||
-        invoice.vendor.trim() ||
-        invoice.receiptFile ||
-        invoice.receiptDocumentId;
-
-      for (const part of invoice.parts) {
-        if (
-          part.part_number.trim() ||
-          part.description.trim() ||
-          part.cost.trim() ||
-          invoiceHasMeta
-        ) {
-          rows.push({ part, invoice });
-        }
-      }
-
-      // Receipt-only invoice with no part lines yet — still persist a placeholder part row.
-      if (invoiceHasMeta && invoice.parts.every((p) => !p.part_number.trim() && !p.description.trim() && !p.cost.trim())) {
-        rows.push({ part: invoice.parts[0] ?? createEmptyPart(), invoice });
-      }
-    }
-
-    if (isEditMode && editLogId) {
-      const { data: existing } = await supabase.from('maintenance_log_parts').select('id').eq('maintenance_log_id', logId);
-      const existingIds = new Set((existing || []).map((p) => p.id));
-      const keptIds = new Set(rows.filter((r) => r.part.id).map((r) => r.part.id!));
-      const toDelete = [...existingIds].filter((id) => !keptIds.has(id));
-      if (toDelete.length) await supabase.from('maintenance_log_parts').delete().in('id', toDelete);
-    }
-
-    const firstPartIdByInvoice = new Map<string, string>();
-    const receiptUploadedForInvoice = new Set<string>();
-
-    for (let i = 0; i < rows.length; i++) {
-      const { part, invoice } = rows[i];
-      const payload = {
-        maintenance_log_id: logId,
-        part_number: part.part_number.trim() || null,
-        description: part.description.trim() || null,
-        cost: part.cost ? parseFloat(part.cost) : null,
-        invoice_number: invoice.invoice_number.trim() || null,
-        vendor: invoice.vendor.trim() || null,
-        order_index: i,
-      };
-
-      let partId = part.id;
-      if (partId) {
-        const { error } = await supabase.from('maintenance_log_parts').update(payload).eq('id', partId);
-        if (error) throw error;
-      } else {
-        const { data: inserted, error } = await supabase.from('maintenance_log_parts').insert(payload).select('id').single();
-        if (error) throw error;
-        partId = inserted.id;
-        part.id = partId;
-      }
-
-      if (!firstPartIdByInvoice.has(invoice.clientKey)) {
-        firstPartIdByInvoice.set(invoice.clientKey, partId);
-      }
-    }
-
-    for (const invoice of invoicesToSave) {
-      if (!invoice.receiptFile || receiptUploadedForInvoice.has(invoice.clientKey)) continue;
-
-      const partId = firstPartIdByInvoice.get(invoice.clientKey) ?? null;
-      const docId = await uploadInvoiceReceipt(logId, invoice.receiptFile, partId);
-
-      if (partId) {
-        await supabase
-          .from('maintenance_log_parts')
-          .update({ receipt_document_id: docId })
-          .eq('id', partId);
-      }
-
-      invoice.receiptDocumentId = docId;
-      invoice.receiptFile = null;
-      receiptUploadedForInvoice.add(invoice.clientKey);
-    }
-
-    const { data: refreshedDocs } = await supabase
-      .from('maintenance_log_documents')
-      .select('id, file_name, file_path, file_type, maintenance_log_part_id')
-      .eq('maintenance_log_id', logId)
-      .order('uploaded_at', { ascending: true });
-
-    setTicketReceipts(
-      (refreshedDocs || []).map((doc) => ({
-        id: doc.id,
-        fileName: doc.file_name,
-        filePath: doc.file_path,
-        fileType: doc.file_type,
-        maintenanceLogPartId: doc.maintenance_log_part_id,
-      })),
+  async function persistTicket(options?: {
+    invoicesOverride?: MaintenanceInvoiceGroup[];
+    receiptsOverride?: TicketReceipt[];
+    titleOverride?: string;
+    closeOnSuccess?: boolean;
+    quiet?: boolean;
+    auto?: boolean;
+  }): Promise<string | null> {
+    const invoicesToSave = options?.invoicesOverride ?? invoices;
+    const receiptsToSave = options?.receiptsOverride ?? ticketReceipts;
+    const resolvedTitle = inferTicketTitle(
+      options?.titleOverride ?? formData.title,
+      receiptsToSave,
+      invoicesToSave,
     );
-  }
 
-  async function handleSubmit(e: React.FormEvent) {
-    e.preventDefault();
-    if (!formData.title.trim()) {
-      toast.error('Title is required');
-      return;
+    if (!formData.title.trim() && resolvedTitle !== formData.title) {
+      setFormData((prev) => ({ ...prev, title: resolvedTitle }));
     }
 
-    setLoading(true);
+    const setBusy = options?.auto ? setAutoSaving : setLoading;
+    setBusy(true);
+
     try {
-      const totalCost = sumInvoiceCosts(invoices);
+      const totalCost = sumInvoiceCosts(invoicesToSave);
       const logPayload = {
         vehicle_id: vehicleId,
         type: formData.type,
         status: formData.status,
-        title: formData.title,
+        title: resolvedTitle,
         date: formData.date,
         mileage_hours: formData.mileage_hours ? parseFloat(formData.mileage_hours) : null,
         description: formData.description || null,
-        part_numbers: formatPartNumbersFromInvoices(invoices),
+        part_numbers: formatPartNumbersFromInvoices(invoicesToSave),
         part_cost: totalCost > 0 ? totalCost : null,
       };
 
-      let logId = editLogId;
-      if (isEditMode && editLogId) {
-        const { error } = await supabase.from('maintenance_logs').update(logPayload).eq('id', editLogId);
+      const wasExisting = Boolean(activeLogId);
+      let logId = activeLogId;
+
+      if (logId) {
+        const { error } = await supabase.from('maintenance_logs').update(logPayload).eq('id', logId);
         if (error) throw error;
       } else {
         const { data: logData, error } = await supabase
@@ -595,22 +382,198 @@ export function AddMaintenanceDialog({
           .single();
         if (error) throw error;
         logId = logData.id;
+        setActiveLogId(logId);
+        onLogCreated?.(logId);
       }
 
       if (!logId) throw new Error('Failed to save ticket');
 
-      await saveInvoices(logId, invoices);
+      const savedReceipts = await saveMaintenanceTicketInvoices({
+        vehicleId,
+        logId,
+        invoices: invoicesToSave,
+        pendingReceipts: receiptsToSave,
+        uploadedBy: profile?.username || 'unknown',
+        isEditMode: wasExisting,
+      });
 
-      toast.success(
-        formData.status === 'complete'
-          ? isEditMode ? 'Ticket closed' : 'Ticket created and closed'
-          : isEditMode ? 'Ticket saved' : 'Ticket opened',
+      setTicketReceipts(
+        savedReceipts.map((doc) => ({
+          id: doc.id,
+          fileName: doc.fileName,
+          filePath: doc.filePath,
+          fileType: doc.fileType,
+          maintenanceLogPartId: doc.maintenanceLogPartId,
+        })),
       );
-      onSuccess();
-    } catch (error: any) {
-      toast.error(error?.message || 'Failed to save ticket');
+
+      const docById = Object.fromEntries(savedReceipts.map((doc) => [doc.id, doc]));
+
+      setInvoices(
+        invoicesToSave.map((invoice) => {
+          const doc = invoice.receiptDocumentId ? docById[invoice.receiptDocumentId] : null;
+          return {
+            ...invoice,
+            receiptFile: null,
+            receiptFileName: doc?.fileName ?? invoice.receiptFileName,
+            receiptFilePath: doc?.filePath ?? invoice.receiptFilePath,
+            receiptFileType: doc?.fileType ?? invoice.receiptFileType,
+          };
+        }),
+      );
+
+      if (!options?.quiet) {
+        toast.success(
+          options?.closeOnSuccess && formData.status === 'complete'
+            ? wasExisting ? 'Ticket closed' : 'Ticket created and closed'
+            : wasExisting ? 'Ticket saved' : 'Ticket opened',
+        );
+      }
+
+      onTicketSaved?.();
+
+      if (options?.closeOnSuccess) {
+        onSuccess();
+      }
+
+      return logId;
+    } catch (error: unknown) {
+      if (!options?.quiet) {
+        toast.error(formatPersistenceError(error));
+      }
+      throw error;
     } finally {
-      setLoading(false);
+      setBusy(false);
+    }
+  }
+
+  async function handleReceiptUpload(invoiceIndex: number, fileOrFiles: File | File[]) {
+    const files = Array.isArray(fileOrFiles) ? fileOrFiles : [fileOrFiles];
+    for (const file of files) {
+      if (!isReceiptFile(file)) {
+        toast.error(`${file.name}: please upload a PDF or image receipt`);
+        return;
+      }
+      if (file.size > MAX_MAINTENANCE_RECEIPT_BYTES) {
+        toast.error(formatReceiptSizeLimitMessage(file.name));
+        return;
+      }
+    }
+
+    let nextReceipts = ticketReceipts;
+    let nextInvoices = invoices.map((inv) => ({ ...inv, parts: [...inv.parts] }));
+
+    for (const file of files) {
+      nextReceipts = appendPendingReceipt(nextReceipts, file);
+      const current = nextInvoices[invoiceIndex];
+      if (current) {
+        nextInvoices[invoiceIndex] = {
+          ...current,
+          receiptFile: file,
+          receiptFileName: file.name,
+          receiptFileType: file.type || null,
+        };
+      }
+    }
+
+    setTicketReceipts(nextReceipts);
+    setInvoices(nextInvoices);
+
+    try {
+      await persistTicket({
+        invoicesOverride: nextInvoices,
+        receiptsOverride: nextReceipts,
+        quiet: true,
+        auto: true,
+      });
+      toast.success(files.length > 1 ? `${files.length} receipts saved` : 'Receipt saved');
+    } catch {
+      return;
+    }
+
+    setExtractingInvoiceIndex(invoiceIndex);
+    try {
+      const batches: Array<{ file: File; normalized: ReturnType<typeof normalizeExtractedInvoices> }> = [];
+
+      for (const file of files) {
+        toast.info(files.length > 1 ? `Scanning ${file.name}...` : 'Scanning receipt...');
+        const extractedInvoices = await extractInvoicesFromReceipt(file);
+        batches.push({
+          file,
+          normalized: normalizeExtractedInvoices(
+            extractedInvoices.map((inv) => ({
+              invoice_number: inv.invoice_number,
+              vendor: inv.vendor,
+              parts: inv.parts.map((part) => ({
+                part_number: part.part_number,
+                description: part.description,
+                cost: part.cost ? parseFloat(part.cost) : null,
+              })),
+            })),
+          ),
+        });
+      }
+
+      const normalized = mergeNormalizedInvoices(batches.flatMap((batch) => batch.normalized));
+      if (!normalized.length) throw new Error('No invoices or parts found on this receipt');
+
+      let scannedInvoices = nextInvoices;
+      let insertAt = invoiceIndex;
+      for (const batch of batches) {
+        if (!batch.normalized.length) continue;
+        scannedInvoices = mergeExtractedIntoInvoiceGroups(
+          scannedInvoices,
+          insertAt,
+          batch.normalized,
+          {
+            file: batch.file,
+            fileName: batch.file.name,
+            fileType: batch.file.type || null,
+          },
+          (parts) => ({
+            ...createEmptyInvoiceGroup(),
+            parts: parts?.length ? parts : [createEmptyPart()],
+          }),
+        );
+        insertAt = Math.min(insertAt + batch.normalized.length, scannedInvoices.length);
+      }
+
+      setInvoices(scannedInvoices);
+
+      await persistTicket({
+        invoicesOverride: scannedInvoices,
+        receiptsOverride: nextReceipts,
+        quiet: true,
+        auto: true,
+      });
+
+      const invoiceCount = normalized.length;
+      const partCount = normalized.reduce((n, inv) => n + inv.parts.length, 0);
+      toast.success(
+        invoiceCount === 1
+          ? partCount === 1
+            ? 'Receipt scanned — invoice and part details filled in'
+            : `${partCount} line items added for invoice ${normalized[0].invoice_number || ''}`.trim()
+          : `${invoiceCount} invoices separated (${partCount} line items total)`,
+      );
+    } catch (error: any) {
+      toast.error(error?.message || 'Could not extract parts from receipt');
+    } finally {
+      setExtractingInvoiceIndex(null);
+    }
+  }
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!formData.title.trim() && !ticketReceipts.some((r) => r.file || r.id) && !invoices.some((i) => i.receiptFile)) {
+      toast.error('Title is required');
+      return;
+    }
+
+    try {
+      await persistTicket({ closeOnSuccess: true });
+    } catch {
+      // persistTicket already toasts
     }
   }
 
@@ -682,8 +645,14 @@ export function AddMaintenanceDialog({
         onPointerDownOutside={(e) => e.preventDefault()}
       >
         <DialogHeader className="px-4 pt-4 pb-3 border-b shrink-0 bg-white">
-          <DialogTitle className="text-xl">
+          <DialogTitle className="text-xl flex items-center gap-2">
             {isEditMode ? 'Maintenance Ticket' : 'New Maintenance Ticket'}
+            {(loading || autoSaving) && (
+              <span className="text-xs font-normal text-muted-foreground inline-flex items-center gap-1">
+                <Loader2 className="w-3 h-3 animate-spin" />
+                Saving…
+              </span>
+            )}
           </DialogTitle>
         </DialogHeader>
 
@@ -819,18 +788,37 @@ export function AddMaintenanceDialog({
                 {invoices.map((invoice, invoiceIndex) => (
                   <div key={invoice.clientKey} className="border-2 border-slate-200 rounded-lg p-3 space-y-3 bg-white">
                     <div className="flex items-center justify-between gap-2">
-                      <span className="text-xs font-semibold text-slate-600 uppercase tracking-wide">
-                        Invoice {invoiceIndex + 1}
-                      </span>
+                      <div className="min-w-0">
+                        <span className="text-xs font-semibold text-slate-600 uppercase tracking-wide">
+                          {invoice.invoice_number.trim()
+                            ? `Invoice ${invoiceIndex + 1} — #${invoice.invoice_number.trim()}`
+                            : `Invoice ${invoiceIndex + 1}`}
+                        </span>
+                        {invoice.parts.some((p) => p.cost.trim()) && (
+                          <p className="text-xs text-slate-500 mt-0.5">
+                            {invoice.parts.filter((p) => p.description.trim() || p.part_number.trim()).length} item
+                            {invoice.parts.filter((p) => p.description.trim() || p.part_number.trim()).length === 1 ? '' : 's'}
+                            {' · '}$
+                            {sumNormalizedInvoiceParts({
+                              invoice_number: invoice.invoice_number,
+                              vendor: invoice.vendor,
+                              parts: invoice.parts,
+                            }).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                          </p>
+                        )}
+                      </div>
                       <div className="flex items-center gap-1">
                         <input
                           type="file"
                           id={`receipt-inv-${invoiceIndex}`}
                           accept={RECEIPT_ACCEPT}
+                          multiple
                           className="hidden"
                           onChange={(e) => {
-                            const file = e.target.files?.[0];
-                            if (file) handleReceiptUpload(invoiceIndex, file);
+                            const selected = e.target.files;
+                            if (selected?.length) {
+                              handleReceiptUpload(invoiceIndex, [...selected]);
+                            }
                             e.target.value = '';
                           }}
                         />
@@ -872,8 +860,8 @@ export function AddMaintenanceDialog({
                             e.preventDefault();
                             e.stopPropagation();
                             setDragOverInvoiceIndex(null);
-                            const file = e.dataTransfer.files?.[0];
-                            if (file) handleReceiptUpload(invoiceIndex, file);
+                            const dropped = [...e.dataTransfer.files].filter(isReceiptFile);
+                            if (dropped.length) handleReceiptUpload(invoiceIndex, dropped);
                           }}
                           onClick={() => document.getElementById(`receipt-inv-${invoiceIndex}`)?.click()}
                         >

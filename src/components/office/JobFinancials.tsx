@@ -275,6 +275,8 @@ interface JobFinancialsProps {
   externalMaterialsWorkbookView?: { workbookId: string | null; status: 'working' | 'locked' | null } | null;
   /** Signed contract: extended sell total of job workbook (`working` row), separate from proposal materials. */
   externalJobWorkbookMaterialsTotal?: number | null;
+  /** Signed contract: locked proposal workbook materials (same workbook math as job total). */
+  externalProposalWorkbookMaterialsTotal?: number | null;
   /** Split view: lift session "unlock for editing" so Materials uses the same read-only gate as this panel. */
   historicalUnlockedQuoteId?: string | null;
   onHistoricalUnlockedQuoteIdChange?: (id: string | null) => void;
@@ -3537,6 +3539,7 @@ export function JobFinancials({
   externalBreakdownSheetPrices,
   externalMaterialsWorkbookView,
   externalJobWorkbookMaterialsTotal,
+  externalProposalWorkbookMaterialsTotal,
   historicalUnlockedQuoteId: historicalUnlockedQuoteIdProp,
   onHistoricalUnlockedQuoteIdChange,
   materialsPanelActive = false,
@@ -3890,6 +3893,7 @@ export function JobFinancials({
     quoteId: string | null;
     allJobQuotesFirstId: string | undefined;
     historicalUnlockedQuoteId: string | null; // effective session unlock id (parent or internal)
+    hasIsolatedJobWorkbook: boolean;
     loadMaterialsData: (
       targetQuoteId: string | null,
       isHistorical?: boolean,
@@ -3902,6 +3906,7 @@ export function JobFinancials({
     quoteId: null,
     allJobQuotesFirstId: undefined,
     historicalUnlockedQuoteId: null,
+    hasIsolatedJobWorkbook: false,
     loadMaterialsData: () => {},
     loadSubcontractorEstimates: async () => {},
   });
@@ -5148,12 +5153,12 @@ export function JobFinancials({
     }
   }
 
-  // Materials panel syncs workbook after proposal switch; reload labor when it arrives (initial load often runs with ext view null).
+  // Materials panel syncs locked proposal workbook after proposal switch — never mirror the job/working copy here.
   useEffect(() => {
     if (!quote?.id) return;
     const wbId = externalMaterialsWorkbookView?.workbookId;
     const status = externalMaterialsWorkbookView?.status;
-    if (!wbId || (status !== 'locked' && status !== 'working')) return;
+    if (!wbId || status !== 'locked') return;
     const wbIdStr = String(wbId).trim();
     const last = lastExternalLaborWbRef.current;
     if (last?.quoteId === quote.id && last.wbId === wbIdStr) return;
@@ -5375,6 +5380,11 @@ export function JobFinancials({
           message: 'materials-workbook-updated deferred — loadData in flight',
           data: { jobId, quoteId: quoteId ?? ctx.quoteId },
         });
+        return;
+      }
+      // Job workbook edits must not reload proposal totals — only the job materials strip updates.
+      const extView = externalMaterialsWorkbookViewRef.current;
+      if (ctx.hasIsolatedJobWorkbook && extView?.status === 'working') {
         return;
       }
       const isHist = !!ctx.quoteId
@@ -8690,11 +8700,13 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
   }
 
   // Keep the ref current so the event handler always has fresh values (avoids stale closure bugs)
+  const hasIsolatedJobWorkbook = typeof externalJobWorkbookMaterialsTotal === 'number';
   workbookUpdateCtxRef.current = {
     jobId: job.id,
     quoteId: quote?.id ?? null,
     allJobQuotesFirstId: formalJobQuotes[0]?.id ?? allJobQuotes[0]?.id,
     historicalUnlockedQuoteId: effectiveHistoricalUnlockedQuoteId,
+    hasIsolatedJobWorkbook,
     loadMaterialsData,
     loadSubcontractorEstimates,
   };
@@ -8925,9 +8937,8 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
         `;
         // Used later for empty-workbook fallback rules (must be outer scope).
         let contractFrozen = false;
-        // If the split-view materials panel is explicitly viewing a workbook, mirror that here
-        // so the proposal totals stay attached to the same snapshot (never influenced by a stale closure).
-        if (extView?.workbookId && (extView.status === 'locked' || extView.status === 'working')) {
+        // Mirror the materials panel only when it shows the locked proposal snapshot — never the job/working copy.
+        if (extView?.workbookId && extView.status === 'locked') {
           const extWbId = String(extView.workbookId).trim();
           const { data: forcedWb, error: forcedErr } = await supabase
             .from('material_workbooks')
@@ -13868,6 +13879,13 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
   const financialBarGrand = estimateCatalogViewOpen ? estimateCatalogGrandTotalFull : proposalGrandTotal;
   const showingCatalogOrLegacyEstimate =
     estimateCatalogViewOpen || (quote as any)?.is_customer_estimate === true;
+  const showJobWorkbookComparison =
+    !showingCatalogOrLegacyEstimate &&
+    typeof externalJobWorkbookMaterialsTotal === 'number' &&
+    typeof externalProposalWorkbookMaterialsTotal === 'number';
+  const jobWorkbookMaterialsDelta = showJobWorkbookComparison
+    ? Math.round((externalJobWorkbookMaterialsTotal! - externalProposalWorkbookMaterialsTotal!) * 100) / 100
+    : null;
 
   // Hold the header GRAND TOTAL until the figure has settled, so transient values
   // during initial load, saves, deletes, or proposal switches don't flash a wrong
@@ -14137,6 +14155,10 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
       grandTotal: showEstimateSummary ? Number(estimateCatalogGrandTotalFull) || 0 : Number(proposalGrandTotal) || 0,
       jobWorkbookMaterials:
         typeof externalJobWorkbookMaterialsTotal === 'number' ? externalJobWorkbookMaterialsTotal : null,
+      proposalWorkbookMaterials:
+        typeof externalProposalWorkbookMaterialsTotal === 'number'
+          ? externalProposalWorkbookMaterialsTotal
+          : null,
       isCustomerEstimate: showEstimateSummary,
     });
     return () => setSummary(null);
@@ -14154,6 +14176,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
     proposalTotalTax,
     proposalGrandTotal,
     externalJobWorkbookMaterialsTotal,
+    externalProposalWorkbookMaterialsTotal,
   ]);
 
   // Sync proposal totals to quote so customer portal can display the same numbers (single source of truth)
@@ -14301,7 +14324,11 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
           <span className="text-slate-300">|</span>
           <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-md border border-slate-200 bg-slate-50/90 px-2.5 py-1.5">
             <span className="text-[10px] font-bold uppercase tracking-wide text-slate-500 whitespace-nowrap">
-              {showingCatalogOrLegacyEstimate ? 'Customer estimate' : 'Customer proposal'}
+              {showingCatalogOrLegacyEstimate
+                ? 'Customer estimate'
+                : showJobWorkbookComparison
+                  ? 'Proposal workbook'
+                  : 'Customer proposal'}
             </span>
             {showingCatalogOrLegacyEstimate ? (
               <>
@@ -14347,8 +14374,8 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
             <span
               className="text-base font-bold text-green-700"
               title={
-                typeof externalJobWorkbookMaterialsTotal === 'number'
-                  ? 'Signed contract / proposal workbook only. Job workbook total is shown above the materials workbook column — not included here.'
+                showJobWorkbookComparison
+                  ? 'Locked proposal workbook — customer pricing. Job workbook materials are shown separately for comparison.'
                   : showingCatalogOrLegacyEstimate
                     ? 'Price-list estimate — not on customer portal until you add lines to the formal proposal below'
                     : 'Customer proposal total'
@@ -14368,6 +14395,61 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
               )}
             </span>
           </div>
+          {showJobWorkbookComparison && (
+            <>
+              <span className="text-slate-300">|</span>
+              <div
+                className="flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-md border-2 border-cyan-500/60 bg-cyan-50 px-2.5 py-1.5"
+                title="Compare job workbook (working) vs proposal workbook (locked) materials — same extended sell total, excluding Field Request / change orders"
+              >
+                <span className="text-[10px] font-bold uppercase tracking-wide text-cyan-900 whitespace-nowrap">
+                  Job workbook
+                </span>
+                <span className="text-slate-300 hidden sm:inline">|</span>
+                <span className="text-cyan-900 text-xs">Materials:</span>
+                <span className="font-bold tabular-nums text-cyan-950">
+                  $
+                  {externalJobWorkbookMaterialsTotal!.toLocaleString('en-US', {
+                    minimumFractionDigits: 2,
+                    maximumFractionDigits: 2,
+                  })}
+                </span>
+                <span className="text-slate-300 hidden sm:inline">|</span>
+                <span className="text-[10px] font-bold uppercase tracking-wide text-cyan-800/90 whitespace-nowrap">
+                  Proposal workbook
+                </span>
+                <span className="text-cyan-900 text-xs">Materials:</span>
+                <span className="font-bold tabular-nums text-cyan-950">
+                  $
+                  {externalProposalWorkbookMaterialsTotal!.toLocaleString('en-US', {
+                    minimumFractionDigits: 2,
+                    maximumFractionDigits: 2,
+                  })}
+                </span>
+                {jobWorkbookMaterialsDelta != null && Math.abs(jobWorkbookMaterialsDelta) >= 0.01 && (
+                  <>
+                    <span className="text-slate-300 hidden sm:inline">|</span>
+                    <span className="text-[10px] font-semibold uppercase tracking-wide text-cyan-800/90">
+                      Delta
+                    </span>
+                    <span
+                      className={cn(
+                        'font-bold tabular-nums text-sm',
+                        jobWorkbookMaterialsDelta > 0 ? 'text-amber-700' : 'text-emerald-700',
+                      )}
+                    >
+                      {jobWorkbookMaterialsDelta > 0 ? '+' : ''}
+                      $
+                      {jobWorkbookMaterialsDelta.toLocaleString('en-US', {
+                        minimumFractionDigits: 2,
+                        maximumFractionDigits: 2,
+                      })}
+                    </span>
+                  </>
+                )}
+              </div>
+            </>
+          )}
           {quote && (
             <Button
               variant="ghost"

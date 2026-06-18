@@ -6,6 +6,7 @@ import { Badge } from '@/components/ui/badge';
 import { ChevronRight, FileText, Plus, Wrench } from 'lucide-react';
 import { toast } from 'sonner';
 import { AddMaintenanceDialog } from './AddMaintenanceDialog';
+import { decodeMaintenanceNotesPayload } from '@/lib/maintenanceLogPersistence';
 
 interface MaintenanceLogPart {
   id: string;
@@ -67,42 +68,85 @@ export function MaintenanceTab({ vehicleId, vehicleType }: MaintenanceTabProps) 
       let documentsByLog: Record<string, MaintenanceLogDocument[]> = {};
 
       if (logIds.length) {
-        const { data: parts } = await supabase
+        const partsWithInvoice = await supabase
           .from('maintenance_log_parts')
           .select('id, maintenance_log_id, part_number, description, cost, invoice_number, vendor')
           .in('maintenance_log_id', logIds)
           .order('order_index', { ascending: true });
 
+        let parts: MaintenanceLogPart[] | null = partsWithInvoice.data;
+        if (partsWithInvoice.error) {
+          const partsBasic = await supabase
+            .from('maintenance_log_parts')
+            .select('id, maintenance_log_id, part_number, description, cost')
+            .in('maintenance_log_id', logIds)
+            .order('order_index', { ascending: true });
+          parts = partsBasic.error ? null : (partsBasic.data as MaintenanceLogPart[]);
+        }
+
         if (parts) {
           partsByLog = parts.reduce<Record<string, MaintenanceLogPart[]>>((acc, part) => {
-            const key = part.maintenance_log_id;
+            const key = (part as MaintenanceLogPart & { maintenance_log_id: string }).maintenance_log_id;
             if (!acc[key]) acc[key] = [];
             acc[key].push(part);
             return acc;
           }, {});
         }
 
-        const { data: docs } = await supabase
+        const { data: docs, error: docsError } = await supabase
           .from('maintenance_log_documents')
           .select('id, maintenance_log_id, file_name, file_path, maintenance_log_part_id')
           .in('maintenance_log_id', logIds);
 
-        if (docs) {
+        if (!docsError && docs) {
           documentsByLog = docs.reduce<Record<string, MaintenanceLogDocument[]>>((acc, doc) => {
             const key = doc.maintenance_log_id;
             if (!acc[key]) acc[key] = [];
             acc[key].push(doc);
             return acc;
           }, {});
+        } else {
+          const { data: legacyDocs } = await supabase
+            .from('vehicle_documents')
+            .select('id, file_name, file_path, description')
+            .eq('vehicle_id', vehicleId)
+            .like('description', 'maintenance_log:%');
+
+          for (const doc of legacyDocs || []) {
+            const logId = doc.description?.match(/^maintenance_log:([^:]+)/)?.[1];
+            if (!logId) continue;
+            if (!documentsByLog[logId]) documentsByLog[logId] = [];
+            documentsByLog[logId].push({
+              id: doc.id,
+              file_name: doc.file_name,
+              file_path: doc.file_path,
+              maintenance_log_part_id: null,
+            });
+          }
         }
       }
 
       setLogs(
-        logsData.map((log) => ({
-          ...log,
-          parts: partsByLog[log.id] || [],
-          documents: documentsByLog[log.id] || [],
-        })),
+        logsData.map((log) => {
+          const notesPayload = decodeMaintenanceNotesPayload(log.notes);
+          const legacyParts =
+            notesPayload?.invoices.flatMap((inv) =>
+              inv.parts.map((part, index) => ({
+                id: `${inv.clientKey}-${index}`,
+                part_number: part.part_number || null,
+                description: part.description || null,
+                cost: part.cost ? parseFloat(part.cost) : null,
+                invoice_number: inv.invoice_number || null,
+                vendor: inv.vendor || null,
+              })),
+            ) || [];
+
+          return {
+            ...log,
+            parts: partsByLog[log.id]?.length ? partsByLog[log.id] : legacyParts,
+            documents: documentsByLog[log.id] || [],
+          };
+        }),
       );
     } catch (error) {
       toast.error('Failed to load maintenance tickets');
@@ -271,6 +315,8 @@ export function MaintenanceTab({ vehicleId, vehicleType }: MaintenanceTabProps) 
         vehicleId={vehicleId}
         vehicleType={vehicleType}
         editLogId={editLogId}
+        onLogCreated={(logId) => setEditLogId(logId)}
+        onTicketSaved={() => loadLogs()}
         onSuccess={() => { closeDialog(); loadLogs(); }}
       />
     </div>

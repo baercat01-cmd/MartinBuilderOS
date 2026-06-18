@@ -6,10 +6,9 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
-import { Info, Wrench, MapPin, FileText } from 'lucide-react';
+import { Info, Wrench, FileText } from 'lucide-react';
 import { VehicleInfoTab } from './details/VehicleInfoTab';
 import { MaintenanceTab } from './details/MaintenanceTab';
-import { LocationTab } from './details/LocationTab';
 import { DocumentsTab } from './details/DocumentsTab';
 
 interface Vehicle {
@@ -43,7 +42,7 @@ export function VehicleDetailsDialog({
         </DialogHeader>
 
         <Tabs value={activeTab} onValueChange={setActiveTab} className="flex-1 flex flex-col min-h-0 overflow-hidden">
-          <TabsList className="grid w-full grid-cols-4 mx-4 mt-3 shrink-0 bg-slate-200">
+          <TabsList className="grid w-full grid-cols-3 mx-4 mt-3 shrink-0 bg-slate-200">
             <TabsTrigger value="info" className="font-semibold data-[state=active]:bg-yellow-600 data-[state=active]:text-black">
               <Info className="w-4 h-4 mr-1" />
               Info
@@ -51,10 +50,6 @@ export function VehicleDetailsDialog({
             <TabsTrigger value="maintenance" className="font-semibold data-[state=active]:bg-yellow-600 data-[state=active]:text-black">
               <Wrench className="w-4 h-4 mr-1" />
               Maintenance
-            </TabsTrigger>
-            <TabsTrigger value="location" className="font-semibold data-[state=active]:bg-yellow-600 data-[state=active]:text-black">
-              <MapPin className="w-4 h-4 mr-1" />
-              Location
             </TabsTrigger>
             <TabsTrigger value="documents" className="font-semibold data-[state=active]:bg-yellow-600 data-[state=active]:text-black">
               <FileText className="w-4 h-4 mr-1" />
@@ -69,10 +64,6 @@ export function VehicleDetailsDialog({
 
             <TabsContent value="maintenance" className="mt-0">
               <MaintenanceTab vehicleId={vehicle.id} vehicleType={vehicle.type} />
-            </TabsContent>
-
-            <TabsContent value="location" className="mt-0">
-              <LocationTab vehicle={vehicle} onVehicleUpdated={onVehicleUpdated} />
             </TabsContent>
 
             <TabsContent value="documents" className="mt-0">

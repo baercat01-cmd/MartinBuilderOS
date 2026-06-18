@@ -325,6 +325,8 @@ interface MaterialsManagementProps {
   onWorkbookLoadSettled?: () => void;
   /** Signed contract: extended sell total of the job workbook (`working` row) for display separate from proposal materials. */
   onJobWorkbookMaterialsTotalSync?: (total: number | null) => void;
+  /** Signed contract: locked proposal workbook materials total (same math/scope as job workbook sync). */
+  onProposalWorkbookMaterialsTotalSync?: (total: number | null) => void;
   /** Session unlock from split-view parent — matches JobFinancials read-only so the proposal workbook locks with the left panel. */
   historicalUnlockedQuoteId?: string | null;
   /** Split view: show job-workbook materials total on the same top row as legacy proposal-workbook controls. */
@@ -351,6 +353,7 @@ export function MaterialsManagement({
   onWorkbookViewSync,
   onWorkbookLoadSettled,
   onJobWorkbookMaterialsTotalSync,
+  onProposalWorkbookMaterialsTotalSync,
   historicalUnlockedQuoteId = null,
   jobWorkbookMaterialsTotalForStrip,
 }: MaterialsManagementProps) {
@@ -1130,6 +1133,9 @@ export function MaterialsManagement({
 
   // Locked snapshot view (view a specific locked workbook; null = show working/edit view)
   const [snapshotWorkbookId, setSnapshotWorkbookId] = useState<string | null>(null);
+  /** Which workbook the user chose — survives reloads/saves so job edits do not flip back to proposal. */
+  const [workbookViewTarget, setWorkbookViewTarget] = useState<'proposal' | 'job' | 'auto'>('auto');
+  const workbookViewTargetRef = useRef<'proposal' | 'job' | 'auto'>('auto');
   const [lockedSnapshotsMeta, setLockedSnapshotsMeta] = useState<{ id: string; version_number: number; locked_at: string | null }[]>([]);
   const [creatingWorkingFromLocked, setCreatingWorkingFromLocked] = useState(false);
   /** True when this quote has at least one `working` material_workbook row (even if UI is viewing a locked snapshot). */
@@ -1254,6 +1260,8 @@ export function MaterialsManagement({
     // Snapshot view is quote-specific; clear it when proposal changes so we don't keep showing
     // a locked workbook from a different quote.
     setSnapshotWorkbookId(null);
+    workbookViewTargetRef.current = 'auto';
+    setWorkbookViewTarget('auto');
     setWorkbook(null);
     for (const key of workbookCache.keys()) {
       if (key.startsWith(`${job.id}:`)) workbookCache.delete(key);
@@ -1269,7 +1277,7 @@ export function MaterialsManagement({
     loadWorkbook();
   }, [job.id, effectiveQuoteId, isControlled, jobQuotes.length]);
 
-  // Load packages once per job; subscribe to package changes (already filtered by job_id)
+  // Load packages once per job; subscribe to package + bundle item changes
   useEffect(() => {
     loadPackages();
     const packagesChannel = supabase
@@ -1279,8 +1287,25 @@ export function MaterialsManagement({
         () => { loadPackages(); }
       )
       .subscribe();
-    return () => { supabase.removeChannel(packagesChannel); };
+    const bundleItemsChannel = supabase
+      .channel(`material_bundle_items_changes_${job.id}`)
+      .on('postgres_changes',
+        { event: '*', schema: 'public', table: 'material_bundle_items' },
+        () => { loadPackages(); }
+      )
+      .subscribe();
+    return () => {
+      supabase.removeChannel(packagesChannel);
+      supabase.removeChannel(bundleItemsChannel);
+    };
   }, [job.id]);
+
+  // Refresh package assignments when returning to the workbook tab
+  useEffect(() => {
+    if (activeTab === 'manage') {
+      loadPackages();
+    }
+  }, [activeTab, job.id]);
 
   // Real-time: reload workbook when any material_item or material_sheet changes so newest crew
   // orders appear in the Field Request workbook immediately (invalidate cache so we don't show stale data).
@@ -1338,24 +1363,49 @@ export function MaterialsManagement({
 
   async function loadPackages() {
     try {
-      const { data, error } = await supabase
+      const { data: bundles, error: bundlesError } = await supabase
         .from('material_bundles')
-        .select(`
-          id,
-          name,
-          description,
-          status,
-          bundle_items:material_bundle_items(material_item_id)
-        `)
+        .select('id, name, description, status')
         .eq('job_id', job.id)
         .order('name');
 
-      if (error) {
-        console.warn('Packages load failed (non-blocking):', error.message);
+      if (bundlesError) {
+        console.warn('Packages load failed (non-blocking):', bundlesError.message);
         setPackages([]);
         return;
       }
-      setPackages(data || []);
+
+      const bundleList = bundles || [];
+      if (bundleList.length === 0) {
+        setPackages([]);
+        return;
+      }
+
+      const { data: bundleItems, error: itemsError } = await supabase
+        .from('material_bundle_items')
+        .select('bundle_id, material_item_id')
+        .in('bundle_id', bundleList.map((bundle) => bundle.id));
+
+      if (itemsError) {
+        console.warn('Package items load failed (non-blocking):', itemsError.message);
+        setPackages(bundleList.map((bundle) => ({ ...bundle, bundle_items: [] })));
+        return;
+      }
+
+      const itemsByBundleId = (bundleItems || []).reduce<
+        Record<string, { material_item_id: string }[]>
+      >((acc, row) => {
+        if (!acc[row.bundle_id]) acc[row.bundle_id] = [];
+        acc[row.bundle_id].push({ material_item_id: row.material_item_id });
+        return acc;
+      }, {});
+
+      setPackages(
+        bundleList.map((bundle) => ({
+          ...bundle,
+          bundle_items: itemsByBundleId[bundle.id] || [],
+        })),
+      );
     } catch (error: any) {
       console.warn('Packages load failed (non-blocking):', error?.message || error);
       setPackages([]);
@@ -1630,8 +1680,19 @@ export function MaterialsManagement({
       let snapActive: string | null;
       if (snapshotIdOverride === null) snapActive = null;
       else if (typeof snapshotIdOverride === 'string') snapActive = snapshotIdOverride;
-      else snapActive = snapshotWorkbookId;
-      const cacheKey = `${job.id}:${quoteIdForLoad ?? 'none'}:${snapActive ?? 'edit'}`;
+      else snapActive = workbookViewTargetRef.current === 'job' ? null : snapshotWorkbookId;
+
+      const viewTarget = workbookViewTargetRef.current;
+      let preferWorking = !!opts?.preferWorking;
+      if (snapshotIdOverride === undefined && viewTarget === 'job') {
+        snapActive = null;
+        preferWorking = true;
+      }
+
+      const cacheViewKey =
+        snapActive ??
+        (viewTarget === 'job' ? 'job-view' : viewTarget === 'proposal' ? 'proposal-view' : 'auto');
+      const cacheKey = `${job.id}:${quoteIdForLoad ?? 'none'}:${cacheViewKey}`;
 
       // Serve from cache immediately (stale-while-revalidate pattern)
       const cached = workbookCache.get(cacheKey);
@@ -1723,9 +1784,15 @@ export function MaterialsManagement({
         if (!workbookData) setSnapshotWorkbookId(null);
       }
       if (!workbookData) {
-        // User explicitly left signed-contract snapshot / chose "working copy" — must land on working, not locked-first.
-        if (opts?.preferWorking && workingList.length > 0) {
+        // Respect explicit view: proposal → locked row; job → working row (never cross-contaminate).
+        if ((preferWorking || viewTarget === 'job') && workingList.length > 0) {
           workbookData = workingList[0];
+        } else if (
+          snapshotIdOverride === undefined &&
+          viewTarget === 'proposal' &&
+          lockedList.length > 0
+        ) {
+          workbookData = lockedList[0];
         } else if (
           shouldDefaultToLockedWorkbook &&
           preferWorkingForSessionUnlock &&
@@ -1974,6 +2041,20 @@ export function MaterialsManagement({
       setWorkbook(fullWorkbook);
       workbookForViewSync = workbookData;
 
+      if (
+        workbookViewTargetRef.current === 'auto' &&
+        workingList.length > 0 &&
+        lockedList.length > 0
+      ) {
+        if (workbookData.status === 'locked') {
+          workbookViewTargetRef.current = 'proposal';
+          setWorkbookViewTarget('proposal');
+        } else if (workbookData.status === 'working') {
+          workbookViewTargetRef.current = 'job';
+          setWorkbookViewTarget('job');
+        }
+      }
+
       // Write to cache so the next visit is instant
       workbookCache.set(cacheKey, { workbook: fullWorkbook, categories, cachedAt: Date.now() });
 
@@ -2019,12 +2100,22 @@ export function MaterialsManagement({
   }
 
   async function openLockedSnapshotView(wbId: string) {
+    workbookViewTargetRef.current = 'proposal';
+    setWorkbookViewTarget('proposal');
     setSnapshotWorkbookId(wbId);
+    for (const key of workbookCache.keys()) {
+      if (key.startsWith(`${job.id}:`)) workbookCache.delete(key);
+    }
     await loadWorkbook(false, undefined, wbId);
   }
 
   async function exitLockedSnapshotView() {
+    workbookViewTargetRef.current = 'job';
+    setWorkbookViewTarget('job');
     setSnapshotWorkbookId(null);
+    for (const key of workbookCache.keys()) {
+      if (key.startsWith(`${job.id}:`)) workbookCache.delete(key);
+    }
     const res = await loadWorkbook(false, undefined, null, { preferWorking: true });
     // Without a `working` row, preferWorking still falls back to `locked` → UI stays read-only. Create a working copy from the snapshot.
     if (res && !res.landedOnEditableWorking && effectiveQuoteId) {
@@ -2745,18 +2836,26 @@ export function MaterialsManagement({
     };
   }
 
+  const materialPackageNamesByItemId = useMemo(() => {
+    const map = new Map<string, string[]>();
+    for (const pkg of packages) {
+      for (const bundleItem of pkg.bundle_items ?? []) {
+        const materialId = bundleItem.material_item_id;
+        if (!materialId) continue;
+        const names = map.get(materialId) ?? [];
+        names.push(pkg.name);
+        map.set(materialId, names);
+      }
+    }
+    return map;
+  }, [packages]);
+
   function isMaterialInAnyPackage(materialId: string): boolean {
-    return packages.some(pkg => 
-      pkg.bundle_items?.some((item: any) => item.material_item_id === materialId)
-    );
+    return materialPackageNamesByItemId.has(materialId);
   }
 
   function getMaterialPackageNames(materialId: string): string[] {
-    return packages
-      .filter(pkg => 
-        pkg.bundle_items?.some((item: any) => item.material_item_id === materialId)
-      )
-      .map(pkg => pkg.name);
+    return materialPackageNamesByItemId.get(materialId) ?? [];
   }
 
   function groupByCategory(items: MaterialItem[], categoryOrder?: string[] | null): CategoryGroup[] {
@@ -3056,6 +3155,10 @@ export function MaterialsManagement({
 
   async function saveCellEdit(item: MaterialItem) {
     if (!editingCell) return;
+    if (isWorkbookReadOnlyRef.current) {
+      cancelCellEdit();
+      return;
+    }
     if (!workbook || isWorkbookQuoteMismatch(workbook.quote_id, effectiveQuoteId, jobQuotes)) {
       toast.error('Cannot save: materials workbook does not match the selected proposal.');
       cancelCellEdit();
@@ -3317,6 +3420,7 @@ export function MaterialsManagement({
   }
 
   function openMoveItem(item: MaterialItem) {
+    if (isWorkbookReadOnly) return;
     setMovingItem(item);
     setMoveToSheetId(item.sheet_id);
     setMoveToCategory(item.category);
@@ -3325,6 +3429,7 @@ export function MaterialsManagement({
 
   async function moveItem() {
     if (!movingItem) return;
+    if (isWorkbookReadOnly) return;
 
     try {
       // Save current scroll position
@@ -4374,21 +4479,57 @@ export function MaterialsManagement({
   const quoteContractFrozen = isQuoteContractFrozen(quoteForContractUi as any);
   const quoteHasSignedContract = quoteHasActiveContract(quoteForContractUi as any);
 
-  // Push job-workbook extended sell total to the proposal panel and in-card display (signed contract only).
+  // Push job + locked proposal workbook materials totals (same extended-sell math and sheet scope).
   useEffect(() => {
     let cancelled = false;
 
-    async function fetchWorkingWorkbookExtendedSellTotal(quoteId: string): Promise<number | null> {
+    const PROPOSAL_WORKBOOK_COMPARISON_EXCLUDED = new Set([
+      'Field Request',
+      'Field Requests',
+      'Crew Orders',
+    ]);
+
+    function sheetCountsTowardWorkbookComparison(sheet: MaterialSheet): boolean {
+      if ((sheet as { is_option?: boolean }).is_option) return false;
+      if (sheet.sheet_type === 'change_order') return false;
+      if (PROPOSAL_WORKBOOK_COMPARISON_EXCLUDED.has(String(sheet.sheet_name ?? '').trim())) return false;
+      return true;
+    }
+
+    function sumSheetsExtendedSellTotal(sheets: MaterialSheet[]): number {
+      let sum = 0;
+      for (const sheet of sheets) {
+        if (!sheetCountsTowardWorkbookComparison(sheet)) continue;
+        const groups = groupByCategory(sheet.items || [], sheet.category_order);
+        for (const cg of groups) {
+          for (const item of cg.items || []) {
+            sum += getDisplayExtended(item).price;
+          }
+        }
+      }
+      return sum;
+    }
+
+    async function fetchWorkbookExtendedSellTotalByStatus(
+      quoteId: string,
+      status: 'working' | 'locked',
+    ): Promise<number | null> {
       const { data: allWorkbooks, error } = await supabase
         .from('material_workbooks')
         .select('id, quote_id, status, version_number')
         .eq('job_id', job.id)
         .order('updated_at', { ascending: false });
       if (error || !allWorkbooks?.length) return null;
-      const workingList = allWorkbooks
-        .filter((w: { quote_id?: string | null; status?: string }) => w.quote_id === quoteId && w.status === 'working')
-        .sort((a: { version_number?: number }, b: { version_number?: number }) => (b.version_number ?? 0) - (a.version_number ?? 0));
-      const wbRow = workingList[0];
+      const matches = allWorkbooks
+        .filter(
+          (w: { quote_id?: string | null; status?: string }) =>
+            w.quote_id === quoteId && w.status === status,
+        )
+        .sort(
+          (a: { version_number?: number }, b: { version_number?: number }) =>
+            (b.version_number ?? 0) - (a.version_number ?? 0),
+        );
+      const wbRow = matches[0];
       if (!wbRow) return null;
       const { data: sheetsRows, error: sheetsErr } = await supabase
         .from('material_sheets')
@@ -4419,45 +4560,30 @@ export function MaterialsManagement({
         ...sheet,
         items: itemsData.filter((item: any) => item.sheet_id === sheet.id),
       }));
-      let sum = 0;
-      for (const sheet of sheetsWithItems) {
-        const groups = groupByCategory(sheet.items || [], sheet.category_order);
-        for (const cg of groups) {
-          for (const item of cg.items || []) {
-            sum += getDisplayExtended(item).price;
-          }
-        }
-      }
-      return sum;
+      return sumSheetsExtendedSellTotal(sheetsWithItems);
     }
 
-    function pushTotal(value: number | null) {
+    function pushTotals(jobTotal: number | null, proposalTotal: number | null) {
       if (cancelled) return;
-      onJobWorkbookMaterialsTotalSync?.(value);
+      onJobWorkbookMaterialsTotalSync?.(jobTotal);
+      onProposalWorkbookMaterialsTotalSync?.(proposalTotal);
     }
 
     async function run() {
-      // Any quote with both a locked snapshot row and a working row uses the working row for this total only;
-      // do not require contract flags (they can lag) so the materials-column strip + JobFinancials stay in sync.
       if (!effectiveQuoteId || !hasWorkingWorkbookForQuote || lockedSnapshotsMeta.length === 0) {
-        pushTotal(null);
+        pushTotals(null, null);
         return;
       }
+
+      let jobTotal: number | null = null;
       if (workbook?.status === 'working' && !snapshotWorkbookId && workbook.sheets) {
-        let sum = 0;
-        for (const sheet of workbook.sheets) {
-          const groups = groupByCategory(sheet.items || [], sheet.category_order);
-          for (const cg of groups) {
-            for (const item of cg.items || []) {
-              sum += getDisplayExtended(item).price;
-            }
-          }
-        }
-        pushTotal(sum);
-        return;
+        jobTotal = sumSheetsExtendedSellTotal(workbook.sheets);
+      } else {
+        jobTotal = await fetchWorkbookExtendedSellTotalByStatus(effectiveQuoteId, 'working');
       }
-      const total = await fetchWorkingWorkbookExtendedSellTotal(effectiveQuoteId);
-      pushTotal(total);
+
+      const proposalTotal = await fetchWorkbookExtendedSellTotalByStatus(effectiveQuoteId, 'locked');
+      pushTotals(jobTotal, proposalTotal);
     }
 
     void run();
@@ -4466,6 +4592,7 @@ export function MaterialsManagement({
     };
   }, [
     onJobWorkbookMaterialsTotalSync,
+    onProposalWorkbookMaterialsTotalSync,
     hasWorkingWorkbookForQuote,
     lockedSnapshotsMeta.length,
     effectiveQuoteId,
@@ -4498,9 +4625,18 @@ export function MaterialsManagement({
   );
   /** Signed-contract job workbook (working row): shop/COS/field edits allowed even when the proposal panel is read-only. */
   const isViewingSignedContractJobWorkbook =
-    quoteHasSignedContract && workbook?.status === 'working' && !snapshotWorkbookId;
-  /** Same read-only rules as JobFinancials (office lock, contract, older proposal, session unlock) for every grid row. */
-  const isWorkbookReadOnly = proposalPanelReadOnly && !isViewingSignedContractJobWorkbook;
+    quoteHasSignedContract &&
+    workbook?.status === 'working' &&
+    !snapshotWorkbookId &&
+    workbookViewTarget !== 'proposal';
+  /** Locked proposal snapshot — always read-only; session unlock only switches to job workbook for edits. */
+  const isViewingLockedProposalSnapshot =
+    !!snapshotWorkbookId ||
+    (workbook?.status === 'locked' && workbookViewTarget !== 'job');
+  /** Proposal snapshot lock OR JobFinancials read-only (office lock, contract, older proposal, minus session unlock on job copy). */
+  const isWorkbookReadOnly =
+    isViewingLockedProposalSnapshot ||
+    (proposalPanelReadOnly && !isViewingSignedContractJobWorkbook);
   isWorkbookReadOnlyRef.current = isWorkbookReadOnly;
   const materialsWorkbookLocked = isWorkbookReadOnly;
 
@@ -4721,74 +4857,87 @@ export function MaterialsManagement({
     }
   }
 
-  /** Shop / trim / Zoho / workbook-level mutations — only when the visible grid is editable. */
+  /** Shop / trim / Zoho / workbook-level mutations — only on the editable job/working workbook. */
   const canUseShopTrimAndZohoOnThisWorkbook =
-    !isWorkbookReadOnly &&
-    (workbook?.status === 'working' || (workbook?.status === 'locked' && quoteHasSignedContract));
+    !isWorkbookReadOnly && workbook?.status === 'working';
   const showShopOrderControls = canUseShopTrimAndZohoOnThisWorkbook;
   /** Unsigned / draft proposals: optional manual lock. Sent or signed contracts auto-manage locked + working copies. */
   const showManualLockWorkbook =
     !!workbook && workbook.status === 'working' && !quoteContractFrozen && !isWorkbookReadOnly;
-  /** Signed contract only: two workbook rows (price snapshot vs job-tracking working copy). */
-  const showContractWorkingToggle = quoteHasSignedContract && lockedSnapshotsMeta.length > 0;
-  /** User manually locked while still editable — keep older “view snapshot” row. */
-  const showLegacyLockedSnapshotButtons =
-    !quoteContractFrozen && workbook?.status === 'working' && lockedSnapshotsMeta.length > 0;
-  /** Viewing a locked snapshot overlay while a job/working row exists — Job workbook switch lives in the top strip. */
-  const showSnapshotExitToJobWorkbook = !!snapshotWorkbookId && hasWorkingWorkbookForQuote;
+  /** When both a locked proposal snapshot and a job/working copy exist, show an isolated toggle. */
+  const showDualWorkbookToggle = hasWorkingWorkbookForQuote && lockedSnapshotsMeta.length > 0;
+  const primaryLockedSnapshot = lockedSnapshotsMeta[0] ?? null;
+  const viewingProposalWorkbook =
+    workbookViewTarget === 'proposal' ||
+    (!!snapshotWorkbookId && workbookViewTarget !== 'job') ||
+    (workbookViewTarget === 'auto' && workbook?.status === 'locked');
+  const viewingJobWorkbook =
+    workbookViewTarget === 'job' ||
+    (workbook?.status === 'working' && !snapshotWorkbookId && workbookViewTarget !== 'proposal');
+  const workingCopyToggleDisabled = !hasWorkingWorkbookForQuote;
 
   const materialsSlot = useMaterialsToolbarSlot();
   const portalTarget = materialsSlot?.ready && materialsSlot?.ref?.current ? materialsSlot.ref.current : null;
 
-  const viewingSignedContractWorkbook =
-    !!snapshotWorkbookId ||
-    (!!workbook?.id &&
-      workbook.status === 'locked' &&
-      lockedSnapshotsMeta.some((l) => l.id === workbook.id));
-  const viewingWorkingCopy =
-    !!workbook &&
-    workbook.status === 'working' &&
-    !snapshotWorkbookId &&
-    hasWorkingWorkbookForQuote;
-  const workingCopyToggleDisabled = !hasWorkingWorkbookForQuote;
-  /** Snapshot exit button is redundant when the signed-contract Job | Proposal toggle is shown. */
-  const showSnapshotExitJobWbButton = showSnapshotExitToJobWorkbook && !showContractWorkingToggle;
-  /** Signed contract pair: which workbook the grid is showing (proposal-priced vs internal job copy). */
-  const workbookLocationIndicator =
-    showContractWorkingToggle && workbook ? (
+  const dualWorkbookViewToggle =
+    showDualWorkbookToggle && primaryLockedSnapshot ? (
       <div
-        className="flex flex-col gap-0.5 shrink-0 min-w-0"
-        role="status"
-        aria-label={
-          viewingWorkingCopy
-            ? 'You are viewing the job workbook'
-            : 'You are viewing the proposal workbook'
-        }
+        className="flex flex-wrap items-center gap-3 shrink-0 ml-auto"
+        role="group"
+        aria-label="Switch between proposal workbook and job workbook"
       >
-        <span className="text-[9px] font-semibold uppercase tracking-wide text-cyan-950/70 whitespace-nowrap">
-          You are viewing
+        <span className="text-[10px] font-bold uppercase tracking-wide text-cyan-900 whitespace-nowrap hidden sm:inline">
+          Workbooks
         </span>
-        <div className="inline-flex rounded-lg border-2 border-cyan-800/30 bg-white/80 p-0.5 gap-0.5 shadow-sm">
-          <span
+        <div className="flex items-center gap-2 rounded-lg border-2 border-cyan-700/25 bg-white/90 p-1 shadow-sm">
+          <Button
+            type="button"
+            size="sm"
+            variant={viewingProposalWorkbook ? 'default' : 'outline'}
             className={cn(
-              'rounded-md px-2 py-1 text-[10px] sm:text-[11px] font-bold whitespace-nowrap transition-colors',
-              viewingSignedContractWorkbook
-                ? 'bg-amber-600 text-white shadow-sm'
-                : 'text-slate-600 bg-transparent',
+              'h-9 text-xs font-semibold',
+              viewingProposalWorkbook
+                ? 'bg-amber-500 hover:bg-amber-600 text-white border-amber-600 shadow-sm'
+                : 'bg-amber-50 border-amber-300 text-amber-950 hover:bg-amber-100',
             )}
+            onClick={() => {
+              if (viewingProposalWorkbook) return;
+              void openLockedSnapshotView(primaryLockedSnapshot.id);
+            }}
+            title="Proposal workbook — customer pricing snapshot (edits here do not change the job workbook)"
           >
+            <Lock className="w-3.5 h-3.5 mr-1.5 shrink-0" />
             Proposal workbook
-          </span>
-          <span
+            <span className="ml-1 opacity-90 font-medium">v{primaryLockedSnapshot.version_number}</span>
+          </Button>
+          <div className="h-7 w-px bg-cyan-300/80 shrink-0" aria-hidden />
+          <Button
+            type="button"
+            size="sm"
+            variant={viewingJobWorkbook ? 'default' : 'outline'}
+            disabled={workingCopyToggleDisabled}
             className={cn(
-              'rounded-md px-2 py-1 text-[10px] sm:text-[11px] font-bold whitespace-nowrap transition-colors',
-              viewingWorkingCopy
-                ? 'bg-cyan-800 text-white shadow-sm'
-                : 'text-slate-600 bg-transparent',
+              'h-9 text-xs font-semibold',
+              viewingJobWorkbook
+                ? 'bg-cyan-800 hover:bg-cyan-900 text-white border-cyan-900 shadow-sm'
+                : 'bg-cyan-50 border-cyan-400 text-cyan-950 hover:bg-cyan-100',
+              workingCopyToggleDisabled && 'opacity-40 cursor-not-allowed hover:bg-cyan-50',
             )}
+            onClick={() => {
+              if (workingCopyToggleDisabled || viewingJobWorkbook) return;
+              void exitLockedSnapshotView();
+            }}
+            title={
+              workingCopyToggleDisabled
+                ? ensuringContractWorkbookPair
+                  ? 'Creating job workbook…'
+                  : 'Job workbook is being prepared'
+                : 'Job workbook — shop, crew orders, and field edits (does not change proposal pricing)'
+            }
           >
+            <LockOpen className="w-3.5 h-3.5 mr-1.5 shrink-0" />
             Job workbook
-          </span>
+          </Button>
         </div>
       </div>
     ) : null;
@@ -4801,59 +4950,6 @@ export function MaterialsManagement({
       </div>
     );
   }
-
-  /** Readable on both the dark portaled job bar and light inline headers */
-  const contractWorkbookViewToggle =
-    showContractWorkingToggle && lockedSnapshotsMeta[0] ? (
-      <div
-        className="flex flex-col gap-0.5 shrink-0"
-        role="group"
-        aria-label="Switch between proposal workbook and job workbook"
-      >
-        <div className="inline-flex rounded-md border-2 border-amber-600 bg-white/95 dark:bg-slate-900/90 p-0.5 shadow-sm">
-          <button
-            type="button"
-            disabled={workingCopyToggleDisabled}
-            onClick={() => {
-              if (workingCopyToggleDisabled) return;
-              void exitLockedSnapshotView();
-            }}
-            className={cn(
-              'rounded px-2 sm:px-2.5 py-1 text-[10px] sm:text-[11px] font-bold transition-colors whitespace-nowrap',
-              viewingWorkingCopy
-                ? 'bg-amber-600 text-white shadow-sm'
-                : 'text-amber-950 hover:bg-amber-50',
-              workingCopyToggleDisabled && 'opacity-40 cursor-not-allowed hover:bg-transparent',
-            )}
-            title={
-              workingCopyToggleDisabled
-                ? ensuringContractWorkbookPair
-                  ? 'Creating job workbook…'
-                  : 'Job workbook is being prepared for this signed contract'
-                : 'Job workbook — internal only. Does not change customer proposal totals (left follows proposal workbook).'
-            }
-          >
-            Job workbook
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              void openLockedSnapshotView(lockedSnapshotsMeta[0].id);
-            }}
-            className={cn(
-              'rounded px-2 sm:px-2.5 py-1 text-[10px] sm:text-[11px] font-bold transition-colors whitespace-nowrap',
-              viewingSignedContractWorkbook
-                ? 'bg-amber-600 text-white shadow-sm'
-                : 'text-amber-950 hover:bg-amber-50',
-            )}
-            title="Proposal workbook (signed contract snapshot) — drives customer materials total on the left"
-          >
-            Proposal workbook{' '}
-            <span className="opacity-90 font-semibold">v{lockedSnapshotsMeta[0].version_number}</span>
-          </button>
-        </div>
-      </div>
-    ) : null;
 
   // Action buttons that appear in the top bar (Move / Package / Add Material, etc.).
   // Only when Workbook tab is active and a workbook exists.
@@ -5109,25 +5205,13 @@ export function MaterialsManagement({
           </div>
         )}
 
-        {(typeof jobWorkbookMaterialsTotalForStrip === 'number' ||
-          showLegacyLockedSnapshotButtons ||
-          showSnapshotExitJobWbButton ||
-          showContractWorkingToggle) && (
+        {(typeof jobWorkbookMaterialsTotalForStrip === 'number' || showDualWorkbookToggle) && (
           <div
             className={cn(
               'sticky top-0 z-20 mb-2 flex flex-wrap items-center gap-x-3 gap-y-2 min-w-0',
-              (typeof jobWorkbookMaterialsTotalForStrip === 'number' ||
-                showSnapshotExitJobWbButton ||
-                showContractWorkingToggle) &&
-                'border-b-2 border-cyan-600 bg-gradient-to-r from-cyan-50 via-sky-50 to-cyan-50 px-3 py-2 shadow-sm',
-              typeof jobWorkbookMaterialsTotalForStrip !== 'number' &&
-                !showSnapshotExitJobWbButton &&
-                !showContractWorkingToggle &&
-                showLegacyLockedSnapshotButtons &&
-                'justify-end',
+              'border-b-2 border-cyan-600 bg-gradient-to-r from-cyan-50 via-sky-50 to-cyan-50 px-3 py-2 shadow-sm',
             )}
           >
-            {workbookLocationIndicator}
             {typeof jobWorkbookMaterialsTotalForStrip === 'number' && (
               <div className="flex flex-wrap items-center gap-x-3 gap-y-1 flex-1 min-w-0">
                 <span className="text-[10px] font-bold uppercase tracking-wide text-cyan-900 whitespace-nowrap">
@@ -5143,45 +5227,7 @@ export function MaterialsManagement({
                 </span>
               </div>
             )}
-            {showContractWorkingToggle && contractWorkbookViewToggle && (
-              <div className="shrink-0">{contractWorkbookViewToggle}</div>
-            )}
-            {(showLegacyLockedSnapshotButtons || showSnapshotExitJobWbButton) && (
-              <div
-                className={cn(
-                  'flex flex-wrap items-center gap-2 shrink-0',
-                  (typeof jobWorkbookMaterialsTotalForStrip === 'number' ||
-                    showSnapshotExitJobWbButton ||
-                    showContractWorkingToggle) &&
-                    'ml-auto',
-                )}
-              >
-                {showSnapshotExitJobWbButton ? (
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="secondary"
-                    className="h-9 text-xs font-semibold"
-                    onClick={() => exitLockedSnapshotView()}
-                    title="Switch to the job workbook (internal only). Does not unlock or replace the proposal workbook."
-                  >
-                    <LockOpen className="w-3.5 h-3.5 mr-1.5" />
-                    Job workbook
-                  </Button>
-                ) : (
-                  <Button
-                    type="button"
-                    size="sm"
-                    className="h-9 text-xs font-semibold bg-amber-100 border-2 border-amber-400 text-amber-950 hover:bg-amber-200 shadow-sm"
-                    onClick={() => openLockedSnapshotView(lockedSnapshotsMeta[0].id)}
-                    title="Open the proposal workbook (locked snapshot)"
-                  >
-                    <Lock className="w-3.5 h-3.5 mr-1.5" />
-                    Proposal workbook
-                  </Button>
-                )}
-              </div>
-            )}
+            {dualWorkbookViewToggle}
           </div>
         )}
 
@@ -5506,7 +5552,7 @@ export function MaterialsManagement({
                                 <CheckSquare className="w-3 h-3 mx-auto" />
                               </th>
                             )}
-                            <th className="text-center p-1 text-[10px] font-bold border-r border-slate-600 whitespace-nowrap w-16 max-w-[4rem]">Pkg</th>
+                            <th className="text-center p-1 text-[10px] font-bold border-r border-slate-600 whitespace-nowrap w-24 max-w-[6rem]">Pkg</th>
                             <th className="text-left p-1 text-[10px] font-bold border-r border-slate-600 whitespace-nowrap">SKU</th>
                             <th className="text-left p-1 text-[10px] font-bold border-r border-slate-600 whitespace-nowrap">Material</th>
                             <th className="text-center p-1 text-[10px] font-bold border-r border-slate-600 whitespace-nowrap w-12">Usage</th>
@@ -5840,11 +5886,13 @@ export function MaterialsManagement({
                                         </div>
                                       </td>
                                     )}
-                                    <td className="p-1 border-r whitespace-nowrap w-20 max-w-[5rem]">
+                                    <td className="p-1 border-r whitespace-nowrap w-24 max-w-[6rem]">
                                       <div className="min-w-0">
                                         <Select
-                                          value=""
+                                          key={`${item.id}-${materialPackageNames.join('|')}`}
+                                          value={materialPackageNames.length > 0 ? `attached-${item.id}` : 'unassigned'}
                                           onValueChange={(value) => {
+                                            if (value === 'unassigned' || value === `attached-${item.id}`) return;
                                             if (value.startsWith('remove-')) {
                                               const packageId = value.replace('remove-', '');
                                               removeMaterialFromPackage(item.id, packageId);
@@ -5853,12 +5901,19 @@ export function MaterialsManagement({
                                             }
                                           }}
                                         >
-                                          <SelectTrigger className="h-6 text-[10px] border bg-white w-full max-w-[4rem] [&>svg]:hidden justify-start">
-                                            <span className="truncate min-w-0 block text-left">
-                                              {materialPackageNames.length > 0 ? materialPackageNames.join(', ') : '–'}
-                                            </span>
+                                          <SelectTrigger
+                                            className="h-6 text-[10px] border bg-white w-full max-w-[5.5rem] [&>svg]:hidden justify-start"
+                                            title={materialPackageNames.length > 0 ? materialPackageNames.join(', ') : 'Assign package'}
+                                          >
+                                            <SelectValue placeholder="–" />
                                           </SelectTrigger>
                                           <SelectContent>
+                                            <SelectItem value="unassigned" className="hidden" aria-hidden>
+                                              –
+                                            </SelectItem>
+                                            <SelectItem value={`attached-${item.id}`} className="hidden" aria-hidden>
+                                              {materialPackageNames.join(', ') || '–'}
+                                            </SelectItem>
                                             {materialPackageNames.length > 0 && (
                                               <>
                                                 <div className="px-2 py-1.5 text-xs font-semibold text-muted-foreground">
@@ -6282,20 +6337,24 @@ export function MaterialsManagement({
                                             <ImageIcon className="w-3.5 h-3.5 mr-2" />
                                             Photos
                                           </DropdownMenuItem>
-                                          <DropdownMenuItem onClick={() => setOpenLinkTrimForItem({ id: item.id, materialName: item.material_name, currentTrimConfigId: item.trim_saved_config_id ?? null })}>
-                                            <Pencil className="w-3.5 h-3.5 mr-2" />
-                                            {item.trim_saved_config_id ? 'View / change trim drawing' : 'Link trim drawing'}
-                                          </DropdownMenuItem>
+                                          {!materialsWorkbookLocked && (
+                                            <DropdownMenuItem onClick={() => setOpenLinkTrimForItem({ id: item.id, materialName: item.material_name, currentTrimConfigId: item.trim_saved_config_id ?? null })}>
+                                              <Pencil className="w-3.5 h-3.5 mr-2" />
+                                              {item.trim_saved_config_id ? 'View / change trim drawing' : 'Link trim drawing'}
+                                            </DropdownMenuItem>
+                                          )}
                                           {!materialsWorkbookLocked && (
                                             <DropdownMenuItem onClick={() => openReplaceMaterialDialog(item)}>
                                               <ArrowLeftRight className="w-3.5 h-3.5 mr-2" />
                                               Switch material
                                             </DropdownMenuItem>
                                           )}
-                                          <DropdownMenuItem onClick={() => openMoveItem(item)}>
-                                            <MoveHorizontal className="w-3.5 h-3.5 mr-2" />
-                                            Move
-                                          </DropdownMenuItem>
+                                          {!materialsWorkbookLocked && (
+                                            <DropdownMenuItem onClick={() => openMoveItem(item)}>
+                                              <MoveHorizontal className="w-3.5 h-3.5 mr-2" />
+                                              Move
+                                            </DropdownMenuItem>
+                                          )}
                                           {!materialsWorkbookLocked && (
                                             <DropdownMenuItem
                                               onClick={() => deleteItem(item.id)}
