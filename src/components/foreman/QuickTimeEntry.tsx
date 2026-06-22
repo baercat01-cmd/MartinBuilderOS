@@ -21,8 +21,6 @@ import {
   LogOut,
   Clock,
   Users,
-  Timer,
-  Edit3,
   ArrowLeft,
   X,
   Briefcase,
@@ -186,7 +184,6 @@ export function QuickTimeEntry({ userId, onSuccess, onBack, allowedJobs, userRol
   const [clockedInEntry, setClockedInEntry] = useState<ClockInEntry | null>(null);
   const [jobs, setJobs] = useState<Job[]>([]);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
-  const [mode, setMode] = useState<'timer' | 'manual'>('manual'); // Default to manual
   const [showDialog, setShowDialog] = useState(false);
   const [selectedJobId, setSelectedJobId] = useState<string>('');
   const [jobPickerOpen, setJobPickerOpen] = useState(false);
@@ -196,6 +193,7 @@ export function QuickTimeEntry({ userId, onSuccess, onBack, allowedJobs, userRol
     startTime: '06:00',
     endTime: '17:00',
     isOvernightShift: false,
+    notes: '',
   });
   const [jobType, setJobType] = useState<'existing' | 'misc'>('existing');
   const [miscJobData, setMiscJobData] = useState({
@@ -583,7 +581,7 @@ export function QuickTimeEntry({ userId, onSuccess, onBack, allowedJobs, userRol
           crew_count: 1,
           is_manual: true,
           is_active: false,
-          notes: 'Manual entry',
+          notes: manualData.notes.trim() || null,
           worker_names: [],
         });
 
@@ -631,6 +629,7 @@ export function QuickTimeEntry({ userId, onSuccess, onBack, allowedJobs, userRol
         startTime: '06:00',
         endTime: '17:00',
         isOvernightShift: false,
+        notes: '',
       });
       setJobComponents([]);
       onSuccess?.();
@@ -867,13 +866,13 @@ export function QuickTimeEntry({ userId, onSuccess, onBack, allowedJobs, userRol
             // Reset when closing
             setJobPickerOpen(false);
             setJobSearchQuery('');
-            setMode('manual');
             setSelectedJobId('');
             setManualData({
               date: new Date().toISOString().split('T')[0],
               startTime: '06:00',
               endTime: '17:00',
               isOvernightShift: false,
+              notes: '',
             });
             setMiscJobData({
               name: '',
@@ -889,14 +888,26 @@ export function QuickTimeEntry({ userId, onSuccess, onBack, allowedJobs, userRol
           }
         }}
       >
-        <DialogContent className="max-w-md max-h-[90vh] overflow-y-auto">
-          <DialogHeader>
+        <DialogContent
+          className={cn(
+            'max-md:fixed max-md:inset-0 max-md:left-0 max-md:top-0 max-md:h-[100dvh] max-md:w-screen max-md:max-w-none max-md:translate-x-0 max-md:translate-y-0 max-md:rounded-none max-md:flex max-md:flex-col max-md:gap-0 max-md:p-0 max-md:overflow-hidden',
+            'md:max-w-md md:max-h-[90vh] md:overflow-y-auto',
+          )}
+          onInteractOutside={(e) => {
+            if (window.matchMedia('(max-width: 767px)').matches) e.preventDefault();
+          }}
+          onPointerDownOutside={(e) => {
+            if (window.matchMedia('(max-width: 767px)').matches) e.preventDefault();
+          }}
+        >
+          <DialogHeader className="max-md:px-4 max-md:pt-4 max-md:pb-3 max-md:pr-12 max-md:border-b max-md:shrink-0">
             <DialogTitle className="flex items-center gap-2 text-lg font-bold">
               <Clock className="w-5 h-5 text-yellow-600" />
               Time Clock
             </DialogTitle>
           </DialogHeader>
 
+          <div className="max-md:flex-1 max-md:min-h-0 max-md:overflow-y-auto max-md:px-4 max-md:py-3 max-md:space-y-3">
           {/* Job Type Selection - hidden for shop users (locked to Shop job) */}
           {!isShopUser && (
             <div className="grid grid-cols-2 gap-2 p-1.5 bg-gradient-to-br from-slate-50 to-slate-100 rounded-lg border-2 border-black">
@@ -950,51 +961,20 @@ export function QuickTimeEntry({ userId, onSuccess, onBack, allowedJobs, userRol
             {/* Existing Job Flow - hidden for shop users */}
             {!isShopUser && jobType === 'existing' && (
               <>
-                {/* Mode Toggle */}
-                <div className="grid grid-cols-2 gap-2 p-1.5 bg-gradient-to-br from-slate-50 to-slate-100 rounded-lg border-2 border-black">
-                  <Button
-                    variant={mode === 'manual' ? 'default' : 'ghost'}
-                    onClick={() => setMode('manual')}
-                    className={`h-10 text-sm font-bold transition-all rounded-none border-2 ${
-                      mode === 'manual' 
-                        ? 'bg-black text-yellow-600 border-yellow-600 shadow-md' 
-                        : 'border-black hover:bg-white hover:shadow-sm'
-                    }`}
-                  >
-                    <Edit3 className="w-4 h-4 mr-2" />
-                    Manual Entry
-                  </Button>
-                  <Button
-                    variant={mode === 'timer' ? 'default' : 'ghost'}
-                    onClick={() => setMode('timer')}
-                    className={`h-10 text-sm font-bold transition-all rounded-none border-2 ${
-                      mode === 'timer' 
-                        ? 'bg-black text-yellow-600 border-yellow-600 shadow-md' 
-                        : 'border-black hover:bg-white hover:shadow-sm'
-                    }`}
-                  >
-                    <Timer className="w-4 h-4 mr-2" />
-                    Timer
-                  </Button>
+                <div className="space-y-2">
+                  <Label htmlFor="dialog-date" className="text-base font-bold text-yellow-600 flex items-center gap-2">
+                    <CalendarIcon className="w-4 h-4" />
+                    Date *
+                  </Label>
+                  <Input
+                    id="dialog-date"
+                    type="date"
+                    className="h-10 text-sm font-semibold border-2 border-black shadow-sm hover:border-yellow-600 transition-colors"
+                    value={manualData.date}
+                    onChange={(e) => setManualData({ ...manualData, date: e.target.value })}
+                    max={new Date().toISOString().split('T')[0]}
+                  />
                 </div>
-
-                {/* Date Field - Show above job selection in manual mode */}
-                {mode === 'manual' && (
-                  <div className="space-y-2">
-                    <Label htmlFor="dialog-date" className="text-base font-bold text-yellow-600 flex items-center gap-2">
-                      <CalendarIcon className="w-4 h-4" />
-                      Date *
-                    </Label>
-                    <Input
-                      id="dialog-date"
-                      type="date"
-                      className="h-10 text-sm font-semibold border-2 border-black shadow-sm hover:border-yellow-600 transition-colors"
-                      value={manualData.date}
-                      onChange={(e) => setManualData({ ...manualData, date: e.target.value })}
-                      max={new Date().toISOString().split('T')[0]}
-                    />
-                  </div>
-                )}
 
                 {/* Job Selection - Highlighted */}
                 <div className="space-y-2 p-3 border-2 border-black rounded-lg bg-gradient-to-br from-yellow-50 to-yellow-100 shadow-md">
@@ -1095,16 +1075,20 @@ export function QuickTimeEntry({ userId, onSuccess, onBack, allowedJobs, userRol
                   </Popover>
                 </div>
 
-                {/* Manual Entry Fields */}
-                {mode === 'manual' && (
-                  <div className="p-3 border-2 border-black rounded-lg bg-gradient-to-br from-yellow-50 to-yellow-100 shadow-md space-y-3">
-                    <div className="flex items-center gap-2 mb-2">
-                      <Clock className="w-5 h-5 text-yellow-600" />
-                      <span className="text-base font-bold text-yellow-600">Time Entry *</span>
-                    </div>
-                    
-                    {/* Overnight Shift Checkbox - Only for Snowplowing */}
-                    {isSnowplowingJob && (
+                <div className="border-2 border-black rounded-lg bg-white shadow-sm overflow-hidden">
+                  <Textarea
+                    id="job-entry-notes"
+                    placeholder="Notes"
+                    className="min-h-[80px] resize-none rounded-none border-0 shadow-none focus-visible:ring-0 focus-visible:ring-offset-0 hover:border-transparent"
+                    rows={3}
+                    value={manualData.notes}
+                    onChange={(e) => setManualData({ ...manualData, notes: e.target.value })}
+                  />
+                </div>
+
+                <div className="p-3 border-2 border-black rounded-lg bg-gradient-to-br from-yellow-50 to-yellow-100 shadow-md space-y-3">
+                  {/* Overnight Shift Checkbox - Only for Snowplowing */}
+                  {isSnowplowingJob && (
                       <>
                         <div className="flex items-center gap-2 p-2 bg-blue-50 border-2 border-blue-300 rounded-lg">
                           <input
@@ -1135,29 +1119,13 @@ export function QuickTimeEntry({ userId, onSuccess, onBack, allowedJobs, userRol
                     <TimeDropdownPicker
                       label="Clock Out Time"
                       value={manualData.endTime}
-                      onChange={(time) => setManualData({ ...manualData, endTime: time })}
-                    />
-                  </div>
-                )}
+                    onChange={(time) => setManualData({ ...manualData, endTime: time })}
+                  />
+                </div>
 
-                {/* Timer Mode Info */}
-                {mode === 'timer' && (
-                  <div className="p-3 bg-gradient-to-br from-green-50 to-green-100 rounded-lg border-2 border-green-800 shadow-sm">
-                    <div className="flex items-start gap-2">
-                      <Timer className="w-5 h-5 text-green-800 flex-shrink-0 mt-0.5" />
-                      <div>
-                        <p className="font-semibold text-green-800 mb-1">Live Timer Mode</p>
-                        <p className="text-sm text-green-700">
-                          Start a live timer to track your time on this job. You'll be able to clock out when you're done.
-                        </p>
-                      </div>
-                    </div>
-                  </div>
-                )}
-
-                {/* Component Time (Optional) - Only show in manual mode */}
-                {mode === 'manual' && selectedJobId && components.length > 0 && (
-                  <div className="space-y-3 pt-4 border-t-2">
+                {/* Component Time (Optional) — always reserve space so layout doesn't shift when a job is selected */}
+                <div className="space-y-3 pt-4 border-t-2">
+                  {selectedJobId && components.length > 0 && jobComponents.length > 0 && (
                     <div className="space-y-3">
                         {jobComponents.map((comp, index) => (
                           <div key={index} className="space-y-2 p-3 border-2 rounded-lg bg-card shadow-sm">
@@ -1252,40 +1220,39 @@ export function QuickTimeEntry({ userId, onSuccess, onBack, allowedJobs, userRol
                             )}
                           </div>
                         ))}
-                      </div>
+                    </div>
+                  )}
 
-                    {/* Add Another Component Button */}
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      onClick={() => {
-                        const defaultTime = calculateDefaultComponentTime();
-                        setJobComponents([...jobComponents, {
-                          componentId: '',
-                          hours: defaultTime.hours,
-                          minutes: defaultTime.minutes,
-                        }]);
-                        // Auto-open the newly added component's dropdown
-                        requestAnimationFrame(() => {
-                          // Find all comboboxes and click the last one (newly added)
-                          const allSelects = document.querySelectorAll('[role="combobox"]');
-                          const lastSelect = allSelects[allSelects.length - 1] as HTMLElement;
-                          if (lastSelect) {
-                            lastSelect.click();
-                          }
-                        });
-                      }}
-                      className="w-full"
-                    >
-                      <Package className="w-3 h-3 mr-1" />
-                      Add Another Component
-                    </Button>
-                  </div>
-                )}
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    disabled={!selectedJobId || components.length === 0}
+                    onClick={() => {
+                      if (!selectedJobId || components.length === 0) return;
+                      const defaultTime = calculateDefaultComponentTime();
+                      setJobComponents([...jobComponents, {
+                        componentId: '',
+                        hours: defaultTime.hours,
+                        minutes: defaultTime.minutes,
+                      }]);
+                      requestAnimationFrame(() => {
+                        const allSelects = document.querySelectorAll('[role="combobox"]');
+                        const lastSelect = allSelects[allSelects.length - 1] as HTMLElement;
+                        if (lastSelect) {
+                          lastSelect.click();
+                        }
+                      });
+                    }}
+                    className="w-full h-9"
+                  >
+                    <Package className="w-3 h-3 mr-1" />
+                    Add Another Component
+                  </Button>
+                </div>
 
                 {/* Action Buttons */}
-                <div className="flex gap-2 pt-3 border-t-2 border-black">
+                <div className="flex gap-2 pt-3 border-t-2 border-black max-md:sticky max-md:bottom-0 max-md:bg-white max-md:pb-1 max-md:-mx-4 max-md:px-4 max-md:border-t-2 max-md:shadow-[0_-4px_12px_rgba(0,0,0,0.06)]">
                   <Button
                     variant="outline"
                     onClick={() => {
@@ -1295,6 +1262,7 @@ export function QuickTimeEntry({ userId, onSuccess, onBack, allowedJobs, userRol
                         startTime: '06:00',
                         endTime: '17:00',
                         isOvernightShift: false,
+                        notes: '',
                       });
                       setJobComponents([]);
                       onBack?.();
@@ -1306,21 +1274,12 @@ export function QuickTimeEntry({ userId, onSuccess, onBack, allowedJobs, userRol
                     Cancel
                   </Button>
                   <Button
-                    onClick={mode === 'manual' ? handleManualEntry : handleTimerClockIn}
+                    onClick={handleManualEntry}
                     disabled={loading || !selectedJobId}
                     className="flex-1 h-10 bg-black text-yellow-600 hover:bg-gray-900 text-sm font-bold shadow-lg hover:shadow-xl transition-all border-2 border-yellow-600 rounded-none"
                   >
-                    {mode === 'manual' ? (
-                      <>
-                        <Clock className="w-5 h-5 mr-2" />
-                        {loading ? 'Logging...' : 'Log Time'}
-                      </>
-                    ) : (
-                      <>
-                        <LogIn className="w-5 h-5 mr-2" />
-                        {loading ? 'Starting...' : 'Start Timer'}
-                      </>
-                    )}
+                    <Clock className="w-5 h-5 mr-2" />
+                    {loading ? 'Logging...' : 'Log Time'}
                   </Button>
                 </div>
               </>
@@ -1385,11 +1344,6 @@ export function QuickTimeEntry({ userId, onSuccess, onBack, allowedJobs, userRol
                 </div>
 
                 <div className="p-3 border-2 border-black rounded-lg bg-gradient-to-br from-yellow-50 to-yellow-100 shadow-md space-y-3">
-                  <div className="flex items-center gap-2 mb-2">
-                    <Clock className="w-5 h-5 text-yellow-600" />
-                    <span className="text-base font-bold text-yellow-600">Time Entry *</span>
-                  </div>
-                  
                   <TimeDropdownPicker
                     label="Clock In Time"
                     value={miscJobData.startTime}
@@ -1416,7 +1370,7 @@ export function QuickTimeEntry({ userId, onSuccess, onBack, allowedJobs, userRol
                 </div>
 
                 {/* Action Buttons */}
-                <div className="flex gap-2 pt-3 border-t-2 border-black">
+                <div className="flex gap-2 pt-3 border-t-2 border-black max-md:sticky max-md:bottom-0 max-md:bg-white max-md:pb-1 max-md:-mx-4 max-md:px-4 max-md:border-t-2 max-md:shadow-[0_-4px_12px_rgba(0,0,0,0.06)]">
                   <Button
                     variant="outline"
                     onClick={() => {
@@ -1449,6 +1403,7 @@ export function QuickTimeEntry({ userId, onSuccess, onBack, allowedJobs, userRol
                 </div>
               </>
             )}
+          </div>
           </div>
         </DialogContent>
       </Dialog>

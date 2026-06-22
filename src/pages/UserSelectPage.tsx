@@ -3,7 +3,7 @@ import { supabase } from '@/lib/supabase';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
-import { ChevronDown, ChevronUp, Settings, Truck, User } from 'lucide-react';
+import { Settings, Truck, User } from 'lucide-react';
 import { InstallButton } from '@/components/ui/install-button';
 import type { UserProfile } from '@/types';
 import { AdminSetup } from './AdminSetup';
@@ -18,12 +18,10 @@ export function UserSelectPage({ onSelectUser }: UserSelectPageProps) {
   const [users, setUsers] = useState<UserProfile[]>([]);
   const [loading, setLoading] = useState(true);
   const [showAdmin, setShowAdmin] = useState(false);
-  const [showFleetDrivers, setShowFleetDrivers] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const mainListRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    setShowFleetDrivers(false);
     loadUsers();
   }, []);
 
@@ -57,7 +55,6 @@ export function UserSelectPage({ onSelectUser }: UserSelectPageProps) {
       <AdminSetup
         onBack={() => {
           setShowAdmin(false);
-          setShowFleetDrivers(false);
           loadUsers();
         }}
       />
@@ -167,7 +164,7 @@ export function UserSelectPage({ onSelectUser }: UserSelectPageProps) {
                   <AlertTitle>No main app users yet</AlertTitle>
                   <AlertDescription className="text-sm mt-1">
                     Only fleet driver accounts are set up. Use <strong>Manage Users</strong> to add crew, office, and
-                    payroll users, or expand Fleet drivers below to sign in as a driver.
+                    payroll users, or sign in as a driver below.
                   </AlertDescription>
                 </Alert>
               )}
@@ -176,24 +173,15 @@ export function UserSelectPage({ onSelectUser }: UserSelectPageProps) {
 
           {!loadError && fleetDrivers.length > 0 && (
             <div className="mt-5 pt-4 border-t border-dashed">
-              <button
-                type="button"
-                className="flex w-full items-center justify-between text-left text-sm text-muted-foreground hover:text-foreground"
-                onClick={() => setShowFleetDrivers((open) => !open)}
-              >
-                <span className="flex items-center gap-2">
-                  <Truck className="w-4 h-4" />
-                  Fleet drivers ({fleetDrivers.length}) — separate from main app
-                </span>
-                {showFleetDrivers ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
-              </button>
-              {showFleetDrivers && (
-                <div className="mt-2 grid gap-2">
-                  {fleetDrivers.map((user) => (
-                    <UserSelectCard key={user.id} user={user} onSelect={onSelectUser} />
-                  ))}
-                </div>
-              )}
+              <h3 className="text-sm font-semibold text-slate-700 mb-2 px-1 flex items-center gap-2">
+                <Truck className="w-4 h-4" />
+                Fleet drivers ({fleetDrivers.length}) — separate from main app
+              </h3>
+              <div className="grid gap-2">
+                {fleetDrivers.map((user) => (
+                  <UserSelectCard key={user.id} user={user} onSelect={onSelectUser} />
+                ))}
+              </div>
             </div>
           )}
 

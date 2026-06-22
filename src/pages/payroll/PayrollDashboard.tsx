@@ -1,5 +1,6 @@
 
 import { useState, useEffect, Fragment } from 'react';
+import { formatDateLocal, parseDateLocal } from '@/lib/date-utils';
 import { supabase } from '@/lib/supabase';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -259,11 +260,11 @@ function resolvePeriodBounds(
 
   if (periodType === 'custom') {
     if (!customStartDate || !customEndDate) return null;
-    periodStart = new Date(customStartDate);
-    periodEnd = new Date(customEndDate);
+    periodStart = parseDateLocal(customStartDate);
+    periodEnd = parseDateLocal(customEndDate);
   } else {
     if (!selectedPeriod) return null;
-    periodStart = new Date(selectedPeriod);
+    periodStart = parseDateLocal(selectedPeriod);
     periodEnd = new Date(periodStart);
 
     if (periodType === 'weekly') {
@@ -280,8 +281,8 @@ function resolvePeriodBounds(
   }
 
   return {
-    start: periodStart.toISOString().split('T')[0],
-    end: periodEnd.toISOString().split('T')[0],
+    start: formatDateLocal(periodStart),
+    end: formatDateLocal(periodEnd),
   };
 }
 
@@ -519,7 +520,7 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
           endTime: entry.end_time ? format(new Date(entry.end_time), 'h:mm a') : '-',
           hours: (entry.total_hours || 0).toFixed(2),
           crewCount: entry.crew_count || 1,
-          notes: entry.notes || '',
+          notes: getPayrollEntryDisplayNote(entry.notes),
           isManual: entry.is_manual,
         });
       });
@@ -614,7 +615,7 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
         weekEnd.setDate(weekStart.getDate() + 6); // Sunday (end of week)
         weekEnd.setHours(23, 59, 59, 999);
         
-        const value = weekStart.toISOString().split('T')[0];
+        const value = formatDateLocal(weekStart);
         const label = `${weekStart.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} - ${weekEnd.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}`;
         
         periods.push({ value, label });
@@ -633,7 +634,7 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
         periodEnd.setDate(periodStart.getDate() + 13); // 2 weeks (ending on Sunday)
         periodEnd.setHours(23, 59, 59, 999);
         
-        const value = periodStart.toISOString().split('T')[0];
+        const value = formatDateLocal(periodStart);
         const label = `${periodStart.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} - ${periodEnd.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}`;
         
         periods.push({ value, label });
@@ -647,7 +648,7 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
         const monthEnd = new Date(monthStart.getFullYear(), monthStart.getMonth() + 1, 0);
         monthEnd.setHours(23, 59, 59, 999);
         
-        const value = monthStart.toISOString().split('T')[0];
+        const value = formatDateLocal(monthStart);
         const label = monthStart.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
         
         periods.push({ value, label });
@@ -665,7 +666,7 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
         const quarterEnd = new Date(quarterYear, (quarter + 1) * 3, 0);
         quarterEnd.setHours(23, 59, 59, 999);
         
-        const value = quarterStart.toISOString().split('T')[0];
+        const value = formatDateLocal(quarterStart);
         const label = `Q${quarter + 1} ${quarterYear} (${quarterStart.toLocaleDateString('en-US', { month: 'short' })} - ${quarterEnd.toLocaleDateString('en-US', { month: 'short', year: 'numeric' })})`;
         
         periods.push({ value, label });
@@ -675,7 +676,7 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
       const year = today.getFullYear();
       const yearStart = new Date(year, 0, 1);
       yearStart.setHours(0, 0, 0, 0);
-      const value = yearStart.toISOString().split('T')[0];
+      const value = formatDateLocal(yearStart);
       const label = `YTD ${year} (${yearStart.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} – ${today.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })})`;
       periods.push({ value, label });
     }
@@ -692,11 +693,11 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
 
     if (periodType === 'custom') {
       if (!customStartDate || !customEndDate) return;
-      periodStart = new Date(customStartDate);
-      periodEnd = new Date(customEndDate);
+      periodStart = parseDateLocal(customStartDate);
+      periodEnd = parseDateLocal(customEndDate);
     } else {
       if (!selectedPeriod) return;
-      periodStart = new Date(selectedPeriod);
+      periodStart = parseDateLocal(selectedPeriod);
       
       // Calculate end date based on period type
       periodEnd = new Date(periodStart);
@@ -929,8 +930,8 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
 
       let periodLabel = '';
       if (periodType === 'custom') {
-        const start = new Date(customStartDate).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-        const end = new Date(customEndDate).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+        const start = parseDateLocal(customStartDate).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+        const end = parseDateLocal(customEndDate).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
         periodLabel = `${start} - ${end}`;
       } else {
         periodLabel = periodOptions.find(p => p.value === selectedPeriod)?.label || 'period';
@@ -941,10 +942,10 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
       let endDate: Date;
       
       if (periodType === 'custom') {
-        startDate = new Date(customStartDate);
-        endDate = new Date(customEndDate);
+        startDate = parseDateLocal(customStartDate);
+        endDate = parseDateLocal(customEndDate);
       } else {
-        startDate = new Date(selectedPeriod);
+        startDate = parseDateLocal(selectedPeriod);
         endDate = new Date(weekData.weekEnd);
       }
 
@@ -1486,7 +1487,8 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
                                               <div className="text-xs text-muted-foreground">{entry.jobName}</div>
                                             )}
                                             {displayNote && (
-                                              <div className="text-xs text-muted-foreground">
+                                              <div className="text-xs text-slate-600 mt-1">
+                                                <span className="font-semibold text-slate-500">Note:</span>{' '}
                                                 {displayNote}
                                               </div>
                                             )}
@@ -1717,6 +1719,7 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
                                   <tr className="border-b bg-muted/20">
                                     <th className="text-left p-2 font-semibold">Date</th>
                                     <th className="text-left p-2 font-semibold">Component</th>
+                                    <th className="text-left p-2 font-semibold">Note</th>
                                     <th className="text-left p-2 font-semibold w-20">Start</th>
                                     <th className="text-left p-2 font-semibold w-20">End</th>
                                     <th className="text-right p-2 font-semibold w-20">Hours</th>
@@ -1731,6 +1734,9 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
                                         {entry.isManual && (
                                           <Badge variant="outline" className="ml-2 text-xs">Manual</Badge>
                                         )}
+                                      </td>
+                                      <td className="p-2 text-xs text-slate-600 max-w-[200px]">
+                                        {entry.notes || '—'}
                                       </td>
                                       <td className="p-2 font-mono text-xs">{entry.startTime}</td>
                                       <td className="p-2 font-mono text-xs">{entry.endTime}</td>
