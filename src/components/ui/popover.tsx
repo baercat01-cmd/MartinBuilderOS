@@ -9,9 +9,16 @@ const PopoverTrigger = PopoverPrimitive.Trigger
 
 const PopoverContent = React.forwardRef<
   React.ElementRef<typeof PopoverPrimitive.Content>,
-  React.ComponentPropsWithoutRef<typeof PopoverPrimitive.Content>
->(({ className, align = "center", sideOffset = 4, ...props }, ref) => (
-  <PopoverPrimitive.Portal>
+  React.ComponentPropsWithoutRef<typeof PopoverPrimitive.Content> & {
+    /**
+     * Portal container. Pass the enclosing Dialog/Sheet content element when this
+     * Popover lives inside a modal so its content stays within the dialog's
+     * scroll-lock subtree — otherwise touch scrolling inside the popover is blocked on mobile.
+     */
+    container?: React.ComponentPropsWithoutRef<typeof PopoverPrimitive.Portal>["container"]
+  }
+>(({ className, align = "center", sideOffset = 4, container, ...props }, ref) => (
+  <PopoverPrimitive.Portal container={container}>
     <PopoverPrimitive.Content
       ref={ref}
       align={align}

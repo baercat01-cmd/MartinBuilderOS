@@ -40,8 +40,24 @@ export function ProposalAndMaterialsView({ job, userId: userIdProp, viewMode: vi
   const [linkedSheetId, setLinkedSheetId] = useState<string | null>(null);
   const [showDocumentsInPanel, setShowDocumentsInPanel] = useState(false);
   const [breakdownSheetPrices, setBreakdownSheetPrices] = useState<BreakdownSheetPrice[]>([]);
-  const [materialsWorkbookView, setMaterialsWorkbookView] = useState<{ workbookId: string | null; status: 'working' | 'locked' | null } | null>(null);
-  const [materialsWorkbookReady, setMaterialsWorkbookReady] = useState(true);
+  const [materialsWorkbookView, setMaterialsWorkbookView] = useState<{
+    workbookId: string | null;
+    status: 'working' | 'locked' | null;
+  } | null>(null);
+  const handleWorkbookViewSync = useCallback(
+    (view: { workbookId: string | null; status: 'working' | 'locked' | null }) => {
+      setMaterialsWorkbookView((prev) => {
+        const prevKey = `${prev?.workbookId ?? ''}:${prev?.status ?? ''}`;
+        const nextKey = `${view.workbookId ?? ''}:${view.status ?? ''}`;
+        if (prevKey !== nextKey) {
+          setMaterialsSyncGen((g) => g + 1);
+        }
+        return view;
+      });
+    },
+    [],
+  );
+  const [materialsWorkbookReady, setMaterialsWorkbookReady] = useState(false);
   const [materialsSyncGen, setMaterialsSyncGen] = useState(0);
   const [jobWorkbookMaterialsTotal, setJobWorkbookMaterialsTotal] = useState<number | null>(null);
   const [proposalWorkbookMaterialsTotal, setProposalWorkbookMaterialsTotal] = useState<number | null>(null);
@@ -198,7 +214,7 @@ export function ProposalAndMaterialsView({ job, userId: userIdProp, viewMode: vi
                   onQuoteChange={handleJobFinancialsQuoteChange}
                   externalActiveSheetId={linkedSheetId}
                   onBreakdownPriceSync={setBreakdownSheetPrices}
-                  onWorkbookViewSync={setMaterialsWorkbookView}
+                  onWorkbookViewSync={handleWorkbookViewSync}
                   onWorkbookLoadSettled={() => setMaterialsWorkbookReady(true)}
                   onJobWorkbookMaterialsTotalSync={setJobWorkbookMaterialsTotal}
                   onProposalWorkbookMaterialsTotalSync={setProposalWorkbookMaterialsTotal}

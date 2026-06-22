@@ -1,5 +1,5 @@
 
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { supabase } from '@/lib/supabase';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -15,6 +15,7 @@ import {
   DialogContent,
   DialogHeader,
   DialogTitle,
+  DialogFooter,
 } from '@/components/ui/dialog';
 import {
   LogIn,
@@ -188,6 +189,7 @@ export function QuickTimeEntry({ userId, onSuccess, onBack, allowedJobs, userRol
   const [selectedJobId, setSelectedJobId] = useState<string>('');
   const [jobPickerOpen, setJobPickerOpen] = useState(false);
   const [jobSearchQuery, setJobSearchQuery] = useState('');
+  const dialogContentRef = useRef<HTMLDivElement | null>(null);
   const [manualData, setManualData] = useState({
     date: new Date().toISOString().split('T')[0],
     startTime: '06:00',
@@ -889,9 +891,11 @@ export function QuickTimeEntry({ userId, onSuccess, onBack, allowedJobs, userRol
         }}
       >
         <DialogContent
+          ref={dialogContentRef}
+          floating
           className={cn(
-            'max-md:fixed max-md:inset-0 max-md:left-0 max-md:top-0 max-md:h-[100dvh] max-md:w-screen max-md:max-w-none max-md:translate-x-0 max-md:translate-y-0 max-md:rounded-none max-md:flex max-md:flex-col max-md:gap-0 max-md:p-0 max-md:overflow-hidden',
-            'md:max-w-md md:max-h-[90vh] md:overflow-y-auto',
+            '!fixed !inset-0 !left-0 !top-0 z-50 !flex !h-[100dvh] !w-full !max-w-none !translate-x-0 !translate-y-0 flex-col gap-0 overflow-hidden rounded-none border-0 p-0 shadow-lg',
+            'md:!inset-auto md:!left-1/2 md:!top-1/2 md:!h-[min(90dvh,820px)] md:!max-h-[min(90dvh,820px)] md:!w-full md:!max-w-md md:!-translate-x-1/2 md:!-translate-y-1/2 md:rounded-lg md:border',
           )}
           onInteractOutside={(e) => {
             if (window.matchMedia('(max-width: 767px)').matches) e.preventDefault();
@@ -900,45 +904,48 @@ export function QuickTimeEntry({ userId, onSuccess, onBack, allowedJobs, userRol
             if (window.matchMedia('(max-width: 767px)').matches) e.preventDefault();
           }}
         >
-          <DialogHeader className="max-md:px-4 max-md:pt-4 max-md:pb-3 max-md:pr-12 max-md:border-b max-md:shrink-0">
+          <DialogHeader className="shrink-0 space-y-0 border-b px-4 pb-3 pt-[max(1rem,env(safe-area-inset-top))] pr-12 text-left">
             <DialogTitle className="flex items-center gap-2 text-lg font-bold">
-              <Clock className="w-5 h-5 text-yellow-600" />
+              <Clock className="h-5 w-5 text-yellow-600" />
               Time Clock
             </DialogTitle>
           </DialogHeader>
 
-          <div className="max-md:flex-1 max-md:min-h-0 max-md:overflow-y-auto max-md:px-4 max-md:py-3 max-md:space-y-3">
-          {/* Job Type Selection - hidden for shop users (locked to Shop job) */}
           {!isShopUser && (
-            <div className="grid grid-cols-2 gap-2 p-1.5 bg-gradient-to-br from-slate-50 to-slate-100 rounded-lg border-2 border-black">
-              <Button
-                variant={jobType === 'existing' ? 'default' : 'ghost'}
-                onClick={() => setJobType('existing')}
-                className={`h-10 text-sm font-bold transition-all rounded-none border-2 ${
-                  jobType === 'existing' 
-                    ? 'bg-black text-yellow-600 border-yellow-600 shadow-md' 
-                    : 'border-black hover:bg-white hover:shadow-sm'
-                }`}
-              >
-                <Briefcase className="w-4 h-4 mr-2" />
-                Existing Job
-              </Button>
-              <Button
-                variant={jobType === 'misc' ? 'default' : 'ghost'}
-                onClick={() => setJobType('misc')}
-                className={`h-10 text-sm font-bold transition-all rounded-none border-2 ${
-                  jobType === 'misc' 
-                    ? 'bg-black text-yellow-600 border-yellow-600 shadow-md' 
-                    : 'border-black hover:bg-white hover:shadow-sm'
-                }`}
-              >
-                <FileText className="w-4 h-4 mr-2" />
-                Misc Job
-              </Button>
+            <div className="shrink-0 border-b bg-slate-50 px-4 py-3">
+              <div className="grid grid-cols-2 gap-2 rounded-lg border-2 border-black bg-gradient-to-br from-slate-50 to-slate-100 p-1.5">
+                <Button
+                  variant={jobType === 'existing' ? 'default' : 'ghost'}
+                  onClick={() => setJobType('existing')}
+                  className={cn(
+                    'h-11 rounded-none border-2 text-sm font-bold transition-all',
+                    jobType === 'existing'
+                      ? 'border-yellow-600 bg-black text-yellow-600 shadow-md'
+                      : 'border-black hover:bg-white hover:shadow-sm',
+                  )}
+                >
+                  <Briefcase className="mr-2 h-4 w-4" />
+                  Existing Job
+                </Button>
+                <Button
+                  variant={jobType === 'misc' ? 'default' : 'ghost'}
+                  onClick={() => setJobType('misc')}
+                  className={cn(
+                    'h-11 rounded-none border-2 text-sm font-bold transition-all',
+                    jobType === 'misc'
+                      ? 'border-yellow-600 bg-black text-yellow-600 shadow-md'
+                      : 'border-black hover:bg-white hover:shadow-sm',
+                  )}
+                >
+                  <FileText className="mr-2 h-4 w-4" />
+                  Misc Job
+                </Button>
+              </div>
             </div>
           )}
 
-          <div className="space-y-3">
+          <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 py-3 [-webkit-overflow-scrolling:touch]">
+          <div className="space-y-3 pb-2">
             {/* Shop user: 1-click Clock In to Shop (no job/misc tabs) */}
             {isShopUser && (
               <div className="p-3 border-2 border-black rounded-lg bg-gradient-to-br from-green-50 to-green-100 shadow-md">
@@ -1017,6 +1024,15 @@ export function QuickTimeEntry({ userId, onSuccess, onBack, allowedJobs, userRol
                       </Button>
                     </PopoverTrigger>
                     <PopoverContent
+                      container={
+                        // On mobile the dialog is full-screen, so portaling the popover INTO the
+                        // dialog keeps it inside the dialog's scroll-lock subtree — without this the
+                        // list can't be touch-scrolled. On desktop we keep the default body portal to
+                        // avoid clipping by the dialog's transformed, overflow-hidden container.
+                        jobPickerOpen && typeof window !== 'undefined' && window.matchMedia('(max-width: 767px)').matches
+                          ? dialogContentRef.current
+                          : undefined
+                      }
                       className="w-[var(--radix-popover-trigger-width)] p-0 flex flex-col h-[var(--radix-popper-available-height,85dvh)] max-h-[var(--radix-popper-available-height,85dvh)]"
                       align="start"
                       collisionPadding={12}
@@ -1250,38 +1266,6 @@ export function QuickTimeEntry({ userId, onSuccess, onBack, allowedJobs, userRol
                     Add Another Component
                   </Button>
                 </div>
-
-                {/* Action Buttons */}
-                <div className="flex gap-2 pt-3 border-t-2 border-black max-md:sticky max-md:bottom-0 max-md:bg-white max-md:pb-1 max-md:-mx-4 max-md:px-4 max-md:border-t-2 max-md:shadow-[0_-4px_12px_rgba(0,0,0,0.06)]">
-                  <Button
-                    variant="outline"
-                    onClick={() => {
-                      setSelectedJobId('');
-                      setManualData({
-                        date: new Date().toISOString().split('T')[0],
-                        startTime: '06:00',
-                        endTime: '17:00',
-                        isOvernightShift: false,
-                        notes: '',
-                      });
-                      setJobComponents([]);
-                      onBack?.();
-                    }}                    
-                    className="flex-1 h-10 text-sm font-semibold border-2 border-black hover:bg-slate-100 transition-all rounded-none"
-                    disabled={loading}
-                  >
-                    <X className="w-5 h-5 mr-2" />
-                    Cancel
-                  </Button>
-                  <Button
-                    onClick={handleManualEntry}
-                    disabled={loading || !selectedJobId}
-                    className="flex-1 h-10 bg-black text-yellow-600 hover:bg-gray-900 text-sm font-bold shadow-lg hover:shadow-xl transition-all border-2 border-yellow-600 rounded-none"
-                  >
-                    <Clock className="w-5 h-5 mr-2" />
-                    {loading ? 'Logging...' : 'Log Time'}
-                  </Button>
-                </div>
               </>
             )}
 
@@ -1368,9 +1352,46 @@ export function QuickTimeEntry({ userId, onSuccess, onBack, allowedJobs, userRol
                     onChange={(e) => setMiscJobData({ ...miscJobData, notes: e.target.value })}
                   />
                 </div>
+              </>
+            )}
+          </div>
+          </div>
 
-                {/* Action Buttons */}
-                <div className="flex gap-2 pt-3 border-t-2 border-black max-md:sticky max-md:bottom-0 max-md:bg-white max-md:pb-1 max-md:-mx-4 max-md:px-4 max-md:border-t-2 max-md:shadow-[0_-4px_12px_rgba(0,0,0,0.06)]">
+          {!isShopUser && (
+            <DialogFooter className="mt-0 shrink-0 !flex-row gap-2 border-t-2 border-black bg-background px-4 py-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] shadow-[0_-4px_12px_rgba(0,0,0,0.08)] sm:justify-stretch">
+              {jobType === 'existing' ? (
+                <>
+                  <Button
+                    variant="outline"
+                    onClick={() => {
+                      setSelectedJobId('');
+                      setManualData({
+                        date: new Date().toISOString().split('T')[0],
+                        startTime: '06:00',
+                        endTime: '17:00',
+                        isOvernightShift: false,
+                        notes: '',
+                      });
+                      setJobComponents([]);
+                      onBack?.();
+                    }}
+                    className="h-12 flex-1 rounded-none border-2 border-black text-base font-semibold hover:bg-slate-100"
+                    disabled={loading}
+                  >
+                    <X className="mr-2 h-5 w-5" />
+                    Cancel
+                  </Button>
+                  <Button
+                    onClick={handleManualEntry}
+                    disabled={loading || !selectedJobId}
+                    className="h-12 flex-1 rounded-none border-2 border-yellow-600 bg-black text-base font-bold text-yellow-600 shadow-lg hover:bg-gray-900"
+                  >
+                    <Clock className="mr-2 h-5 w-5" />
+                    {loading ? 'Logging...' : 'Log Time'}
+                  </Button>
+                </>
+              ) : (
+                <>
                   <Button
                     variant="outline"
                     onClick={() => {
@@ -1386,25 +1407,24 @@ export function QuickTimeEntry({ userId, onSuccess, onBack, allowedJobs, userRol
                       });
                       onBack?.();
                     }}
-                    className="flex-1 h-10 text-sm font-semibold border-2 border-black hover:bg-slate-100 transition-all rounded-none"
+                    className="h-12 flex-1 rounded-none border-2 border-black text-base font-semibold hover:bg-slate-100"
                     disabled={loading}
                   >
-                    <X className="w-5 h-5 mr-2" />
+                    <X className="mr-2 h-5 w-5" />
                     Cancel
                   </Button>
                   <Button
                     onClick={handleMiscJobEntry}
                     disabled={loading || !miscJobData.name.trim() || !miscJobData.address.trim()}
-                    className="flex-1 h-10 bg-black text-yellow-600 hover:bg-gray-900 text-sm font-bold shadow-lg hover:shadow-xl transition-all border-2 border-yellow-600 rounded-none"
+                    className="h-12 flex-1 rounded-none border-2 border-yellow-600 bg-black text-base font-bold text-yellow-600 shadow-lg hover:bg-gray-900"
                   >
-                    <Clock className="w-5 h-5 mr-2" />
+                    <Clock className="mr-2 h-5 w-5" />
                     {loading ? 'Logging...' : 'Log Time'}
                   </Button>
-                </div>
-              </>
-            )}
-          </div>
-          </div>
+                </>
+              )}
+            </DialogFooter>
+          )}
         </DialogContent>
       </Dialog>
     </>
