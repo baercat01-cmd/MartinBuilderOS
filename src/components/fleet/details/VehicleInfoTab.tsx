@@ -14,6 +14,9 @@ import {
 } from '@/components/ui/select';
 import { toast } from 'sonner';
 import { Save, Upload, Image as ImageIcon } from 'lucide-react';
+import { formatFleetUploadLimit, VEHICLE_IMAGE_MAX_BYTES } from '@/lib/fleetUploadLimits';
+import { ensureVehicleImagesStorage, isStoragePolicyError } from '@/lib/maintenanceLogSchema';
+import { uploadFleetVehicleImage } from '@/lib/fleetVehicleImageUpload';
 
 interface VehicleInfoTabProps {
   vehicle: any;
@@ -86,30 +89,23 @@ export function VehicleInfoTab({ vehicle, onVehicleUpdated }: VehicleInfoTabProp
     }
   }
 
+  useEffect(() => {
+    void ensureVehicleImagesStorage();
+  }, []);
+
   async function handleImageUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    if (file.size > 5 * 1024 * 1024) {
-      toast.error('Image must be less than 5MB');
+    if (file.size > VEHICLE_IMAGE_MAX_BYTES) {
+      toast.error(`Image must be ${formatFleetUploadLimit(VEHICLE_IMAGE_MAX_BYTES)} or smaller`);
+      e.target.value = '';
       return;
     }
 
     setLoading(true);
     try {
-      const fileExt = file.name.split('.').pop();
-      const fileName = `${vehicle.id}-${Date.now()}.${fileExt}`;
-      const filePath = `${fileName}`;
-
-      const { error: uploadError } = await supabase.storage
-        .from('vehicle-images')
-        .upload(filePath, file);
-
-      if (uploadError) throw uploadError;
-
-      const { data: { publicUrl } } = supabase.storage
-        .from('vehicle-images')
-        .getPublicUrl(filePath);
+      const { publicUrl } = await uploadFleetVehicleImage(vehicle.id, file);
 
       const { error: updateError } = await supabase
         .from('vehicles')
@@ -120,11 +116,22 @@ export function VehicleInfoTab({ vehicle, onVehicleUpdated }: VehicleInfoTabProp
 
       toast.success('Image uploaded successfully');
       onVehicleUpdated();
-    } catch (error: any) {
+    } catch (error: unknown) {
       console.error('Error uploading image:', error);
-      toast.error('Failed to upload image');
+      const message =
+        error && typeof error === 'object' && 'message' in error
+          ? String((error as { message?: string }).message)
+          : 'Failed to upload image';
+      if (isStoragePolicyError(error)) {
+        toast.error(
+          'Photo upload is blocked by database permissions. Ask your admin to run public/sql/vehicle-images-80mb-anon-onspace.sql in the OnSpace SQL console.',
+        );
+      } else {
+        toast.error(message);
+      }
     } finally {
       setLoading(false);
+      e.target.value = '';
     }
   }
 
@@ -134,7 +141,7 @@ export function VehicleInfoTab({ vehicle, onVehicleUpdated }: VehicleInfoTabProp
       <div className="space-y-2">
         <Label>Vehicle Image</Label>
         {vehicle.image_url ? (
-          <div className="relative aspect-video rounded-lg overflow-hidden bg-slate-100 border-2">
+          <div className="relative mx-auto w-full max-w-xs sm:max-w-sm aspect-[4/3] rounded-lg overflow-hidden bg-slate-100 border-2">
             <img src={vehicle.image_url} alt={vehicle.vehicle_name} className="w-full h-full object-cover" />
             <label className="absolute bottom-2 right-2 cursor-pointer">
               <Button size="sm" className="bg-yellow-600 hover:bg-yellow-700 text-black" asChild>
@@ -147,10 +154,10 @@ export function VehicleInfoTab({ vehicle, onVehicleUpdated }: VehicleInfoTabProp
             </label>
           </div>
         ) : (
-          <label className="border-2 border-dashed border-slate-300 rounded-lg p-8 flex flex-col items-center justify-center cursor-pointer hover:border-yellow-600 transition-colors">
-            <ImageIcon className="w-12 h-12 text-slate-400 mb-2" />
-            <p className="text-sm text-slate-600 font-medium">Click to upload image</p>
-            <p className="text-xs text-slate-500">PNG, JPG up to 5MB</p>
+          <label className="mx-auto w-full max-w-xs sm:max-w-sm aspect-[4/3] border-2 border-dashed border-slate-300 rounded-lg p-4 flex flex-col items-center justify-center cursor-pointer hover:border-yellow-600 transition-colors">
+            <ImageIcon className="w-10 h-10 text-slate-400 mb-2" />
+            <p className="text-sm text-slate-600 font-medium text-center">Click to upload image</p>
+            <p className="text-xs text-slate-500 text-center px-2">PNG, JPG, HEIC up to {formatFleetUploadLimit(VEHICLE_IMAGE_MAX_BYTES)}</p>
             <input type="file" accept="image/*" onChange={handleImageUpload} className="hidden" />
           </label>
         )}

@@ -6,16 +6,17 @@ export interface UserRoleSection {
   shortLabel: string;
 }
 
-/** Main Martin Builder OS login — jobs, time, office, payroll (not fleet-only). */
+/** Main Martin Builder OS login — crew, fleet drivers, office, payroll, etc. */
 export const MAIN_APP_ROLE_SECTIONS: UserRoleSection[] = [
   { role: 'crew', title: 'Crew Members', shortLabel: 'Crew' },
   { role: 'foreman', title: 'Foremen', shortLabel: 'Foreman' },
   { role: 'shop', title: 'Shop Members', shortLabel: 'Shop' },
   { role: 'office', title: 'Office Members', shortLabel: 'Office' },
   { role: 'payroll', title: 'Payroll Members', shortLabel: 'Payroll' },
+  { role: 'driver', title: 'Fleet Drivers', shortLabel: 'Driver' },
 ];
 
-/** Fleet-only PIN users — shown separately from the main app picker. */
+/** @deprecated Drivers are listed in MAIN_APP_ROLE_SECTIONS. */
 export const FLEET_DRIVER_SECTION: UserRoleSection = {
   role: 'driver',
   title: 'Fleet Drivers',

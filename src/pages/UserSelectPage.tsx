@@ -3,7 +3,7 @@ import { supabase } from '@/lib/supabase';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
-import { Settings, Truck, User } from 'lucide-react';
+import { Settings, User } from 'lucide-react';
 import { InstallButton } from '@/components/ui/install-button';
 import type { UserProfile } from '@/types';
 import { AdminSetup } from './AdminSetup';
@@ -63,7 +63,7 @@ export function UserSelectPage({ onSelectUser }: UserSelectPageProps) {
 
   if (loading) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-muted/30">
+      <div className="h-[100dvh] flex items-center justify-center bg-muted/30 overflow-hidden">
         <div className="text-center">
           <div className="w-12 h-12 border-4 border-primary border-t-transparent rounded-full animate-spin mx-auto mb-4" />
           <p className="text-muted-foreground">Loading users...</p>
@@ -74,45 +74,45 @@ export function UserSelectPage({ onSelectUser }: UserSelectPageProps) {
 
   const usersByRole = groupUsersByRole(users);
   const mainSectionsWithUsers = MAIN_APP_ROLE_SECTIONS.filter(({ role }) => usersByRole[role].length > 0);
-  const fleetDrivers = usersByRole.driver;
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-muted/30 p-4">
-      <Card className="w-full max-w-2xl shadow-xl">
-        <CardHeader className="text-center space-y-4">
-          <div className="flex items-center justify-between">
-            <div className="flex-1" />
-            <div className="flex justify-center flex-1">
+    <div className="h-[100dvh] flex flex-col bg-muted/30 p-2 sm:p-4 overflow-hidden sm:items-center sm:justify-center">
+      <Card className="w-full max-w-2xl shadow-xl flex flex-col flex-1 min-h-0 sm:flex-initial sm:max-h-[calc(100dvh-2rem)]">
+        <CardHeader className="shrink-0 text-center space-y-2 sm:space-y-4 pb-3 sm:pb-6">
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex-1 min-w-0" />
+            <div className="flex justify-center flex-1 min-w-0">
               <img
                 src="https://cdn-ai.onspace.ai/onspace/files/EvPiYskzE4vCidikEdjr5Z/MB_Logo_Green_192x64_12.9kb.png"
                 alt="Martin Builder OS"
-                className="h-16 w-auto"
+                className="h-10 sm:h-16 w-auto"
               />
             </div>
-            <div className="flex-1 flex justify-end">
+            <div className="flex-1 flex justify-end min-w-0">
               <Button
                 variant="outline"
                 size="sm"
                 onClick={() => setShowAdmin(true)}
-                className="text-muted-foreground hover:text-foreground"
+                className="text-muted-foreground hover:text-foreground h-8 sm:h-9 px-2 sm:px-3"
+                aria-label="Manage Users"
               >
-                <Settings className="w-4 h-4 mr-2" />
-                Manage Users
+                <Settings className="w-4 h-4 sm:mr-2" />
+                <span className="hidden sm:inline">Manage Users</span>
               </Button>
             </div>
           </div>
           <div>
-            <CardTitle className="text-2xl font-bold">Martin Builder OS</CardTitle>
-            <CardDescription>Select Your Name to Continue</CardDescription>
+            <CardTitle className="text-xl sm:text-2xl font-bold">Martin Builder OS</CardTitle>
+            <CardDescription className="text-sm">Select Your Name to Continue</CardDescription>
           </div>
         </CardHeader>
-        <CardContent>
-          <div className="flex justify-center mb-6">
+        <CardContent className="flex flex-col flex-1 min-h-0 pt-0 pb-3 sm:pb-6">
+          <div className="shrink-0 flex justify-center mb-3 sm:mb-4">
             <InstallButton />
           </div>
 
           {loadError ? (
-            <Alert variant="destructive" className="mb-4 text-left">
+            <Alert variant="destructive" className="shrink-0 mb-3 text-left">
               <AlertTitle>Could not load users</AlertTitle>
               <AlertDescription className="space-y-2 mt-2">
                 <p className="text-sm">{loadError}</p>
@@ -132,64 +132,38 @@ export function UserSelectPage({ onSelectUser }: UserSelectPageProps) {
           ) : null}
 
           {users.length === 0 && !loadError ? (
-            <div className="text-center py-8">
-              <User className="w-12 h-12 mx-auto mb-4 text-muted-foreground" />
-              <p className="text-muted-foreground mb-2">No users available</p>
-              <p className="text-sm text-muted-foreground mb-4">
-                Add crew, office, and payroll users in Manage Users.
-              </p>
-              <Button onClick={() => setShowAdmin(true)} className="gradient-primary">
-                <Settings className="w-4 h-4 mr-2" />
-                Manage Users
-              </Button>
+            <div className="flex flex-1 min-h-0 items-center justify-center text-center py-4">
+              <div>
+                <User className="w-12 h-12 mx-auto mb-4 text-muted-foreground" />
+                <p className="text-muted-foreground mb-2">No users available</p>
+                <p className="text-sm text-muted-foreground mb-4">
+                  Add crew, office, and payroll users in Manage Users.
+                </p>
+                <Button onClick={() => setShowAdmin(true)} className="gradient-primary">
+                  <Settings className="w-4 h-4 mr-2" />
+                  Manage Users
+                </Button>
+              </div>
             </div>
           ) : users.length > 0 ? (
-            <>
-              <div ref={mainListRef} className="space-y-5 max-h-[28rem] overflow-y-auto pr-1">
-                {mainSectionsWithUsers.map(({ role, title }) => (
-                  <section key={role}>
-                    <h3 className="text-sm font-semibold text-slate-700 mb-2 px-1">{title}</h3>
-                    <div className="grid gap-2">
-                      {usersByRole[role].map((user) => (
-                        <UserSelectCard key={user.id} user={user} onSelect={onSelectUser} />
-                      ))}
-                    </div>
-                  </section>
-                ))}
-              </div>
-
-              {mainSectionsWithUsers.length === 0 && fleetDrivers.length > 0 && (
-                <Alert className="mt-2 text-left">
-                  <User className="w-4 h-4" />
-                  <AlertTitle>No main app users yet</AlertTitle>
-                  <AlertDescription className="text-sm mt-1">
-                    Only fleet driver accounts are set up. Use <strong>Manage Users</strong> to add crew, office, and
-                    payroll users, or sign in as a driver below.
-                  </AlertDescription>
-                </Alert>
-              )}
-            </>
-          ) : null}
-
-          {!loadError && fleetDrivers.length > 0 && (
-            <div className="mt-5 pt-4 border-t border-dashed">
-              <h3 className="text-sm font-semibold text-slate-700 mb-2 px-1 flex items-center gap-2">
-                <Truck className="w-4 h-4" />
-                Fleet drivers ({fleetDrivers.length}) — separate from main app
-              </h3>
-              <div className="grid gap-2">
-                {fleetDrivers.map((user) => (
-                  <UserSelectCard key={user.id} user={user} onSelect={onSelectUser} />
-                ))}
-              </div>
+            <div
+              ref={mainListRef}
+              className="flex-1 min-h-0 overflow-y-auto overscroll-contain space-y-4 sm:space-y-5 pr-1 -mr-1"
+            >
+              {mainSectionsWithUsers.map(({ role, title }) => (
+                <section key={role}>
+                  <h3 className="text-sm font-semibold text-slate-700 mb-2 px-1 sticky top-0 bg-card py-1 z-[1]">
+                    {title}
+                  </h3>
+                  <div className="grid gap-2">
+                    {usersByRole[role].map((user) => (
+                      <UserSelectCard key={user.id} user={user} onSelect={onSelectUser} />
+                    ))}
+                  </div>
+                </section>
+              ))}
             </div>
-          )}
-
-          {users.length > 0 && (
-            <p className="text-xs text-center text-muted-foreground mt-4">
-              Missing someone? Use <strong>Manage Users</strong> to add them.
-            </p>
-          )}
+          ) : null}
         </CardContent>
       </Card>
     </div>

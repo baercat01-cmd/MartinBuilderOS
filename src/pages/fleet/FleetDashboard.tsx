@@ -3,11 +3,13 @@ import { supabase } from '@/lib/supabase';
 import { useAuth } from '@/hooks/useAuth';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
-import { Building2, LogOut, Settings, ArrowLeft } from 'lucide-react';
+import { Building2, CalendarIcon, LogOut, Settings, ArrowLeft } from 'lucide-react';
 import { toast } from 'sonner';
 import { VehicleManagement } from '@/components/fleet/VehicleManagement';
 import { FleetSettings } from '@/components/fleet/FleetSettings';
-import { ensureMaintenanceLogSchema, probeMaintenanceLogSchema } from '@/lib/maintenanceLogSchema';
+import { QuickTimeEntry } from '@/components/foreman/QuickTimeEntry';
+import { UnavailableCalendar } from '@/components/foreman/UnavailableCalendar';
+import { ensureMaintenanceLogSchema, ensureVehicleImagesStorage, probeMaintenanceLogSchema } from '@/lib/maintenanceLogSchema';
 
 interface Company {
   id: string;
@@ -26,11 +28,14 @@ export function FleetDashboard({ hideHeader = false, defaultCompany }: FleetDash
   const [companies, setCompanies] = useState<Company[]>([]);
   const [selectedCompany, setSelectedCompany] = useState<Company | null>(null);
   const [showSettings, setShowSettings] = useState(false);
+  const [showUnavailableCalendar, setShowUnavailableCalendar] = useState(false);
   const [loading, setLoading] = useState(true);
+  const showDriverTimeBar = !hideHeader && !selectedCompany && !showSettings;
 
   useEffect(() => {
     loadCompanies();
     void (async () => {
+      await ensureVehicleImagesStorage();
       const status = await probeMaintenanceLogSchema();
       if (!status.ready && status.rpcAvailable) {
         await ensureMaintenanceLogSchema();
@@ -75,6 +80,36 @@ export function FleetDashboard({ hideHeader = false, defaultCompany }: FleetDash
           <div className="w-12 h-12 border-4 border-yellow-600 border-t-transparent rounded-full animate-spin mx-auto mb-4" />
           <p className="text-slate-600">Loading...</p>
         </div>
+      </div>
+    );
+  }
+
+  if (showUnavailableCalendar) {
+    return (
+      <div className={hideHeader ? '' : 'min-h-screen bg-slate-50'}>
+        {!hideHeader && (
+          <div className="bg-gradient-to-r from-slate-900 via-slate-800 to-slate-900 text-white px-3 py-2 border-b-4 border-yellow-600 shadow-lg">
+            <div className="flex items-center justify-between max-w-4xl mx-auto">
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setShowUnavailableCalendar(false)}
+                className="text-white hover:text-yellow-400 -ml-1"
+              >
+                <ArrowLeft className="w-5 h-5 mr-2" />
+                Back
+              </Button>
+              <h1 className="text-lg font-bold">Time Off</h1>
+              <div className="w-16" aria-hidden />
+            </div>
+          </div>
+        )}
+        <main className="container mx-auto px-2 sm:px-4 py-3 sm:py-6 max-w-4xl">
+          <UnavailableCalendar
+            userId={profile?.id || ''}
+            onBack={() => setShowUnavailableCalendar(false)}
+          />
+        </main>
       </div>
     );
   }
@@ -159,7 +194,7 @@ export function FleetDashboard({ hideHeader = false, defaultCompany }: FleetDash
         </div>
       )}
 
-      <div className="p-4">
+      <div className={`p-4 ${showDriverTimeBar ? 'pb-36' : ''}`}>
         <div className="max-w-4xl mx-auto">
           <div className="mb-4">
             <h2 className="text-xl font-bold text-slate-800">Select Company</h2>
@@ -198,6 +233,25 @@ export function FleetDashboard({ hideHeader = false, defaultCompany }: FleetDash
           </div>
         </div>
       </div>
+
+      {showDriverTimeBar && profile?.id && (
+        <div className="fixed bottom-0 left-0 right-0 bg-white border-t-2 border-slate-300 shadow-lg z-10">
+          <div className="w-full px-0 py-2 sm:py-3 space-y-1.5 sm:space-y-2">
+            <QuickTimeEntry userId={profile.id} />
+            <div className="px-2 sm:px-4">
+              <Button
+                onClick={() => setShowUnavailableCalendar(true)}
+                variant="ghost"
+                size="sm"
+                className="w-full text-sm text-black hover:bg-slate-100 hover:text-green-900 py-2 h-auto rounded-none font-semibold border border-slate-200"
+              >
+                <CalendarIcon className="w-4 h-4 mr-2" />
+                Time Off
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

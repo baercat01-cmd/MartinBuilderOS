@@ -76,3 +76,50 @@ export async function ensureMaintenanceLogSchema(
   const status = await probeMaintenanceLogSchema(client);
   return { ok: status.ready, status, error: status.ready ? undefined : 'Tables still missing after setup' };
 }
+
+/** Ensures vehicle-images bucket allows 80 MB uploads with anon storage policies. */
+export async function ensureVehicleImagesStorage(
+  client: SupabaseClient = supabase,
+): Promise<{ ok: boolean; error?: string }> {
+  const rpcs = ['mb_ensure_fleet_storage_json', 'ensure_vehicle_images_storage_json', 'ensure_maintenance_log_schema_json'] as const;
+
+  for (const rpcName of rpcs) {
+    const { data, error } = await client.rpc(rpcName, { p_payload: {} });
+    if (!error) {
+      const row = data as { ok?: boolean; error?: string } | null;
+      if (row?.ok !== false) {
+        return { ok: true };
+      }
+      if (row?.error) {
+        return { ok: false, error: row.error };
+      }
+      return { ok: true };
+    }
+    const message = error.message || '';
+    const missingRpc =
+      error.code === 'PGRST202' ||
+      message.includes('Could not find the function') ||
+      message.includes(rpcName);
+    if (!missingRpc) {
+      return { ok: false, error: message };
+    }
+  }
+
+  return {
+    ok: false,
+    error: 'Run public/sql/vehicle-images-80mb-anon-onspace.sql in your database SQL editor, then reload the app.',
+  };
+}
+
+export function isStoragePolicyError(error: unknown): boolean {
+  const message =
+    error && typeof error === 'object' && 'message' in error
+      ? String((error as { message?: string }).message).toLowerCase()
+      : '';
+  return (
+    message.includes('row-level security') ||
+    message.includes('42501') ||
+    message.includes('policy') ||
+    message.includes('upsert object')
+  );
+}
