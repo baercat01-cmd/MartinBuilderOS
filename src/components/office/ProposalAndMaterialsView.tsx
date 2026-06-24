@@ -215,7 +215,10 @@ export function ProposalAndMaterialsView({ job, userId: userIdProp, viewMode: vi
                   externalActiveSheetId={linkedSheetId}
                   onBreakdownPriceSync={setBreakdownSheetPrices}
                   onWorkbookViewSync={handleWorkbookViewSync}
-                  onWorkbookLoadSettled={() => setMaterialsWorkbookReady(true)}
+                  onWorkbookLoadSettled={() => {
+                    setMaterialsWorkbookReady(true);
+                    setMaterialsSyncGen((g) => g + 1);
+                  }}
                   onJobWorkbookMaterialsTotalSync={setJobWorkbookMaterialsTotal}
                   onProposalWorkbookMaterialsTotalSync={setProposalWorkbookMaterialsTotal}
                   historicalUnlockedQuoteId={historicalUnlockedQuoteId}

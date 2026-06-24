@@ -134,12 +134,23 @@ export function MaterialsByBundle({ job }: MaterialsByBundleProps) {
           };
         }).filter(Boolean);
 
+        const seenIds = new Set<string>();
+        const seenFp = new Set<string>();
+        const dedupedItems = bundleItems.filter((item: any) => {
+          if (seenIds.has(item.id)) return false;
+          seenIds.add(item.id);
+          const fp = `${item._sheet_name}|${item.material_name}|${item.sku}|${item.quantity}|${item.usage}|${item.length}`;
+          if (seenFp.has(fp)) return false;
+          seenFp.add(fp);
+          return true;
+        });
+
         return {
           id: bundle.id,
           name: bundle.name,
           description: bundle.description,
           status: bundle.status,
-          items: bundleItems,
+          items: dedupedItems,
         };
       });
 

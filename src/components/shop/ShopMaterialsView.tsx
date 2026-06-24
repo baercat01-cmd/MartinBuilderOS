@@ -22,7 +22,11 @@ import { toast } from 'sonner';
 import { TrimDrawingPreview, getCutLengthFromTrimConfig, formatLengthInches, type LineSegment } from '@/components/office/TrimDrawingPreview';
 import { TrimDrawingFullScreenView } from '@/components/office/TrimDrawingFullScreenView';
 import { extractFlatstockCutListSnippet } from '@/lib/flatstockCutListNotes';
-import { isTrimSlittingPlanV1, type TrimSlittingPlanV1 } from '@/lib/trimFlatstockOptimize';
+import { dedupeMaterialBundleItemsForJob } from '@/lib/materialBundleRemap';
+import {
+  dispatchMaterialItemStatusUpdated,
+  updateMaterialItemStatus,
+} from '@/lib/materialPackageStatus';
 
 function toNum(v: unknown): number {
   if (typeof v === 'number' && Number.isFinite(v)) return v;
@@ -455,6 +459,21 @@ export function ShopMaterialsView({ userId }: ShopMaterialsViewProps) {
         setLoading(false);
         return;
       }
+
+      const jobIds = [...new Set(allBundles.map((b: { job_id: string }) => b.job_id).filter(Boolean))];
+      for (const jid of jobIds) {
+        try {
+          await dedupeMaterialBundleItemsForJob(jid);
+        } catch (dedupeErr) {
+          console.warn('ShopMaterialsView dedupe:', dedupeErr);
+        }
+      }
+
+      // Re-fetch after dedupe so bundle_items reflect cleanup
+      const refetch = await supabase.from('material_bundles').select(bundleSelectFull).order('name');
+      if (!refetch.error && refetch.data) {
+        allBundles = refetch.data;
+      }
       
       console.log('📦 SHOP VIEW: Sample bundle structure:', JSON.stringify(allBundles[0], null, 2));
       console.log('📦 SHOP VIEW: All bundles:', allBundles.map(b => ({ id: b.id, name: b.name, itemCount: b.bundle_items?.length || 0 })));
@@ -492,16 +511,36 @@ export function ShopMaterialsView({ userId }: ShopMaterialsViewProps) {
             },
           };
         }).filter(Boolean); // Remove null items
+
+        const seenMaterialIds = new Set<string>();
+        const seenFingerprints = new Set<string>();
+        const dedupedBundleItems = (bundleItems as any[]).filter((item) => {
+          const mid = item.material_item_id;
+          if (seenMaterialIds.has(mid)) return false;
+          seenMaterialIds.add(mid);
+          const mi = item.material_items;
+          const fp = [
+            mi?.sheets?.sheet_name ?? '',
+            mi?.material_name ?? '',
+            mi?.sku ?? '',
+            mi?.quantity ?? 0,
+            mi?.usage ?? '',
+            mi?.length ?? '',
+          ].join('|');
+          if (seenFingerprints.has(fp)) return false;
+          seenFingerprints.add(fp);
+          return true;
+        });
         
         console.log(`✅ Transformed bundle "${pkg.name}":`, {
           job: job.name,
-          itemCount: bundleItems.length
+          itemCount: dedupedBundleItems.length
         });
         
         return {
           ...pkg,
           jobs: job,
-          bundle_items: bundleItems as any,
+          bundle_items: dedupedBundleItems as any,
         };
       });
       
@@ -839,75 +878,34 @@ export function ShopMaterialsView({ userId }: ShopMaterialsViewProps) {
   }
 
   async function updateMaterialStatus(materialId: string, bundleId: string, currentStatus: string, newStatus: 'ready_for_job' | 'at_job') {
-    console.log('🎯 SHOP updateMaterialStatus called:', { materialId, bundleId, currentStatus, newStatus, isProcessing: processingMaterials.has(materialId) });
-    
-    if (processingMaterials.has(materialId)) {
-      console.log('⚠️ SHOP Material is already being processed, skipping');
-      return;
-    }
-    
+    if (processingMaterials.has(materialId)) return;
+
     setProcessingMaterials(prev => new Set(prev).add(materialId));
 
     try {
-      console.log(`🔄 SHOP Updating material ${materialId} from ${currentStatus} to ${newStatus}`);
-      
-      // Update material status
-      const { data, error: materialError } = await supabase
-        .from('material_items')
-        .update({ 
-          status: newStatus,
-          updated_at: new Date().toISOString() 
-        })
-        .eq('id', materialId)
-        .select();
+      const jobId = packages.find((p) => p.id === bundleId)?.job_id
+        ?? sheetGroups.find((p) => p.id === bundleId)?.job_id;
 
-      if (materialError) {
-        console.error('❌ SHOP Database error:', materialError);
-        throw materialError;
-      }
+      const { packageIds, packageStatuses } = await updateMaterialItemStatus(
+        supabase,
+        materialId,
+        newStatus,
+        { syncPackageStatus: !bundleId.startsWith('unbundled-') },
+      );
 
-      console.log('✅ SHOP Material updated successfully:', data);
-
-      // Check if this is the first material in the package being marked as ready
-      // Get all materials in the package (only for non-virtual bundles)
-      if (!bundleId.startsWith('unbundled-')) {
-        const { data: bundleItems, error: bundleItemsError } = await supabase
-          .from('material_bundle_items')
-          .select(`
-            material_item_id,
-            material_items!inner(status)
-          `)
-          .eq('bundle_id', bundleId);
-
-        if (bundleItemsError) throw bundleItemsError;
-
-        // Count how many materials are now ready_for_job or at_job
-        const readyMaterials = bundleItems?.filter(
-          (item: any) => item.material_items.status === 'ready_for_job' || item.material_items.status === 'at_job'
-        ).length || 0;
-
-        console.log(`📊 Package ${bundleId}: ${readyMaterials}/${bundleItems?.length || 0} materials ready`);
-
-        // If this is the first material being marked ready, update package status
-        if (readyMaterials === 1) {
-          console.log('🔄 First material marked ready - updating package status');
-          const { error: packageError } = await supabase
-            .from('material_bundles')
-            .update({
-              status: 'delivered', // Database value for ready_for_job
-              updated_at: new Date().toISOString(),
-            })
-            .eq('id', bundleId);
-
-          if (packageError) throw packageError;
-        }
-      }
+      dispatchMaterialItemStatusUpdated({
+        jobId,
+        materialItemIds: [materialId],
+        newStatus,
+        packageIds: bundleId.startsWith('unbundled-') ? [] : packageIds,
+        packageStatuses: bundleId.startsWith('unbundled-') ? undefined : packageStatuses,
+      });
 
       toast.success(`Material marked as ${newStatus === 'ready_for_job' ? 'Ready for Job' : 'At Job'}`);
 
       loadPackages();
     } catch (error: any) {
-      console.error('❌ SHOP Error updating material:', error);
+      console.error('Error updating material:', error);
       toast.error(`Failed to update material: ${error.message || 'Unknown error'}`);
     } finally {
       setProcessingMaterials(prev => {

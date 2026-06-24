@@ -2,7 +2,7 @@ import { serve } from 'https://deno.land/std@0.168.0/http/server.ts';
 import { corsHeaders } from '../_shared/cors.ts';
 
 function generateJobHoursHTML(data: any): string {
-  const { title, jobName, clientName, address, totalHours, users } = data;
+  const { title, jobName, clientName, address, periodLabel, totalHours, users } = data;
   
   return `
     <style>
@@ -15,90 +15,103 @@ function generateJobHoursHTML(data: any): string {
       body {
         font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
         color: #1a1a1a;
-        line-height: 1.5;
-        max-width: 900px;
+        line-height: 1.25;
+        max-width: 100%;
         margin: 0 auto;
       }
       
       .header {
         text-align: center;
-        margin-bottom: 30px;
-        padding-bottom: 15px;
-        border-bottom: 3px solid #2d5f3f;
+        margin-bottom: 10px;
+        padding-bottom: 6px;
+        border-bottom: 2px solid #2d5f3f;
       }
       
       .header h1 {
         color: #2d5f3f;
-        font-size: 28px;
-        margin-bottom: 8px;
+        font-size: 16px;
+        font-weight: 700;
+        margin-bottom: 4px;
+        letter-spacing: 0.02em;
       }
       
       .job-info {
         background: #f8f9fa;
-        border-radius: 6px;
-        padding: 15px 20px;
-        margin: 15px auto;
-        display: inline-block;
+        border-radius: 4px;
+        padding: 5px 10px;
+        margin: 0 auto;
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: center;
+        gap: 6px 14px;
+        max-width: 100%;
         text-align: left;
       }
       
       .job-info-row {
-        margin-bottom: 8px;
+        display: inline-flex;
+        align-items: baseline;
+        gap: 4px;
+        margin-bottom: 0;
+        white-space: nowrap;
       }
       
       .job-info-label {
-        font-size: 12px;
+        font-size: 9px;
         color: #666;
         font-weight: 600;
-        margin-bottom: 2px;
+        text-transform: uppercase;
+        letter-spacing: 0.03em;
       }
       
       .job-info-value {
-        font-size: 15px;
+        font-size: 11px;
         color: #1a1a1a;
       }
       
       .total-hours {
         background: #2d5f3f;
         color: white;
-        padding: 12px 20px;
-        border-radius: 6px;
-        font-size: 18px;
+        padding: 3px 10px;
+        border-radius: 4px;
+        font-size: 11px;
         font-weight: bold;
-        margin-top: 10px;
+        margin-top: 0;
         text-align: center;
+        white-space: nowrap;
       }
       
       .user-section {
-        margin-bottom: 40px;
-        page-break-inside: avoid;
+        margin-bottom: 8px;
       }
       
       .user-header {
-        background: #f8f9fa;
-        padding: 12px 15px;
-        border-left: 4px solid #2d5f3f;
-        margin-bottom: 15px;
+        background: #f0f0f0;
+        padding: 3px 8px;
+        border-left: 3px solid #2d5f3f;
+        margin-bottom: 2px;
         display: flex;
         justify-content: space-between;
         align-items: center;
+        min-height: 0;
       }
       
       .user-name {
-        font-size: 20px;
-        font-weight: bold;
+        font-size: 11px;
+        font-weight: 700;
         color: #1a1a1a;
       }
       
       .user-total {
-        font-size: 24px;
-        font-weight: bold;
+        font-size: 11px;
+        font-weight: 700;
         color: #2d5f3f;
       }
       
       .time-table {
         border: 1px solid #e0e0e0;
-        border-radius: 6px;
+        border-radius: 3px;
         overflow: hidden;
       }
       
@@ -108,20 +121,20 @@ function generateJobHoursHTML(data: any): string {
       }
       
       .entries-table th {
-        background: #f0f0f0;
-        padding: 8px;
+        background: #f5f5f5;
+        padding: 2px 4px;
         text-align: left;
-        font-size: 11px;
+        font-size: 9px;
         font-weight: 600;
         color: #555;
-        border-bottom: 2px solid #ddd;
+        border-bottom: 1px solid #ddd;
       }
       
       .entries-table th:last-child { text-align: right; }
       
       .entries-table td {
-        padding: 6px 8px;
-        font-size: 12px;
+        padding: 2px 4px;
+        font-size: 10px;
         border-bottom: 1px solid #f0f0f0;
         vertical-align: top;
       }
@@ -134,20 +147,21 @@ function generateJobHoursHTML(data: any): string {
       
       .date-cell {
         font-weight: 500;
-        font-size: 12px;
+        font-size: 10px;
+        white-space: nowrap;
       }
       
       .component-cell {
-        font-weight: 500;
+        font-weight: 400;
       }
       
       .time-cell {
-        font-family: 'Courier New', monospace;
-        font-size: 11px;
+        font-size: 10px;
+        white-space: nowrap;
       }
       
       .hours-cell {
-        font-weight: bold;
+        font-weight: 700;
         color: #2d5f3f;
       }
       
@@ -156,9 +170,10 @@ function generateJobHoursHTML(data: any): string {
       }
       
       .notes-cell {
-        font-size: 11px;
+        font-size: 9px;
         color: #666;
         font-style: italic;
+        padding: 1px 4px 2px !important;
       }
       
       @media print {
@@ -167,11 +182,28 @@ function generateJobHoursHTML(data: any): string {
           print-color-adjust: exact;
           max-width: 100%;
           margin: 0;
-          padding: 20px;
+          padding: 0;
+          line-height: 1.2;
         }
         
+        .header {
+          margin-bottom: 6px;
+          padding-bottom: 4px;
+        }
+
         .user-section {
           page-break-inside: avoid;
+          margin-bottom: 5px;
+        }
+
+        .user-header {
+          padding: 2px 6px;
+        }
+
+        .entries-table th,
+        .entries-table td {
+          padding: 1px 3px;
+          font-size: 9px;
         }
       }
     </style>
@@ -180,19 +212,25 @@ function generateJobHoursHTML(data: any): string {
       <h1>${title}</h1>
       <div class="job-info">
         <div class="job-info-row">
-          <div class="job-info-label">Job Name</div>
-          <div class="job-info-value"><strong>${jobName}</strong></div>
+          <span class="job-info-label">Job</span>
+          <span class="job-info-value"><strong>${jobName}</strong></span>
         </div>
         <div class="job-info-row">
-          <div class="job-info-label">Client</div>
-          <div class="job-info-value">${clientName}</div>
+          <span class="job-info-label">Client</span>
+          <span class="job-info-value">${clientName}</span>
         </div>
         <div class="job-info-row">
-          <div class="job-info-label">Address</div>
-          <div class="job-info-value">${address}</div>
+          <span class="job-info-label">Address</span>
+          <span class="job-info-value">${address}</span>
         </div>
+        ${periodLabel ? `
+        <div class="job-info-row">
+          <span class="job-info-label">Period</span>
+          <span class="job-info-value">${periodLabel}</span>
+        </div>
+        ` : ''}
         <div class="total-hours">
-          Total Hours: ${totalHours}h
+          Total: ${totalHours}h
         </div>
       </div>
     </div>
@@ -626,40 +664,42 @@ serve(async (req) => {
           <style>
             @media print {
               @page {
-                margin: 1.5cm;
+                margin: 0.5in;
                 size: letter;
               }
             }
             body {
               margin: 0;
-              padding: 20px;
+              padding: 8px;
             }
             .print-instructions {
               background: #f0f7f0;
               border: 2px solid #2d5f3f;
               border-radius: 8px;
-              padding: 20px;
-              margin-bottom: 30px;
+              padding: 12px;
+              margin-bottom: 12px;
               text-align: center;
             }
             .print-instructions h2 {
               color: #2d5f3f;
-              margin: 0 0 10px 0;
+              margin: 0 0 6px 0;
+              font-size: 16px;
             }
             .print-instructions p {
-              margin: 5px 0;
+              margin: 3px 0;
               color: #333;
+              font-size: 12px;
             }
             .print-instructions button {
               background: #2d5f3f;
               color: white;
               border: none;
-              padding: 12px 24px;
+              padding: 8px 16px;
               border-radius: 6px;
-              font-size: 16px;
+              font-size: 14px;
               font-weight: bold;
               cursor: pointer;
-              margin-top: 15px;
+              margin-top: 8px;
             }
             .print-instructions button:hover {
               background: #1a3d28;

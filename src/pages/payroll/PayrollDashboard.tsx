@@ -36,6 +36,7 @@ import {
 import { toast } from 'sonner';
 import { useAuth } from '@/hooks/useAuth';
 import { FunctionsHttpError } from '@supabase/supabase-js';
+import { buildJobHoursPrintDocument } from '@/lib/generateJobHoursHtml';
 import { UnavailableCalendar } from '@/components/foreman/UnavailableCalendar';
 import { format } from 'date-fns';
 import { ensureDefaultTimeEntryJobs, prioritizeDefaultJobs } from '@/lib/defaultJobs';
@@ -248,6 +249,88 @@ interface WeekData {
 }
 
 type PeriodType = 'weekly' | 'biweekly' | 'monthly' | 'quarterly' | 'yearly' | 'custom';
+type JobHoursPeriodType = PeriodType | 'all';
+
+function buildPeriodOptions(periodType: PeriodType): { value: string; label: string }[] {
+  const periods: { value: string; label: string }[] = [];
+  const today = new Date();
+
+  if (periodType === 'weekly') {
+    for (let i = 0; i < 12; i++) {
+      const weekStart = new Date(today);
+      const dayOfWeek = today.getDay();
+      const daysToMonday = dayOfWeek === 0 ? 6 : dayOfWeek - 1;
+      weekStart.setDate(today.getDate() - daysToMonday - (i * 7));
+      weekStart.setHours(0, 0, 0, 0);
+
+      const weekEnd = new Date(weekStart);
+      weekEnd.setDate(weekStart.getDate() + 6);
+      weekEnd.setHours(23, 59, 59, 999);
+
+      periods.push({
+        value: formatDateLocal(weekStart),
+        label: `${weekStart.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} - ${weekEnd.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}`,
+      });
+    }
+  } else if (periodType === 'biweekly') {
+    for (let i = 0; i < 12; i++) {
+      const periodStart = new Date(today);
+      const dayOfWeek = today.getDay();
+      const daysToMonday = dayOfWeek === 0 ? 6 : dayOfWeek - 1;
+      periodStart.setDate(today.getDate() - daysToMonday - (i * 14));
+      periodStart.setHours(0, 0, 0, 0);
+
+      const periodEnd = new Date(periodStart);
+      periodEnd.setDate(periodStart.getDate() + 13);
+      periodEnd.setHours(23, 59, 59, 999);
+
+      periods.push({
+        value: formatDateLocal(periodStart),
+        label: `${periodStart.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} - ${periodEnd.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}`,
+      });
+    }
+  } else if (periodType === 'monthly') {
+    for (let i = 0; i < 12; i++) {
+      const monthStart = new Date(today.getFullYear(), today.getMonth() - i, 1);
+      monthStart.setHours(0, 0, 0, 0);
+
+      const monthEnd = new Date(monthStart.getFullYear(), monthStart.getMonth() + 1, 0);
+      monthEnd.setHours(23, 59, 59, 999);
+
+      periods.push({
+        value: formatDateLocal(monthStart),
+        label: monthStart.toLocaleDateString('en-US', { month: 'long', year: 'numeric' }),
+      });
+    }
+  } else if (periodType === 'quarterly') {
+    for (let i = 0; i < 8; i++) {
+      const currentQuarter = Math.floor(today.getMonth() / 3);
+      const quarterYear = today.getFullYear() - Math.floor(i / 4);
+      const quarter = (currentQuarter - i % 4 + 4) % 4;
+
+      const quarterStart = new Date(quarterYear, quarter * 3, 1);
+      quarterStart.setHours(0, 0, 0, 0);
+
+      const quarterEnd = new Date(quarterYear, (quarter + 1) * 3, 0);
+      quarterEnd.setHours(23, 59, 59, 999);
+
+      periods.push({
+        value: formatDateLocal(quarterStart),
+        label: `Q${quarter + 1} ${quarterYear} (${quarterStart.toLocaleDateString('en-US', { month: 'short' })} - ${quarterEnd.toLocaleDateString('en-US', { month: 'short', year: 'numeric' })})`,
+      });
+    }
+  } else if (periodType === 'yearly') {
+    const year = today.getFullYear();
+    const yearStart = new Date(year, 0, 1);
+    yearStart.setHours(0, 0, 0, 0);
+    periods.push({
+      value: formatDateLocal(yearStart),
+      label: `YTD ${year} (${yearStart.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} – ${today.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })})`,
+    });
+  }
+
+  return periods;
+}
 
 function resolvePeriodBounds(
   periodType: PeriodType,
@@ -359,6 +442,11 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
   const [jobHoursData, setJobHoursData] = useState<any[]>([]);
   const [loadingJobHours, setLoadingJobHours] = useState(false);
   const [exportingJobHours, setExportingJobHours] = useState(false);
+  const [jobHoursPeriodType, setJobHoursPeriodType] = useState<JobHoursPeriodType>('weekly');
+  const [jobHoursSelectedPeriod, setJobHoursSelectedPeriod] = useState<string>('');
+  const [jobHoursPeriodOptions, setJobHoursPeriodOptions] = useState<{ value: string; label: string }[]>([]);
+  const [jobHoursCustomStartDate, setJobHoursCustomStartDate] = useState<string>('');
+  const [jobHoursCustomEndDate, setJobHoursCustomEndDate] = useState<string>('');
   const [payrollUsers, setPayrollUsers] = useState<{ id: string; username: string | null; email?: string | null }[]>([]);
   const [showAddTimeDialog, setShowAddTimeDialog] = useState(false);
   const [savingAddTime, setSavingAddTime] = useState(false);
@@ -378,20 +466,74 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
   }, [periodType]);
 
   useEffect(() => {
-    if (periodType === 'custom') {
-      if (customStartDate && customEndDate) {
-        loadPeriodData();
-      }
-    } else if (selectedPeriod) {
-      loadPeriodData();
+    if (periodType === 'custom') return;
+    if (!selectedPeriod) return;
+    const bounds = resolvePeriodBounds(periodType, selectedPeriod, '', '');
+    if (bounds) {
+      setCustomStartDate(bounds.start);
+      setCustomEndDate(bounds.end);
     }
-  }, [selectedPeriod, customStartDate, customEndDate]);
+  }, [periodType, selectedPeriod]);
 
   useEffect(() => {
-    if (selectedJobId) {
+    if (!customStartDate || !customEndDate || customStartDate > customEndDate) return;
+    if (periodType === 'custom' || selectedPeriod) {
+      loadPeriodData();
+    }
+  }, [periodType, selectedPeriod, customStartDate, customEndDate]);
+
+  useEffect(() => {
+    if (jobHoursPeriodType === 'all' || jobHoursPeriodType === 'custom') return;
+    const periods = buildPeriodOptions(jobHoursPeriodType);
+    setJobHoursPeriodOptions(periods);
+    if (periods.length > 0) {
+      setJobHoursSelectedPeriod(periods[0].value);
+    }
+  }, [jobHoursPeriodType]);
+
+  useEffect(() => {
+    if (jobHoursPeriodType === 'all' || jobHoursPeriodType === 'custom') return;
+    if (!jobHoursSelectedPeriod) return;
+    const bounds = resolvePeriodBounds(
+      jobHoursPeriodType,
+      jobHoursSelectedPeriod,
+      '',
+      ''
+    );
+    if (bounds) {
+      setJobHoursCustomStartDate(bounds.start);
+      setJobHoursCustomEndDate(bounds.end);
+    }
+  }, [jobHoursPeriodType, jobHoursSelectedPeriod]);
+
+  useEffect(() => {
+    if (!selectedJobId) {
+      setJobHoursData([]);
+      return;
+    }
+
+    if (jobHoursPeriodType === 'all') {
+      loadJobHours();
+    } else if (jobHoursPeriodType === 'custom') {
+      if (
+        jobHoursCustomStartDate &&
+        jobHoursCustomEndDate &&
+        jobHoursCustomStartDate <= jobHoursCustomEndDate
+      ) {
+        loadJobHours();
+      } else {
+        setJobHoursData([]);
+      }
+    } else if (jobHoursSelectedPeriod) {
       loadJobHours();
     }
-  }, [selectedJobId]);
+  }, [
+    selectedJobId,
+    jobHoursPeriodType,
+    jobHoursSelectedPeriod,
+    jobHoursCustomStartDate,
+    jobHoursCustomEndDate,
+  ]);
 
   async function loadJobs() {
     try {
@@ -482,7 +624,7 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
 
     setLoadingJobHours(true);
     try {
-      const { data: timeEntries, error } = await supabase
+      let query = supabase
         .from('time_entries')
         .select(`
           *,
@@ -492,6 +634,30 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
         .eq('job_id', selectedJobId)
         .eq('is_active', false)
         .order('start_time', { ascending: true });
+
+      if (jobHoursPeriodType !== 'all') {
+        const bounds = resolvePeriodBounds(
+          jobHoursPeriodType,
+          jobHoursSelectedPeriod,
+          jobHoursCustomStartDate,
+          jobHoursCustomEndDate
+        );
+        if (!bounds) {
+          setJobHoursData([]);
+          return;
+        }
+
+        const periodStart = parseDateLocal(bounds.start);
+        periodStart.setHours(0, 0, 0, 0);
+        const periodEnd = parseDateLocal(bounds.end);
+        periodEnd.setHours(23, 59, 59, 999);
+
+        query = query
+          .gte('start_time', periodStart.toISOString())
+          .lte('start_time', periodEnd.toISOString());
+      }
+
+      const { data: timeEntries, error } = await query;
 
       if (error) throw error;
 
@@ -515,7 +681,7 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
         userData.totalHours += entry.total_hours || 0;
         userData.entries.push({
           date: format(new Date(entry.start_time), 'MMM d, yyyy'),
-          component: entry.components?.name || 'Clock In/Out',
+          component: entry.components?.name ?? '',
           startTime: format(new Date(entry.start_time), 'h:mm a'),
           endTime: entry.end_time ? format(new Date(entry.end_time), 'h:mm a') : '-',
           hours: (entry.total_hours || 0).toFixed(2),
@@ -559,30 +725,17 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
         title: 'Job Hours Report',
         jobName: job.name,
         clientName: job.client_name,
-        address: job.address,
+        address: job.address || 'N/A',
+        periodLabel: jobHoursPeriodType !== 'all' ? getJobHoursPeriodLabel() : undefined,
         totalHours: totalHours.toFixed(2),
         users: jobHoursData,
       };
 
-      const { data, error } = await supabase.functions.invoke('generate-pdf', {
-        body: {
-          type: 'job-hours',
-          data: pdfData,
-        },
-      });
+      const html = buildJobHoursPrintDocument(pdfData);
 
-      if (error) {
-        if (error instanceof FunctionsHttpError) {
-          const errorText = await error.context.text();
-          throw new Error(errorText || error.message);
-        }
-        throw error;
-      }
-
-      // Open HTML in new window with print dialog
       const printWindow = window.open('', '_blank');
       if (printWindow) {
-        printWindow.document.write(data);
+        printWindow.document.write(html);
         printWindow.document.close();
       } else {
         toast.error('Please allow popups to print');
@@ -598,123 +751,102 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
   }
 
   function generatePeriodOptions() {
-    const periods: { value: string; label: string }[] = [];
-    const today = new Date();
-    
-    if (periodType === 'weekly') {
-      // Generate last 12 weeks (Monday to Sunday)
-      for (let i = 0; i < 12; i++) {
-        const weekStart = new Date(today);
-        // Calculate days to subtract to get to Monday
-        const dayOfWeek = today.getDay(); // 0 = Sunday, 1 = Monday, etc.
-        const daysToMonday = dayOfWeek === 0 ? 6 : dayOfWeek - 1; // If Sunday, go back 6 days; otherwise go back to Monday
-        weekStart.setDate(today.getDate() - daysToMonday - (i * 7)); // Monday
-        weekStart.setHours(0, 0, 0, 0);
-        
-        const weekEnd = new Date(weekStart);
-        weekEnd.setDate(weekStart.getDate() + 6); // Sunday (end of week)
-        weekEnd.setHours(23, 59, 59, 999);
-        
-        const value = formatDateLocal(weekStart);
-        const label = `${weekStart.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} - ${weekEnd.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}`;
-        
-        periods.push({ value, label });
-      }
-    } else if (periodType === 'biweekly') {
-      // Generate last 12 biweekly periods (Monday to Sunday)
-      for (let i = 0; i < 12; i++) {
-        const periodStart = new Date(today);
-        // Calculate days to subtract to get to Monday
-        const dayOfWeek = today.getDay(); // 0 = Sunday, 1 = Monday, etc.
-        const daysToMonday = dayOfWeek === 0 ? 6 : dayOfWeek - 1; // If Sunday, go back 6 days; otherwise go back to Monday
-        periodStart.setDate(today.getDate() - daysToMonday - (i * 14)); // Monday
-        periodStart.setHours(0, 0, 0, 0);
-        
-        const periodEnd = new Date(periodStart);
-        periodEnd.setDate(periodStart.getDate() + 13); // 2 weeks (ending on Sunday)
-        periodEnd.setHours(23, 59, 59, 999);
-        
-        const value = formatDateLocal(periodStart);
-        const label = `${periodStart.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} - ${periodEnd.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}`;
-        
-        periods.push({ value, label });
-      }
-    } else if (periodType === 'monthly') {
-      // Generate last 12 months
-      for (let i = 0; i < 12; i++) {
-        const monthStart = new Date(today.getFullYear(), today.getMonth() - i, 1);
-        monthStart.setHours(0, 0, 0, 0);
-        
-        const monthEnd = new Date(monthStart.getFullYear(), monthStart.getMonth() + 1, 0);
-        monthEnd.setHours(23, 59, 59, 999);
-        
-        const value = formatDateLocal(monthStart);
-        const label = monthStart.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
-        
-        periods.push({ value, label });
-      }
-    } else if (periodType === 'quarterly') {
-      // Generate last 8 quarters
-      for (let i = 0; i < 8; i++) {
-        const currentQuarter = Math.floor(today.getMonth() / 3);
-        const quarterYear = today.getFullYear() - Math.floor(i / 4);
-        const quarter = (currentQuarter - i % 4 + 4) % 4;
-        
-        const quarterStart = new Date(quarterYear, quarter * 3, 1);
-        quarterStart.setHours(0, 0, 0, 0);
-        
-        const quarterEnd = new Date(quarterYear, (quarter + 1) * 3, 0);
-        quarterEnd.setHours(23, 59, 59, 999);
-        
-        const value = formatDateLocal(quarterStart);
-        const label = `Q${quarter + 1} ${quarterYear} (${quarterStart.toLocaleDateString('en-US', { month: 'short' })} - ${quarterEnd.toLocaleDateString('en-US', { month: 'short', year: 'numeric' })})`;
-        
-        periods.push({ value, label });
-      }
-    } else if (periodType === 'yearly') {
-      // Year-to-date: Jan 1 of current calendar year through today
-      const year = today.getFullYear();
-      const yearStart = new Date(year, 0, 1);
-      yearStart.setHours(0, 0, 0, 0);
-      const value = formatDateLocal(yearStart);
-      const label = `YTD ${year} (${yearStart.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} – ${today.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })})`;
-      periods.push({ value, label });
-    }
-    
+    const periods = buildPeriodOptions(periodType);
     setPeriodOptions(periods);
     if (periods.length > 0 && periodType !== 'custom') {
       setSelectedPeriod(periods[0].value);
     }
   }
 
-  async function loadPeriodData() {
-    let periodStart: Date;
-    let periodEnd: Date;
+  function handlePeriodTypeChange(value: PeriodType) {
+    setPeriodType(value);
+  }
 
-    if (periodType === 'custom') {
-      if (!customStartDate || !customEndDate) return;
-      periodStart = parseDateLocal(customStartDate);
-      periodEnd = parseDateLocal(customEndDate);
-    } else {
-      if (!selectedPeriod) return;
-      periodStart = parseDateLocal(selectedPeriod);
-      
-      // Calculate end date based on period type
-      periodEnd = new Date(periodStart);
-      if (periodType === 'weekly') {
-        periodEnd.setDate(periodStart.getDate() + 6);
-      } else if (periodType === 'biweekly') {
-        periodEnd.setDate(periodStart.getDate() + 13);
-      } else if (periodType === 'monthly') {
-        periodEnd = new Date(periodStart.getFullYear(), periodStart.getMonth() + 1, 0);
-      } else if (periodType === 'quarterly') {
-        periodEnd = new Date(periodStart.getFullYear(), periodStart.getMonth() + 3, 0);
-      } else if (periodType === 'yearly') {
-        periodEnd = new Date();
-      }
+  function handlePeriodStartDateChange(value: string) {
+    setCustomStartDate(value);
+    if (value && periodType !== 'custom') {
+      setPeriodType('custom');
     }
-    
+  }
+
+  function handlePeriodEndDateChange(value: string) {
+    setCustomEndDate(value);
+    if (value && periodType !== 'custom') {
+      setPeriodType('custom');
+    }
+  }
+
+  function getTimeEntriesPeriodLabel(): string {
+    if (customStartDate && customEndDate) {
+      const start = parseDateLocal(customStartDate).toLocaleDateString('en-US', {
+        month: 'short',
+        day: 'numeric',
+        year: 'numeric',
+      });
+      const end = parseDateLocal(customEndDate).toLocaleDateString('en-US', {
+        month: 'short',
+        day: 'numeric',
+        year: 'numeric',
+      });
+      return `${start} – ${end}`;
+    }
+    if (periodType === 'custom') return 'Custom range';
+    return periodOptions.find((p) => p.value === selectedPeriod)?.label || '';
+  }
+
+  function getJobHoursPeriodLabel(): string {
+    if (jobHoursPeriodType === 'all') return 'All Time';
+    if (jobHoursCustomStartDate && jobHoursCustomEndDate) {
+      const start = parseDateLocal(jobHoursCustomStartDate).toLocaleDateString('en-US', {
+        month: 'short',
+        day: 'numeric',
+        year: 'numeric',
+      });
+      const end = parseDateLocal(jobHoursCustomEndDate).toLocaleDateString('en-US', {
+        month: 'short',
+        day: 'numeric',
+        year: 'numeric',
+      });
+      return `${start} – ${end}`;
+    }
+    if (jobHoursPeriodType === 'custom') return 'Custom range';
+    return jobHoursPeriodOptions.find((p) => p.value === jobHoursSelectedPeriod)?.label || '';
+  }
+
+  function handleJobHoursPeriodTypeChange(value: JobHoursPeriodType) {
+    setJobHoursPeriodType(value);
+    if (value === 'all') {
+      setJobHoursCustomStartDate('');
+      setJobHoursCustomEndDate('');
+    }
+  }
+
+  function handleJobHoursStartDateChange(value: string) {
+    setJobHoursCustomStartDate(value);
+    if (value && jobHoursPeriodType !== 'all') {
+      setJobHoursPeriodType('custom');
+    }
+  }
+
+  function handleJobHoursEndDateChange(value: string) {
+    setJobHoursCustomEndDate(value);
+    if (value && jobHoursPeriodType !== 'all') {
+      setJobHoursPeriodType('custom');
+    }
+  }
+
+  async function loadPeriodData() {
+    const bounds = resolvePeriodBounds(
+      periodType,
+      selectedPeriod,
+      customStartDate,
+      customEndDate
+    );
+    if (!bounds || bounds.start > bounds.end) return;
+
+    const periodStart = parseDateLocal(bounds.start);
     periodStart.setHours(0, 0, 0, 0);
+    const periodEnd = parseDateLocal(bounds.end);
     periodEnd.setHours(23, 59, 59, 999);
     
     setLoading(true);
@@ -928,26 +1060,15 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
         customerSearch
       );
 
-      let periodLabel = '';
-      if (periodType === 'custom') {
-        const start = parseDateLocal(customStartDate).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-        const end = parseDateLocal(customEndDate).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-        periodLabel = `${start} - ${end}`;
-      } else {
-        periodLabel = periodOptions.find(p => p.value === selectedPeriod)?.label || 'period';
-      }
-      
-      // Calculate exact date range for PDF
-      let startDate: Date;
-      let endDate: Date;
-      
-      if (periodType === 'custom') {
-        startDate = parseDateLocal(customStartDate);
-        endDate = parseDateLocal(customEndDate);
-      } else {
-        startDate = parseDateLocal(selectedPeriod);
-        endDate = new Date(weekData.weekEnd);
-      }
+      const exportBounds = resolvePeriodBounds(
+        periodType,
+        selectedPeriod,
+        customStartDate,
+        customEndDate
+      );
+      const periodLabel = exportBounds ? getTimeEntriesPeriodLabel() : 'period';
+      const startDate = exportBounds ? parseDateLocal(exportBounds.start) : parseDateLocal(selectedPeriod);
+      const endDate = exportBounds ? parseDateLocal(exportBounds.end) : new Date(weekData.weekEnd);
 
       const startDateStr = startDate.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
       const endDateStr = endDate.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
@@ -1201,63 +1322,78 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
           </TabsList>
 
           <TabsContent value="time-entries" className="space-y-6 mt-6">
-        {/* Week Selector & Summary */}
+        {/* Period Selector & Summary */}
         <Card>
           <CardHeader>
-            <div className="flex items-center justify-between flex-wrap gap-4">
-              <CardTitle className="flex items-center gap-2">
-                <Calendar className="w-5 h-5 text-primary" />
-                Time Entries by Period
-              </CardTitle>
-              <div className="flex items-center gap-3 flex-wrap">
-                <Select value={periodType} onValueChange={(v) => setPeriodType(v as PeriodType)}>
-                  <SelectTrigger className="w-[140px]">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="weekly">Weekly</SelectItem>
-                    <SelectItem value="biweekly">Biweekly</SelectItem>
-                    <SelectItem value="monthly">Monthly</SelectItem>
-                    <SelectItem value="quarterly">Quarterly</SelectItem>
-                    <SelectItem value="yearly">Yearly</SelectItem>
-                    <SelectItem value="custom">Custom</SelectItem>
-                  </SelectContent>
-                </Select>
-                
-                {periodType === 'custom' ? (
-                  <div className="flex items-center gap-2">
-                    <Input
-                      type="date"
-                      value={customStartDate}
-                      onChange={(e) => setCustomStartDate(e.target.value)}
-                      className="w-[150px]"
-                    />
-                    <span className="text-muted-foreground">to</span>
-                    <Input
-                      type="date"
-                      value={customEndDate}
-                      onChange={(e) => setCustomEndDate(e.target.value)}
-                      className="w-[150px]"
-                    />
-                  </div>
-                ) : (
-                  <Select value={selectedPeriod} onValueChange={setSelectedPeriod}>
-                    <SelectTrigger className="w-[280px]">
-                      <SelectValue placeholder="Select period" />
+            <CardTitle className="flex items-center gap-2">
+              <Calendar className="w-5 h-5 text-primary" />
+              Time Entries by Period
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-6">
+            <div className="rounded-lg border bg-muted/20 p-4 space-y-3">
+              <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                <Label className="text-sm font-semibold flex items-center gap-2 shrink-0">
+                  <CalendarDays className="w-4 h-4 text-primary" />
+                  Select Timeframe
+                </Label>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <Select value={periodType} onValueChange={(v) => handlePeriodTypeChange(v as PeriodType)}>
+                    <SelectTrigger className="w-[140px]">
+                      <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
-                      {periodOptions.map(period => (
-                        <SelectItem key={period.value} value={period.value}>
-                          {period.label}
-                        </SelectItem>
-                      ))}
+                      <SelectItem value="weekly">Weekly</SelectItem>
+                      <SelectItem value="biweekly">Biweekly</SelectItem>
+                      <SelectItem value="monthly">Monthly</SelectItem>
+                      <SelectItem value="quarterly">Quarterly</SelectItem>
+                      <SelectItem value="yearly">Yearly</SelectItem>
+                      <SelectItem value="custom">Custom</SelectItem>
                     </SelectContent>
                   </Select>
-                )}
+
+                  {periodType !== 'custom' && (
+                    <Select value={selectedPeriod} onValueChange={setSelectedPeriod}>
+                      <SelectTrigger className="w-[280px]">
+                        <SelectValue placeholder="Select period" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {periodOptions.map((period) => (
+                          <SelectItem key={period.value} value={period.value}>
+                            {period.label}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  )}
+
+                  <Input
+                    id="time-entries-start-date"
+                    type="date"
+                    value={customStartDate}
+                    onChange={(e) => handlePeriodStartDateChange(e.target.value)}
+                    aria-label="From date"
+                    className="w-[145px]"
+                  />
+                  <span className="text-muted-foreground text-sm">–</span>
+                  <Input
+                    id="time-entries-end-date"
+                    type="date"
+                    value={customEndDate}
+                    onChange={(e) => handlePeriodEndDateChange(e.target.value)}
+                    aria-label="To date"
+                    className="w-[145px]"
+                  />
+                </div>
               </div>
+
+              {customStartDate && customEndDate && customStartDate > customEndDate && (
+                <p className="text-xs text-destructive">
+                  End date must be on or after the start date.
+                </p>
+              )}
             </div>
-          </CardHeader>
-          <CardContent>
+
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
               <div className="p-4 bg-muted/30 rounded-lg">
                 <div className="flex items-center gap-2 text-muted-foreground mb-2">
@@ -1584,7 +1720,81 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
                   Job Hours Report
                 </CardTitle>
               </CardHeader>
-              <CardContent>
+              <CardContent className="space-y-6">
+                <div className="rounded-lg border bg-muted/20 p-4 space-y-3">
+                  <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                    <Label className="text-sm font-semibold flex items-center gap-2 shrink-0">
+                      <Calendar className="w-4 h-4 text-primary" />
+                      Select Dates
+                    </Label>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <Select
+                        value={jobHoursPeriodType}
+                        onValueChange={(v) => handleJobHoursPeriodTypeChange(v as JobHoursPeriodType)}
+                      >
+                        <SelectTrigger className="w-[140px]">
+                          <SelectValue placeholder="Period" />
+                        </SelectTrigger>
+                        <SelectContent position="popper" className="z-50">
+                          <SelectItem value="all">All Time</SelectItem>
+                          <SelectItem value="weekly">Weekly</SelectItem>
+                          <SelectItem value="biweekly">Biweekly</SelectItem>
+                          <SelectItem value="monthly">Monthly</SelectItem>
+                          <SelectItem value="quarterly">Quarterly</SelectItem>
+                          <SelectItem value="yearly">Yearly</SelectItem>
+                          <SelectItem value="custom">Custom</SelectItem>
+                        </SelectContent>
+                      </Select>
+
+                      {jobHoursPeriodType !== 'all' && jobHoursPeriodType !== 'custom' && (
+                        <Select value={jobHoursSelectedPeriod} onValueChange={setJobHoursSelectedPeriod}>
+                          <SelectTrigger className="w-[280px]">
+                            <SelectValue placeholder="Select period" />
+                          </SelectTrigger>
+                          <SelectContent position="popper" className="z-50">
+                            {jobHoursPeriodOptions.map((period) => (
+                              <SelectItem key={period.value} value={period.value}>
+                                {period.label}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      )}
+
+                      {jobHoursPeriodType !== 'all' && (
+                        <>
+                          <Input
+                            id="job-hours-start-date"
+                            type="date"
+                            value={jobHoursCustomStartDate}
+                            onChange={(e) => handleJobHoursStartDateChange(e.target.value)}
+                            aria-label="From date"
+                            className="w-[145px]"
+                          />
+                          <span className="text-muted-foreground text-sm">–</span>
+                          <Input
+                            id="job-hours-end-date"
+                            type="date"
+                            value={jobHoursCustomEndDate}
+                            onChange={(e) => handleJobHoursEndDateChange(e.target.value)}
+                            aria-label="To date"
+                            className="w-[145px]"
+                          />
+                        </>
+                      )}
+                    </div>
+                  </div>
+
+                  {jobHoursPeriodType !== 'all' &&
+                    jobHoursCustomStartDate &&
+                    jobHoursCustomEndDate &&
+                    jobHoursCustomStartDate > jobHoursCustomEndDate && (
+                      <p className="text-xs text-destructive">
+                        End date must be on or after the start date.
+                      </p>
+                    )}
+                </div>
+
                 <div className="flex items-end gap-4">
                   <div className="flex-1">
                     <Label htmlFor="job-select">Select Job</Label>
@@ -1651,11 +1861,19 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
                       <Clock className="w-12 h-12 mx-auto mb-4 text-muted-foreground" />
                       <p className="text-muted-foreground">
                         No time entries found for this job
+                        {jobHoursPeriodType !== 'all' && (
+                          <> in {getJobHoursPeriodLabel()}</>
+                        )}
                       </p>
                     </CardContent>
                   </Card>
                 ) : (
                   <>
+                    {jobHoursPeriodType !== 'all' && (
+                      <p className="text-sm text-muted-foreground">
+                        Showing hours for <span className="font-medium text-foreground">{getJobHoursPeriodLabel()}</span>
+                      </p>
+                    )}
                     {/* Summary Stats */}
                     <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                       <Card>
@@ -1720,8 +1938,8 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
                                     <th className="text-left p-2 font-semibold">Date</th>
                                     <th className="text-left p-2 font-semibold">Component</th>
                                     <th className="text-left p-2 font-semibold">Note</th>
-                                    <th className="text-left p-2 font-semibold w-20">Start</th>
-                                    <th className="text-left p-2 font-semibold w-20">End</th>
+                                    <th className="text-left p-2 font-semibold w-24">Start</th>
+                                    <th className="text-left p-2 font-semibold w-24">End</th>
                                     <th className="text-right p-2 font-semibold w-20">Hours</th>
                                   </tr>
                                 </thead>
@@ -1729,17 +1947,12 @@ export function PayrollDashboard({ embed = false }: PayrollDashboardProps) {
                                   {user.entries.map((entry: any, idx: number) => (
                                     <tr key={idx} className="border-b hover:bg-muted/20">
                                       <td className="p-2">{entry.date}</td>
-                                      <td className="p-2">
-                                        {entry.component}
-                                        {entry.isManual && (
-                                          <Badge variant="outline" className="ml-2 text-xs">Manual</Badge>
-                                        )}
-                                      </td>
+                                      <td className="p-2">{entry.component}</td>
                                       <td className="p-2 text-xs text-slate-600 max-w-[200px]">
                                         {entry.notes || '—'}
                                       </td>
-                                      <td className="p-2 font-mono text-xs">{entry.startTime}</td>
-                                      <td className="p-2 font-mono text-xs">{entry.endTime}</td>
+                                      <td className="p-2">{entry.startTime}</td>
+                                      <td className="p-2">{entry.endTime}</td>
                                       <td className="p-2 text-right font-bold text-primary">{entry.hours}</td>
                                     </tr>
                                   ))}

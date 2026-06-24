@@ -89,6 +89,8 @@ import {
   realignMisassignedSheetLineItems,
   sheetBelongsToQuote,
 } from '@/lib/proposalIsolation';
+import { remapMaterialBundleItemsForJob } from '@/lib/materialBundleRemap';
+import { syncMissingWorkingSheetsFromLocked } from '@/lib/materialWorkbookSheetSync';
 
 interface CustomFinancialRow {
   id: string;
@@ -452,6 +454,9 @@ function resolveSheetLaborForSection(
   sheetName?: string,
   materialSheets?: { id?: string; sheet_name?: string }[],
   breakdownSheets?: { sheetId?: string; id?: string; sheetName?: string; sheet_name?: string }[],
+  // Accumulated id→name map (e.g. sheetMetaById) so labor keyed to a sibling/locked
+  // workbook's sheet ids — not in the currently displayed set — can still resolve by name.
+  extraIdToName?: Record<string, string> | Map<string, string>,
 ): any | null {
   const sid = String(displaySheetId ?? '').trim();
   if (!sid) return null;
@@ -481,6 +486,15 @@ function resolveSheetLaborForSection(
       idToName.set(id, normalizeLaborSheetName(s?.sheetName ?? s?.sheet_name));
     }
   });
+  const extraEntries = extraIdToName
+    ? extraIdToName instanceof Map
+      ? extraIdToName.entries()
+      : Object.entries(extraIdToName)
+    : [];
+  for (const [id, name] of extraEntries) {
+    const key = String(id ?? '').trim();
+    if (key && !idToName.has(key)) idToName.set(key, normalizeLaborSheetName(name));
+  }
 
   let best: any = null;
   let bestTotal = 0;
@@ -490,7 +504,10 @@ function resolveSheetLaborForSection(
     const sourceId = String((lab as any).labor_source_sheet_id ?? (lab as any).sheet_id ?? '').trim();
     const keyName =
       idToName.get(sourceId) ??
-      idToName.get(String((lab as any).sheet_id ?? '').trim());
+      idToName.get(String((lab as any).sheet_id ?? '').trim()) ??
+      // Labor rows enriched at load time carry their own section name — last resort so
+      // labor still attaches even when neither key id is in any known sheet map.
+      normalizeLaborSheetName((lab as any).section_name);
     if (keyName !== targetName) continue;
     if (total > bestTotal) {
       bestTotal = total;
@@ -615,6 +632,9 @@ function remapLaborPayloadToDisplayedSheets(
       ...lab,
       sheet_id: sid,
       labor_source_sheet_id: sourceSid || sid,
+      // Stamp the resolved section name so labor still attaches by name if these keys
+      // ever fall out of the displayed set (locked vs working workbook clones).
+      section_name: s?.sheet_name ?? lab.section_name ?? null,
     };
     if (sourceSid !== sid) remapped.labor_mergetrusted = true;
     out[sid] = remapped;
@@ -641,11 +661,19 @@ function agentDebugLog(payload: {
   } catch {
     // ignore
   }
-  fetch('http://127.0.0.1:7264/ingest/38c719fd-41f2-436e-b178-2936be94ecc3', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '458a80' },
-    body: JSON.stringify(body),
-  }).catch(() => {});
+  // Dev only: post to the Vite dev middleware (/__debug/log → .cursor/debug-ca9250.log)
+  // so the trace can be read back from the workspace while diagnosing labor-load issues.
+  if (import.meta.env?.DEV) {
+    try {
+      fetch('/__debug/log', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ marker: 'LABORDBG', ...body }),
+      }).catch(() => {});
+    } catch {
+      // ignore
+    }
+  }
 }
 
 /**
@@ -1113,6 +1141,30 @@ function isWorkbookLaborCategoryName(name: unknown): boolean {
   );
 }
 
+/** Materials-panel sync sends `labor: 0` for empty Labor categories — ignore so DB sheet labor still shows after refresh. */
+function lookupSyncedCategoryBasePrice(
+  externalPriceLookup: Map<string, Record<string, number>>,
+  sheetIdForMatch: string,
+  sheetNameForMatch: string,
+  categoryName: unknown,
+): number | undefined {
+  const catKey = String(categoryName ?? '').trim().toLowerCase();
+  if (!catKey) return undefined;
+  const extBySheetId = externalPriceLookup.get(sheetIdForMatch);
+  if (extBySheetId && Object.prototype.hasOwnProperty.call(extBySheetId, catKey)) {
+    const v = Number(extBySheetId[catKey]) || 0;
+    if (isWorkbookLaborCategoryName(categoryName) && v === 0) return undefined;
+    return v;
+  }
+  const extBySheetName = externalPriceLookup.get(sheetNameForMatch);
+  if (extBySheetName && Object.prototype.hasOwnProperty.call(extBySheetName, catKey)) {
+    const v = Number(extBySheetName[catKey]) || 0;
+    if (isWorkbookLaborCategoryName(categoryName) && v === 0) return undefined;
+    return v;
+  }
+  return undefined;
+}
+
 type SheetCategoryBreakdown = {
   name: string;
   itemCount: number;
@@ -1383,6 +1435,7 @@ function SortableRow({
         sheet.sheetName ?? (sheet as any)?.sheet_name,
         materialSheets,
         materialsBreakdown?.sheetBreakdowns,
+        sheetMetaById,
       );
       const sheetLaborTotal = sheetLaborRow ? effectiveSheetLaborTotal(sheetLaborRow) : 0;
       
@@ -1417,16 +1470,13 @@ function SortableRow({
       const getCategoryBreakdownPrice = (cat: any) => {
         const catKey = normalizeCategoryName(cat?.name);
 
-        // Primary source-of-truth: structured external prices from right-panel Breakdown.
-        // Try matching by sheet ID first, then sheet name.
-        const extBySheetId = externalPriceLookup.get(sheetIdForMatch);
-        if (extBySheetId && Object.prototype.hasOwnProperty.call(extBySheetId, catKey)) {
-          return Number(extBySheetId[catKey]) || 0;
-        }
-        const extBySheetName = externalPriceLookup.get(sheetNameForMatch);
-        if (extBySheetName && Object.prototype.hasOwnProperty.call(extBySheetName, catKey)) {
-          return Number(extBySheetName[catKey]) || 0;
-        }
+        const synced = lookupSyncedCategoryBasePrice(
+          externalPriceLookup,
+          sheetIdForMatch,
+          sheetNameForMatch,
+          cat?.name,
+        );
+        if (synced !== undefined) return synced;
 
         // Fallback: compute from items in this category's own breakdown data.
         const itemsPrice = ((cat?.items || []) as any[]).reduce((sum: number, item: any) => {
@@ -1447,14 +1497,14 @@ function SortableRow({
       // When `externalPriceLookup` provides a category total, treat it as the base category price
       // so the per-category markup % always affects the section "Price" column.
       const getCategoryDisplayPrice = (cat: any) => {
-        const catKey = normalizeCategoryName(cat?.name);
-        const extBySheetId = externalPriceLookup.get(sheetIdForMatch);
-        if (extBySheetId && Object.prototype.hasOwnProperty.call(extBySheetId, catKey)) {
-          return { price: Number(extBySheetId[catKey]) || 0, isFinal: false };
-        }
-        const extBySheetName = externalPriceLookup.get(sheetNameForMatch);
-        if (extBySheetName && Object.prototype.hasOwnProperty.call(extBySheetName, catKey)) {
-          return { price: Number(extBySheetName[catKey]) || 0, isFinal: false };
+        const synced = lookupSyncedCategoryBasePrice(
+          externalPriceLookup,
+          sheetIdForMatch,
+          sheetNameForMatch,
+          cat?.name,
+        );
+        if (synced !== undefined) {
+          return { price: synced, isFinal: false };
         }
         return { price: getCategoryBreakdownPrice(cat), isFinal: false };
       };
@@ -5319,6 +5369,23 @@ export function JobFinancials({
     })();
   }, [quote?.id, materialsPanelActive, materialsWorkbookReady, materialsSyncGen, externalMaterialsWorkbookView?.workbookId, externalMaterialsWorkbookView?.status]);
 
+  // After the materials panel finishes loadWorkbook, recover sheet labor + line items (refresh race).
+  useEffect(() => {
+    const qid = quote?.id;
+    if (!qid || !materialsPanelActive || !materialsWorkbookReady) return;
+    let cancelled = false;
+    void (async () => {
+      await waitForProposalSwitchGate();
+      if (cancelled || quote?.id !== qid) return;
+      await refreshDisplayedSheetLaborFromDb(qid);
+      if (cancelled || quote?.id !== qid) return;
+      await refreshSheetSectionLineItemsForQuote(qid);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [quote?.id, materialsPanelActive, materialsWorkbookReady, materialsSyncGen]);
+
   // Always DB-fetch sheet labor for the active quote once breakdown sheet ids are known.
   useEffect(() => {
     const qid = quote?.id;
@@ -5733,7 +5800,17 @@ export function JobFinancials({
       lastSyncedControlledIdRef.current = controlledQuoteId;
       userSelectedQuoteIdRef.current = match.id;
       // #region agent log
-      fetch('http://127.0.0.1:7264/ingest/38c719fd-41f2-436e-b178-2936be94ecc3',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'458a80'},body:JSON.stringify({sessionId:'458a80',runId:'post-fix',hypothesisId:'H4-double-load',location:'JobFinancials.tsx:controlledQuoteSync',message:'controlled quote switch (load via quote effect)',data:{fromQuoteId:quote?.id??null,toQuoteId:controlledQuoteId,proposalNumber:(match as any)?.proposal_number??null},timestamp:Date.now()})}).catch(()=>{});
+      agentDebugLog({
+        runId: 'post-fix',
+        hypothesisId: 'H4-double-load',
+        location: 'JobFinancials.tsx:controlledQuoteSync',
+        message: 'controlled quote switch (load via quote effect)',
+        data: {
+          fromQuoteId: quote?.id ?? null,
+          toQuoteId: controlledQuoteId,
+          proposalNumber: (match as any)?.proposal_number ?? null,
+        },
+      });
       // #endregion
       setQuote(match);
     } else if (match && quote?.id === match.id) {
@@ -6090,7 +6167,7 @@ export function JobFinancials({
 
         const { data: wbStatuses, error: wbListErr } = await supabase
           .from('material_workbooks')
-          .select('id, status')
+          .select('id, status, version_number')
           .eq('quote_id', quoteId);
         if (wbListErr) {
           console.warn('ensureWorkingSnapshotFromLocked list:', wbListErr);
@@ -6099,7 +6176,26 @@ export function JobFinancials({
         const list = wbStatuses || [];
         const hasLocked = list.some((w: any) => w?.status === 'locked');
         const hasWorking = list.some((w: any) => w?.status === 'working');
-        if (!hasLocked || hasWorking) return;
+        if (!hasLocked) return;
+        if (hasWorking) {
+          const lockedRow = list
+            .filter((w: any) => w?.status === 'locked')
+            .sort((a: any, b: any) => (b.version_number ?? 0) - (a.version_number ?? 0))[0];
+          const workingRow = list
+            .filter((w: any) => w?.status === 'working')
+            .sort((a: any, b: any) => (b.version_number ?? 0) - (a.version_number ?? 0))[0];
+          if (lockedRow?.id && workingRow?.id) {
+            try {
+              await syncMissingWorkingSheetsFromLocked({
+                lockedWorkbookId: lockedRow.id,
+                workingWorkbookId: workingRow.id,
+              });
+            } catch (syncErr) {
+              console.warn('ensureWorkingSnapshotFromLocked sync sheets:', syncErr);
+            }
+          }
+          return;
+        }
 
         const { data: lockedFull, error: lockedFetchErr } = await fetchMaterialWorkbooksFullForQuote(quoteId);
         if (lockedFetchErr) {
@@ -6117,6 +6213,7 @@ export function JobFinancials({
           .limit(1)
           .maybeSingle();
         let nextWbVersion = (maxWbRow?.version_number ?? 0) + 1;
+        const contractCloneItemIdMap: Record<string, string> = {};
 
         for (const wb of lockedWorkbooks) {
           const {
@@ -6226,13 +6323,22 @@ export function JobFinancials({
               .slice()
               .sort((a: any, b: any) => (a.order_index ?? 0) - (b.order_index ?? 0));
             if (items.length) {
-              const { error: iErr } = await supabase.from('material_items').insert(
-                items.map(({ id: _id, sheet_id: _sid, created_at: _ca, updated_at: _ua, ...r }: any) => ({
-                  ...r,
-                  sheet_id: newSheet.id,
-                }))
-              );
+              const { data: insertedItems, error: iErr } = await supabase
+                .from('material_items')
+                .insert(
+                  items.map(({ id: _id, sheet_id: _sid, created_at: _ca, updated_at: _ua, ...r }: any) => ({
+                    ...r,
+                    sheet_id: newSheet.id,
+                  })),
+                )
+                .select('id');
               if (iErr) console.warn('ensureWorkingSnapshotFromLocked insert items:', iErr);
+              else {
+                items.forEach((oldItem: any, idx: number) => {
+                  const newId = insertedItems?.[idx]?.id;
+                  if (newId) contractCloneItemIdMap[oldItem.id] = newId;
+                });
+              }
             }
 
             const labor = sheet.material_sheet_labor || [];
@@ -6269,6 +6375,14 @@ export function JobFinancials({
                 .eq('id', newSid);
               if (cmpErr) console.warn('ensureWorkingSnapshotFromLocked compare_to_sheet_id:', cmpErr.message);
             }
+          }
+        }
+
+        if (job?.id && Object.keys(contractCloneItemIdMap).length > 0) {
+          try {
+            await remapMaterialBundleItemsForJob(job.id, contractCloneItemIdMap);
+          } catch (remapErr) {
+            console.warn('ensureWorkingSnapshotFromLocked remap bundles:', remapErr);
           }
         }
       };
@@ -8003,6 +8117,77 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
             }),
           );
           if (siErr) throw new Error(`Step 3 (insert sheet items): ${(siErr as { message?: string })?.message ?? String(siErr)}`);
+        }
+
+        // Sheet-linked labor/material line items sometimes live only on a SIBLING workbook
+        // of the source quote (e.g. labor saved to the locked snapshot but not the working
+        // copy that pickWorkbookForProposalClone selected). Carry those forward by section
+        // name — de-duplicated against what we already copied — so a new proposal inherits
+        // labor even when the source's data is split across its workbooks.
+        const clonedSourceWbId = String((sourceWorkbook as any)?.id ?? '').trim();
+        const nameToNewSheetId = new Map<string, string>();
+        const nameToNewWorkbookId = new Map<string, string>();
+        const nameToSectionName = new Map<string, string>();
+        Object.entries(sheetIdMap).forEach(([oldSid, newSid]) => {
+          const nm = normalizeLaborSheetName(oldSheetIdToSectionName[oldSid]);
+          if (nm && !nameToNewSheetId.has(nm)) {
+            nameToNewSheetId.set(nm, newSid);
+            const wbId = oldSheetIdToNewWorkbookId[oldSid];
+            if (wbId) nameToNewWorkbookId.set(nm, wbId);
+            const sn = oldSheetIdToSectionName[oldSid];
+            if (sn) nameToSectionName.set(nm, sn);
+          }
+        });
+        const dedupeKey = (newSheetId: string, it: any) =>
+          `${newSheetId}|${normalizeLaborSheetName(it?.description)}|${it?.item_type ?? 'material'}|${Number(it?.quantity) || 0}|${Number(it?.unit_cost) || 0}`;
+        const alreadyCopied = new Set<string>();
+        (sItems || []).forEach((it: any) => {
+          const oldSid = it?.sheet_id ? String(it.sheet_id) : null;
+          const newSid = oldSid ? (sheetIdMap[oldSid] ?? null) : null;
+          if (newSid) alreadyCopied.add(dedupeKey(newSid, it));
+        });
+        const siblingSheetIdToName = new Map<string, string>();
+        (oldWorkbooksFull || []).forEach((wb: any) => {
+          if (String(wb?.id ?? '').trim() === clonedSourceWbId) return;
+          ((wb?.material_sheets as any[]) || []).forEach((s: any) => {
+            const id = String(s?.id ?? '').trim();
+            const nm = normalizeLaborSheetName(s?.sheet_name);
+            if (id && nm) siblingSheetIdToName.set(id, nm);
+          });
+        });
+        const siblingSheetIds = Array.from(siblingSheetIdToName.keys());
+        if (siblingSheetIds.length > 0 && nameToNewSheetId.size > 0) {
+          const { data: sibItems } = await supabase
+            .from('custom_financial_row_items').select('*').in('sheet_id', siblingSheetIds).is('row_id', null);
+          const toInsert = (sibItems || []).filter((it: any) => {
+            const nm = siblingSheetIdToName.get(String(it?.sheet_id ?? '').trim());
+            const newSid = nm ? nameToNewSheetId.get(nm) : undefined;
+            if (!newSid) return false;
+            const key = dedupeKey(newSid, it);
+            if (alreadyCopied.has(key)) return false;
+            alreadyCopied.add(key);
+            return true;
+          });
+          if (toInsert.length > 0) {
+            const { error: sibErr } = await insertClonedRowItemsResilient(() =>
+              toInsert.map((it: any) => {
+                const nm = siblingSheetIdToName.get(String(it?.sheet_id ?? '').trim())!;
+                const newSid = nameToNewSheetId.get(nm)!;
+                return payloadForClonedLineItem(it as Record<string, unknown>, {
+                  row_id: null,
+                  sheet_id: newSid,
+                  quote_id: newQuoteId,
+                  workbook_id: nameToNewWorkbookId.get(nm) ?? null,
+                  section_name: nameToSectionName.get(nm) ?? null,
+                });
+              }),
+            );
+            if (sibErr) {
+              console.warn('Step 3 (sibling sheet items merge):', (sibErr as { message?: string })?.message ?? sibErr);
+            } else {
+              console.log(`✅ Step 3b — carried ${toInsert.length} sheet line item(s) forward from sibling workbook(s)`);
+            }
+          }
         }
       }
       console.log(`✅ Step 3 — copied ${oldRows?.length ?? 0} financial rows`);
@@ -9995,7 +10180,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
         });
         lastMaterialsLaborTotalRef.current = laborMapTotal(sheetLaborLiveRef.current);
         if (targetQuoteId && !isFinancialLoadStale(cooperativeGen)) {
-          void refreshDisplayedSheetLaborFromDb(targetQuoteId, displayedSheetRefs);
+          await refreshDisplayedSheetLaborFromDb(targetQuoteId, displayedSheetRefs);
         }
       } else if (laborMapTotal(finalLaborPayload) === 0) {
         agentDebugLog({
@@ -10012,7 +10197,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
         });
         lastMaterialsLaborTotalRef.current = laborMapTotal(sheetLaborLiveRef.current);
         if (targetQuoteId && !isFinancialLoadStale(cooperativeGen)) {
-          void refreshDisplayedSheetLaborFromDb(targetQuoteId, displayedSheetRefs);
+          await refreshDisplayedSheetLaborFromDb(targetQuoteId, displayedSheetRefs);
         }
       } else {
         setSheetLabor((prev) => {
@@ -13865,17 +14050,16 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
       breakdownCategories.map((cat: any) => [normalizeCategoryName(cat?.name), Number(cat?.totalPrice) || 0])
     );
 
-    const getCategoryBreakdownPrice = (cat: any) => {
-      const catKey = normalizeCategoryName(cat?.name);
-      const extBySheetId = externalPriceLookup.get(sheetIdForMatch);
-      if (extBySheetId && Object.prototype.hasOwnProperty.call(extBySheetId, catKey)) {
-        return Number(extBySheetId[catKey]) || 0;
-      }
-      const extBySheetName = externalPriceLookup.get(sheetNameForMatch);
-      if (extBySheetName && Object.prototype.hasOwnProperty.call(extBySheetName, catKey)) {
-        return Number(extBySheetName[catKey]) || 0;
-      }
-      const itemsPrice = ((cat?.items || []) as any[]).reduce((sum: number, item: any) => {
+      const getCategoryBreakdownPrice = (cat: any) => {
+        const catKey = normalizeCategoryName(cat?.name);
+        const synced = lookupSyncedCategoryBasePrice(
+          externalPriceLookup,
+          sheetIdForMatch,
+          sheetNameForMatch,
+          cat?.name,
+        );
+        if (synced !== undefined) return synced;
+        const itemsPrice = ((cat?.items || []) as any[]).reduce((sum: number, item: any) => {
         if (item?.extended_price != null && item.extended_price !== '') {
           return sum + (Number(item.extended_price) || 0);
         }
@@ -13898,18 +14082,18 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
     };
 
     // If the Breakdown panel provides a category total, treat it as the base price so category markup applies.
-    const getCategoryDisplayPrice = (cat: any) => {
-      const catKey = normalizeCategoryName(cat?.name);
-      const extBySheetId = externalPriceLookup.get(sheetIdForMatch);
-      if (extBySheetId && Object.prototype.hasOwnProperty.call(extBySheetId, catKey)) {
-        return { price: Number(extBySheetId[catKey]) || 0, isFinal: false };
-      }
-      const extBySheetName = externalPriceLookup.get(sheetNameForMatch);
-      if (extBySheetName && Object.prototype.hasOwnProperty.call(extBySheetName, catKey)) {
-        return { price: Number(extBySheetName[catKey]) || 0, isFinal: false };
-      }
-      return { price: getCategoryBreakdownPrice(cat), isFinal: false };
-    };
+      const getCategoryDisplayPrice = (cat: any) => {
+        const synced = lookupSyncedCategoryBasePrice(
+          externalPriceLookup,
+          sheetIdForMatch,
+          sheetNameForMatch,
+          cat?.name,
+        );
+        if (synced !== undefined) {
+          return { price: synced, isFinal: false };
+        }
+        return { price: getCategoryBreakdownPrice(cat), isFinal: false };
+      };
 
     let materials = 0;
     let labor = 0;
@@ -14126,6 +14310,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
         bdForSheet?.sheetName ?? msForSheet?.sheet_name,
         materialSheets,
         materialsBreakdown.sheetBreakdowns,
+        sheetMetaById,
       );
       return row ? effectiveSheetLaborTotal(row) : 0;
     })();

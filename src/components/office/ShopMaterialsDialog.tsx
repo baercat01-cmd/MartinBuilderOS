@@ -13,6 +13,10 @@ import { TrimDrawingPreview, type LineSegment } from '@/components/office/TrimDr
 import { Package, ArrowRight, ChevronDown, ChevronRight, FileSpreadsheet, Pencil } from 'lucide-react';
 import { toast } from 'sonner';
 import {
+  dispatchMaterialItemStatusUpdated,
+  updateMaterialItemStatus,
+} from '@/lib/materialPackageStatus';
+import {
   Select,
   SelectContent,
   SelectItem,
@@ -291,17 +295,27 @@ export function ShopMaterialsDialog({ open, onClose, onJobSelect }: ShopMaterial
     }
   }
 
+  function findJobIdForMaterial(materialId: string): string | undefined {
+    for (const pkg of [...packages, ...sheetGroups]) {
+      if (pkg.bundle_items.some((bi) => bi.material_items.id === materialId)) {
+        return pkg.job_id;
+      }
+    }
+    return undefined;
+  }
+
   async function updateMaterialStatus(materialId: string, newStatus: string) {
     try {
-      const { error } = await supabase
-        .from('material_items')
-        .update({ 
-          status: newStatus,
-          updated_at: new Date().toISOString()
-        })
-        .eq('id', materialId);
+      const jobId = findJobIdForMaterial(materialId);
+      const { packageIds, packageStatuses } = await updateMaterialItemStatus(supabase, materialId, newStatus);
 
-      if (error) throw error;
+      dispatchMaterialItemStatusUpdated({
+        jobId,
+        materialItemIds: [materialId],
+        newStatus,
+        packageIds,
+        packageStatuses,
+      });
 
       toast.success('Material status updated');
       loadMaterials();

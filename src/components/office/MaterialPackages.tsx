@@ -1,5 +1,18 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { supabase } from '@/lib/supabase';
+import {
+  buildLockedToWorkingItemIdMap,
+  bundleContainsEquivalentMaterial,
+  dedupeMaterialBundleItemsForJob,
+  remapMaterialBundleItemsForQuote,
+  resolveJobWorkbookIdForQuote,
+} from '@/lib/materialBundleRemap';
+import {
+  dispatchMaterialPackageStatusUpdated,
+  MATERIAL_ITEM_STATUS_UPDATED_EVENT,
+  syncMaterialsToPackageStatus,
+  updatePackageStatusAndMaterials,
+} from '@/lib/materialPackageStatus';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -108,17 +121,23 @@ interface MaterialSheet {
 interface MaterialPackagesProps {
   jobId: string;
   userId: string;
-  workbook?: MaterialWorkbook | null;
+  /** Active proposal quote — scopes the job workbook (working row) for this contract. */
+  quoteId?: string | null;
+  /** When set, load materials from this exact workbook (the manage-tab job workbook). */
+  sourceWorkbookId?: string | null;
   job?: Job;
 }
 
-export function MaterialPackages({ jobId, userId, workbook, job }: MaterialPackagesProps) {
+export function MaterialPackages({ jobId, userId, quoteId = null, sourceWorkbookId = null, job }: MaterialPackagesProps) {
   const [showZohoOrderDialog, setShowZohoOrderDialog] = useState(false);
   const [selectedPackageForOrder, setSelectedPackageForOrder] = useState<MaterialBundle | null>(null);
   const [selectedMaterialsForOrder, setSelectedMaterialsForOrder] = useState<MaterialItem[]>([]);
   const [metalCatalogForZoho, setMetalCatalogForZoho] = useState<MetalCatalogBySku>({});
   const [packages, setPackages] = useState<MaterialBundle[]>([]);
   const [availableMaterials, setAvailableMaterials] = useState<MaterialItem[]>([]);
+  const [jobWorkbook, setJobWorkbook] = useState<MaterialWorkbook | null>(null);
+  const [jobWorkbookLoading, setJobWorkbookLoading] = useState(true);
+  const [proposalToJobItemIdMap, setProposalToJobItemIdMap] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(true);
   const [activeView, setActiveView] = useState<'list' | 'add'>('list');
   const [selectedPackageForAdd, setSelectedPackageForAdd] = useState<string>('');
@@ -136,14 +155,15 @@ export function MaterialPackages({ jobId, userId, workbook, job }: MaterialPacka
   const [saving, setSaving] = useState(false);
 
   function openZohoOrderDialog(pkg: MaterialBundle) {
-    if (pkg.bundle_items.length === 0) {
-      toast.error('This package has no materials to order');
+    const jobItems = bundleItemsOnJobWorkbook(pkg);
+    if (jobItems.length === 0) {
+      toast.error('This package has no materials on the job workbook to order');
       return;
     }
     
     // Only exclude materials that have BOTH SO and PO
     // Materials with only one type of order can still be ordered (to add the other type)
-    const orderableMaterials = pkg.bundle_items.filter(item => 
+    const orderableMaterials = jobItems.filter(item => 
       !item.material_items.zoho_sales_order_id || !item.material_items.zoho_purchase_order_id
     );
     
@@ -152,8 +172,8 @@ export function MaterialPackages({ jobId, userId, workbook, job }: MaterialPacka
       return;
     }
     
-    if (orderableMaterials.length < pkg.bundle_items.length) {
-      const fullyOrderedCount = pkg.bundle_items.length - orderableMaterials.length;
+    if (orderableMaterials.length < jobItems.length) {
+      const fullyOrderedCount = jobItems.length - orderableMaterials.length;
       toast.warning(
         `${fullyOrderedCount} material${fullyOrderedCount !== 1 ? 's' : ''} with both SO & PO will be excluded`
       );
@@ -186,16 +206,10 @@ export function MaterialPackages({ jobId, userId, workbook, job }: MaterialPacka
 
   useEffect(() => {
     loadPackages();
-    loadAvailableMaterials();
+    loadJobWorkbookMaterials();
 
-    // Set initial sheet if workbook is available
-    if (workbook && workbook.sheets.length > 0 && !selectedSheetId) {
-      setSelectedSheetId(workbook.sheets[0].id);
-    }
-
-    // Subscribe to changes
     const bundlesChannel = supabase
-      .channel('material_bundles_changes')
+      .channel(`material_packages_bundles_${jobId}`)
       .on('postgres_changes',
         { event: '*', schema: 'public', table: 'material_bundles', filter: `job_id=eq.${jobId}` },
         () => {
@@ -205,7 +219,7 @@ export function MaterialPackages({ jobId, userId, workbook, job }: MaterialPacka
       .subscribe();
 
     const itemsChannel = supabase
-      .channel('material_bundle_items_changes')
+      .channel(`material_packages_bundle_items_${jobId}`)
       .on('postgres_changes',
         { event: '*', schema: 'public', table: 'material_bundle_items' },
         () => {
@@ -214,11 +228,59 @@ export function MaterialPackages({ jobId, userId, workbook, job }: MaterialPacka
       )
       .subscribe();
 
+    const onWorkbookUpdated = (e: Event) => {
+      const detail = (e as CustomEvent<{ jobId?: string; quoteId?: string | null }>).detail;
+      if (!detail || detail.jobId !== jobId) return;
+      if (quoteId != null && detail.quoteId != null && detail.quoteId !== quoteId) return;
+      void loadJobWorkbookMaterials();
+      void loadPackages();
+    };
+    const onItemStatusUpdated = (e: Event) => {
+      const detail = (e as CustomEvent<{
+        jobId?: string | null;
+        materialItemIds: string[];
+        newStatus: string;
+        packageStatuses?: Record<string, string>;
+      }>).detail;
+      if (!detail || (detail.jobId && detail.jobId !== jobId)) return;
+
+      if (detail.packageStatuses && Object.keys(detail.packageStatuses).length) {
+        setPackages((prev) =>
+          prev.map((pkg) =>
+            detail.packageStatuses![pkg.id]
+              ? { ...pkg, status: detail.packageStatuses![pkg.id]! }
+              : pkg,
+          ),
+        );
+      } else {
+        void loadPackages();
+      }
+    };
+    window.addEventListener(MATERIAL_ITEM_STATUS_UPDATED_EVENT, onItemStatusUpdated as EventListener);
+    window.addEventListener('materials-workbook-updated', onWorkbookUpdated as EventListener);
+
     return () => {
       supabase.removeChannel(bundlesChannel);
       supabase.removeChannel(itemsChannel);
+      window.removeEventListener(MATERIAL_ITEM_STATUS_UPDATED_EVENT, onItemStatusUpdated as EventListener);
+      window.removeEventListener('materials-workbook-updated', onWorkbookUpdated as EventListener);
     };
-  }, [jobId, workbook]);
+  }, [jobId, quoteId, sourceWorkbookId]);
+
+  useEffect(() => {
+    if (activeView === 'add') {
+      void loadJobWorkbookMaterials();
+      void loadPackages();
+    }
+  }, [activeView]);
+
+  useEffect(() => {
+    if (!jobWorkbook?.sheets?.length) return;
+    const stillValid = jobWorkbook.sheets.some((s) => s.id === selectedSheetId);
+    if (!stillValid) {
+      setSelectedSheetId(jobWorkbook.sheets[0]!.id);
+    }
+  }, [jobWorkbook?.id, jobWorkbook?.sheets, selectedSheetId]);
 
   useEffect(() => {
     if (!showZohoOrderDialog || selectedMaterialsForOrder.length === 0) {
@@ -274,6 +336,17 @@ export function MaterialPackages({ jobId, userId, workbook, job }: MaterialPacka
   async function loadPackages() {
     try {
       setLoading(true);
+
+      if (quoteId) {
+        try {
+          const workbookId =
+            sourceWorkbookId ??
+            (await resolveJobWorkbookIdForQuote(jobId, quoteId, { allowLegacyNullQuote: true }));
+          await dedupeMaterialBundleItemsForJob(jobId, { quoteId, jobWorkbookId: workbookId });
+        } catch (dedupeErr) {
+          console.warn('MaterialPackages dedupe:', dedupeErr);
+        }
+      }
       
       const { data, error } = await supabase
         .from('material_bundles')
@@ -324,49 +397,80 @@ export function MaterialPackages({ jobId, userId, workbook, job }: MaterialPacka
     }
   }
 
-  async function loadAvailableMaterials() {
+  async function loadJobWorkbookMaterials() {
+    setJobWorkbookLoading(true);
     try {
-      // Get working workbook
-      const { data: workbookData } = await supabase
-        .from('material_workbooks')
-        .select('id')
-        .eq('job_id', jobId)
-        .eq('status', 'working')
-        .maybeSingle();
+      if (quoteId) {
+        try {
+          await remapMaterialBundleItemsForQuote(jobId, quoteId);
+          const map = await buildLockedToWorkingItemIdMap(jobId, quoteId);
+          setProposalToJobItemIdMap(map);
+        } catch (remapErr) {
+          console.warn('MaterialPackages remap/map:', remapErr);
+        }
+      } else {
+        setProposalToJobItemIdMap({});
+      }
 
-      if (!workbookData) return;
+      const workbookId =
+        sourceWorkbookId ??
+        (await resolveJobWorkbookIdForQuote(jobId, quoteId, {
+          allowLegacyNullQuote: true,
+        }));
+      if (!workbookId) {
+        setJobWorkbook(null);
+        setAvailableMaterials([]);
+        return;
+      }
 
-      // Get all sheets
       const { data: sheetsData } = await supabase
         .from('material_sheets')
-        .select('id, sheet_name')
-        .eq('workbook_id', workbookData.id);
+        .select('id, sheet_name, workbook_id, order_index')
+        .eq('workbook_id', workbookId)
+        .order('order_index');
 
-      if (!sheetsData) return;
+      if (!sheetsData?.length) {
+        setJobWorkbook({ id: workbookId, job_id: jobId, sheets: [] });
+        setAvailableMaterials([]);
+        return;
+      }
 
-      const sheetIds = sheetsData.map(s => s.id);
-
-      // Get all material items
+      const sheetIds = sheetsData.map((s) => s.id);
       const { data: itemsData } = await supabase
         .from('material_items')
         .select('id, sheet_id, category, material_name, quantity, length, color, usage, sku, cost_per_unit, price_per_unit, extended_cost, extended_price, zoho_sales_order_id, zoho_sales_order_number, zoho_purchase_order_id, zoho_purchase_order_number, ordered_at')
         .in('sheet_id', sheetIds)
         .order('material_name');
 
-      if (!itemsData) return;
-
-      const materials = itemsData.map(item => {
-        const sheet = sheetsData.find(s => s.id === item.sheet_id);
+      const materials = (itemsData || []).map((item) => {
+        const sheet = sheetsData.find((s) => s.id === item.sheet_id);
         return {
           ...item,
           sheets: { sheet_name: sheet?.sheet_name || 'Unknown' },
         };
       });
 
+      const sheets: MaterialSheet[] = sheetsData.map((sheet) => ({
+        id: sheet.id,
+        workbook_id: sheet.workbook_id,
+        sheet_name: sheet.sheet_name,
+        items: materials.filter((m) => m.sheet_id === sheet.id),
+      }));
+
+      setJobWorkbook({ id: workbookId, job_id: jobId, sheets });
       setAvailableMaterials(materials);
+      await loadPackages();
     } catch (error: any) {
-      console.error('Error loading materials:', error);
+      console.error('Error loading job workbook materials:', error);
+      setJobWorkbook(null);
+      setAvailableMaterials([]);
+    } finally {
+      setJobWorkbookLoading(false);
     }
+  }
+
+  async function loadAvailableMaterials() {
+    await loadJobWorkbookMaterials();
   }
 
   function openCreateDialog() {
@@ -445,6 +549,12 @@ export function MaterialPackages({ jobId, userId, workbook, job }: MaterialPacka
           throw itemsError;
         }
 
+        await syncMaterialsToPackageStatus(
+          supabase,
+          Array.from(selectedMaterialIds),
+          bundleData.status ?? 'not_ordered',
+        );
+
         console.log('Materials added to package successfully');
       }
 
@@ -513,7 +623,18 @@ export function MaterialPackages({ jobId, userId, workbook, job }: MaterialPacka
 
       // Add new materials
       if (toAdd.length > 0) {
-        const bundleItems = toAdd.map(materialId => ({
+        const uniqueToAdd: string[] = [];
+        for (const materialId of toAdd) {
+          const already = await bundleContainsEquivalentMaterial(
+            selectedPackage.id,
+            materialId,
+            proposalToJobItemIdMap,
+          );
+          if (!already) uniqueToAdd.push(materialId);
+        }
+
+        if (uniqueToAdd.length > 0) {
+        const bundleItems = uniqueToAdd.map(materialId => ({
           bundle_id: selectedPackage.id,
           material_item_id: materialId,
         }));
@@ -523,6 +644,13 @@ export function MaterialPackages({ jobId, userId, workbook, job }: MaterialPacka
           .insert(bundleItems);
 
         if (addError) throw addError;
+
+        await syncMaterialsToPackageStatus(
+          supabase,
+          uniqueToAdd,
+          selectedPackage.status ?? 'not_ordered',
+        );
+        }
       }
 
       // Remove materials
@@ -558,25 +686,6 @@ export function MaterialPackages({ jobId, userId, workbook, job }: MaterialPacka
           : pkg
       ));
       
-      // Update bundle status (no mapping needed - DB uses same values as UI)
-      const { error: bundleError } = await supabase
-        .from('material_bundles')
-        .update({
-          status: newStatus,
-          updated_at: new Date().toISOString(),
-        })
-        .eq('id', packageId);
-
-      if (bundleError) {
-        console.error('Error updating bundle status:', bundleError);
-        // Revert optimistic update on error
-        await loadPackages();
-        throw bundleError;
-      }
-
-      console.log('Bundle status updated successfully');
-
-      // Get all material items in this bundle
       const { data: bundleItems, error: itemsError } = await supabase
         .from('material_bundle_items')
         .select('material_item_id')
@@ -587,36 +696,25 @@ export function MaterialPackages({ jobId, userId, workbook, job }: MaterialPacka
         throw itemsError;
       }
 
-      console.log('Found bundle items:', bundleItems?.length || 0);
+      const materialItemIds = (bundleItems ?? []).map((item) => item.material_item_id);
 
-      // Update all material items to match the bundle status
-      if (bundleItems && bundleItems.length > 0) {
-        const materialItemIds = bundleItems.map(item => item.material_item_id);
-        
-        console.log('Updating material items:', materialItemIds);
-        
-        const { error: updateError } = await supabase
-          .from('material_items')
-          .update({
-            status: newStatus,
-            updated_at: new Date().toISOString(),
-          })
-          .in('id', materialItemIds);
+      await updatePackageStatusAndMaterials(supabase, packageId, newStatus, materialItemIds);
 
-        if (updateError) {
-          console.error('Error updating material items:', updateError);
-          throw updateError;
-        }
-        
-        console.log('Material items updated successfully');
-        
-        toast.success(`Package status updated - ${bundleItems.length} material${bundleItems.length !== 1 ? 's' : ''} updated in workbook`);
+      dispatchMaterialPackageStatusUpdated({
+        packageId,
+        newStatus,
+        materialItemIds,
+      });
+
+      if (materialItemIds.length > 0) {
+        toast.success(`Package status updated - ${materialItemIds.length} material${materialItemIds.length !== 1 ? 's' : ''} updated in workbook`);
       } else {
         toast.success('Package status updated (no materials in package)');
       }
     } catch (error: any) {
       console.error('Error updating package status:', error);
       toast.error(`Failed to update status: ${error.message || 'Unknown error'}`);
+      await loadPackages();
     }
   }
 
@@ -733,10 +831,17 @@ export function MaterialPackages({ jobId, userId, workbook, job }: MaterialPacka
     setExpandedPackages(newSet);
   }
 
-  function isMaterialInPackage(materialId: string): boolean {
-    if (!selectedPackageForAdd) return false;
-    const pkg = packages.find(p => p.id === selectedPackageForAdd);
-    return pkg?.bundle_items?.some(item => item.material_item_id === materialId) || false;
+  function openAddMaterialsForPackage(packageId: string) {
+    if (!jobWorkbook) {
+      toast.error('Job workbook is not loaded yet. Try again in a moment.');
+      void loadJobWorkbookMaterials();
+      return;
+    }
+    setSelectedPackageForAdd(packageId);
+    setSelectedMaterialIds(new Set());
+    setExpandedPackages((prev) => new Set(prev).add(packageId));
+    void loadJobWorkbookMaterials();
+    setActiveView('add');
   }
 
   async function addSelectedMaterialsToPackage() {
@@ -770,8 +875,24 @@ export function MaterialPackages({ jobId, userId, workbook, job }: MaterialPacka
         return;
       }
 
+      const uniqueToAdd: string[] = [];
+      for (const materialId of materialsToAdd) {
+        const already = await bundleContainsEquivalentMaterial(
+          selectedPackageForAdd,
+          materialId,
+          proposalToJobItemIdMap,
+        );
+        if (!already) uniqueToAdd.push(materialId);
+      }
+
+      if (uniqueToAdd.length === 0) {
+        toast.error('All selected materials are already in this package');
+        setSaving(false);
+        return;
+      }
+
       // Add materials to package
-      const bundleItems = materialsToAdd.map(materialId => ({
+      const bundleItems = uniqueToAdd.map(materialId => ({
         bundle_id: selectedPackageForAdd,
         material_item_id: materialId,
       }));
@@ -782,7 +903,10 @@ export function MaterialPackages({ jobId, userId, workbook, job }: MaterialPacka
 
       if (error) throw error;
 
-      toast.success(`Added ${materialsToAdd.length} material${materialsToAdd.length !== 1 ? 's' : ''} to package`);
+      const packageStatus = pkg?.status ?? 'not_ordered';
+      await syncMaterialsToPackageStatus(supabase, uniqueToAdd, packageStatus);
+
+      toast.success(`Added ${uniqueToAdd.length} material${uniqueToAdd.length !== 1 ? 's' : ''} to package`);
       setSelectedMaterialIds(new Set());
       setActiveView('list');
       loadPackages();
@@ -823,16 +947,141 @@ export function MaterialPackages({ jobId, userId, workbook, job }: MaterialPacka
     return Array.from(categoryMap.entries()).map(([category, items]) => ({ category, items }));
   };
 
-  if (loading) {
+  const packagesWorkbook = jobWorkbook;
+  const jobWorkbookItemIds = useMemo(
+    () => new Set(availableMaterials.map((m) => m.id)),
+    [availableMaterials],
+  );
+
+  function bundleItemsOnJobWorkbook(pkg: MaterialBundle): BundleItem[] {
+    const items = pkg.bundle_items ?? [];
+    const filtered =
+      jobWorkbookItemIds.size === 0
+        ? items
+        : items.filter((bi) => jobWorkbookItemIds.has(bi.material_item_id));
+
+    const seenMaterialIds = new Set<string>();
+    const seenFingerprints = new Set<string>();
+    return filtered.filter((bi) => {
+      if (seenMaterialIds.has(bi.material_item_id)) return false;
+      seenMaterialIds.add(bi.material_item_id);
+      const mi = bi.material_items;
+      if (!mi) return true;
+      const fp = [
+        mi.sheets?.sheet_name ?? '',
+        mi.material_name ?? '',
+        mi.sku ?? '',
+        mi.quantity ?? 0,
+        mi.usage ?? '',
+        mi.length ?? '',
+      ].join('|');
+      if (seenFingerprints.has(fp)) return false;
+      seenFingerprints.add(fp);
+      return true;
+    });
+  }
+
+  const materialPackageNamesByItemId = useMemo(() => {
+    const map = new Map<string, string[]>();
+    const displayedIds = new Set(availableMaterials.map((m) => m.id));
+
+    for (const pkg of packages) {
+      for (const bundleItem of pkg.bundle_items ?? []) {
+        let materialId = bundleItem.material_item_id as string | undefined;
+        if (!materialId) continue;
+        if (!displayedIds.has(materialId) && proposalToJobItemIdMap[materialId]) {
+          materialId = proposalToJobItemIdMap[materialId];
+        }
+        if (!displayedIds.has(materialId)) continue;
+        const names = map.get(materialId) ?? [];
+        names.push(pkg.name);
+        map.set(materialId, names);
+      }
+    }
+    return map;
+  }, [packages, availableMaterials, proposalToJobItemIdMap]);
+
+  function getMaterialPackageNames(materialId: string): string[] {
+    return materialPackageNamesByItemId.get(materialId) ?? [];
+  }
+
+  function formatMaterialPackageLabel(names: string[]): string {
+    if (names.length === 0) return '';
+    if (names.length === 1) return names[0]!;
+    return `${names[0]} +${names.length - 1}`;
+  }
+
+  function isMaterialInPackage(materialId: string): boolean {
+    if (!selectedPackageForAdd) return false;
+    const pkg = packages.find((p) => p.id === selectedPackageForAdd);
+    if (!pkg) return false;
+    return bundleItemsOnJobWorkbook(pkg).some((item) => item.material_item_id === materialId);
+  }
+
+  function scrollToPackageSheet(sheetId: string) {
+    setSelectedSheetId(sheetId);
+    document.getElementById(`package-sheet-${sheetId}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+
+  function renderMaterialPickerRow(item: MaterialItem) {
+    const packageNames = getMaterialPackageNames(item.id);
+    const isInSelectedPackage = isMaterialInPackage(item.id);
+    const isSelected = selectedMaterialIds.has(item.id);
+
     return (
-      <div className="text-center py-8">
-        <div className="w-8 h-8 border-4 border-primary border-t-transparent rounded-full animate-spin mx-auto mb-4" />
-        <p className="text-muted-foreground">Loading packages...</p>
+      <div
+        key={item.id}
+        className={`p-3 flex items-center gap-3 cursor-pointer transition-colors ${
+          isInSelectedPackage
+            ? 'bg-green-50 opacity-60'
+            : isSelected
+            ? 'bg-blue-50 border-l-4 border-blue-600'
+            : 'hover:bg-slate-50'
+        }`}
+        onClick={() => !isInSelectedPackage && toggleMaterialSelection(item.id)}
+      >
+        <div className="flex items-center justify-center w-6 h-6">
+          {isInSelectedPackage ? (
+            <CheckSquare className="w-5 h-5 text-green-600" />
+          ) : isSelected ? (
+            <CheckSquare className="w-5 h-5 text-blue-600" />
+          ) : (
+            <Square className="w-5 h-5 text-slate-400" />
+          )}
+        </div>
+        <div className="flex-1">
+          <div className="font-medium flex items-center gap-2 flex-wrap">
+            {item.material_name}
+            {isInSelectedPackage && (
+              <Badge variant="outline" className="bg-green-100 text-green-800 border-green-300">
+                In this package
+              </Badge>
+            )}
+            {packageNames.map((pkgName) => (
+              <Badge
+                key={`${item.id}-${pkgName}`}
+                variant="outline"
+                className="bg-indigo-50 text-indigo-800 border-indigo-300 font-semibold"
+              >
+                <Package className="w-3 h-3 mr-1" />
+                {pkgName}
+              </Badge>
+            ))}
+          </div>
+          <div className="text-sm text-muted-foreground mt-1">
+            {item.sku && <span className="font-mono">{item.sku} • </span>}
+            {item.usage && <span>{item.usage} • </span>}
+            Qty: {item.quantity}
+            {item.length && ` • ${item.length}`}
+            {item.cost_per_unit != null && ` • $${Number(item.cost_per_unit).toFixed(2)}`}
+          </div>
+        </div>
       </div>
     );
   }
 
-  // Group materials by sheet for create/edit dialogs
+  const sheetsWithMaterials = packagesWorkbook?.sheets.filter((s) => s.items.length > 0) ?? [];
+
   const materialsBySheet = availableMaterials.reduce((acc, material) => {
     const sheetName = material.sheets.sheet_name;
     if (!acc[sheetName]) {
@@ -842,11 +1091,33 @@ export function MaterialPackages({ jobId, userId, workbook, job }: MaterialPacka
     return acc;
   }, {} as Record<string, MaterialItem[]>);
 
-  const currentSheet = workbook?.sheets.find(s => s.id === selectedSheetId);
-  const categoryGroups = currentSheet ? groupByCategory(currentSheet.items) : [];
+  if (loading || jobWorkbookLoading) {
+    return (
+      <div className="text-center py-8">
+        <div className="w-8 h-8 border-4 border-primary border-t-transparent rounded-full animate-spin mx-auto mb-4" />
+        <p className="text-muted-foreground">Loading packages and job workbook…</p>
+      </div>
+    );
+  }
+
+  if (!packagesWorkbook) {
+    return (
+      <div className="max-w-3xl mx-auto space-y-4 px-4">
+        <div>
+          <h3 className="text-lg font-semibold flex items-center gap-2">
+            <Package className="w-5 h-5" />
+            Material Packages
+          </h3>
+          <p className="text-sm text-muted-foreground mt-2">
+            Packages use the job workbook (working copy). Open the Workbook tab and create a job workbook from the proposal, or wait for it to finish preparing after contract sign.
+          </p>
+        </div>
+      </div>
+    );
+  }
 
   return (
-    <div className="max-w-6xl mx-auto space-y-4 px-4">
+    <div className="max-w-3xl mx-auto space-y-4 px-4">
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
@@ -855,7 +1126,13 @@ export function MaterialPackages({ jobId, userId, workbook, job }: MaterialPacka
             Material Packages
           </h3>
           <p className="text-sm text-muted-foreground">
-            Bundle materials together for easier tracking
+            Bundle materials from the job workbook (working copy) for shop tracking and orders.
+            {packagesWorkbook && (
+              <span className="block mt-1 text-xs">
+                Using job workbook — {sheetsWithMaterials.length} sheet{sheetsWithMaterials.length !== 1 ? 's' : ''},{' '}
+                {availableMaterials.length} material lines
+              </span>
+            )}
           </p>
         </div>
         <div className="flex gap-2">
@@ -869,8 +1146,8 @@ export function MaterialPackages({ jobId, userId, workbook, job }: MaterialPacka
               Back to Packages
             </Button>
           )}
-          {activeView === 'list' && packages.length > 0 && workbook && (
-            <Button onClick={() => setActiveView('add')} variant="outline">
+          {activeView === 'list' && packages.length > 0 && packagesWorkbook && (
+            <Button onClick={() => { void loadJobWorkbookMaterials(); setActiveView('add'); }} variant="outline">
               <Plus className="w-4 h-4 mr-2" />
               Add Materials to Package
             </Button>
@@ -883,7 +1160,7 @@ export function MaterialPackages({ jobId, userId, workbook, job }: MaterialPacka
       </div>
 
       {/* Add Materials View */}
-      {activeView === 'add' && workbook && (
+      {activeView === 'add' && packagesWorkbook && (
         <Card className="border-2">
           <CardHeader className="pb-3 border-b bg-gradient-to-r from-blue-50 to-blue-100">
             <div className="space-y-3">
@@ -933,92 +1210,68 @@ export function MaterialPackages({ jobId, userId, workbook, job }: MaterialPacka
           </CardHeader>
           {selectedPackageForAdd && (
             <CardContent className="p-0">
-              <div className="bg-gradient-to-r from-slate-100 to-slate-50 border-b-2">
-                <div className="flex items-center gap-1 overflow-x-auto px-2 py-1">
-                  {workbook.sheets.map((sheet) => (
-                    <Button
-                      key={sheet.id}
-                      variant={selectedSheetId === sheet.id ? 'default' : 'ghost'}
-                      size="sm"
-                      onClick={() => setSelectedSheetId(sheet.id)}
-                      className={`flex items-center gap-2 min-w-[140px] justify-start font-semibold ${
-                        selectedSheetId === sheet.id ? 'bg-white shadow-md border-2 border-primary' : 'hover:bg-white/50'
-                      }`}
-                    >
-                      {sheet.sheet_name}
-                      <Badge variant="secondary" className="ml-auto text-xs">
-                        {sheet.items.length}
-                      </Badge>
-                    </Button>
-                  ))}
+              {sheetsWithMaterials.length > 1 && (
+                <div className="bg-gradient-to-r from-slate-100 to-slate-50 border-b-2 sticky top-0 z-20">
+                  <div className="flex items-center gap-1 overflow-x-auto px-2 py-1">
+                    {sheetsWithMaterials.map((sheet) => (
+                      <Button
+                        key={sheet.id}
+                        variant={selectedSheetId === sheet.id ? 'default' : 'ghost'}
+                        size="sm"
+                        onClick={() => scrollToPackageSheet(sheet.id)}
+                        className={`flex items-center gap-2 min-w-[140px] justify-start font-semibold ${
+                          selectedSheetId === sheet.id ? 'bg-white shadow-md border-2 border-primary' : 'hover:bg-white/50'
+                        }`}
+                      >
+                        {sheet.sheet_name}
+                        <Badge variant="secondary" className="ml-auto text-xs">
+                          {sheet.items.length}
+                        </Badge>
+                      </Button>
+                    ))}
+                  </div>
                 </div>
-              </div>
+              )}
               <div className="p-4">
-                {categoryGroups.length === 0 ? (
+                {sheetsWithMaterials.length === 0 ? (
                   <div className="text-center py-12 text-muted-foreground">
                     <Package className="w-16 h-16 mx-auto mb-3 opacity-50" />
-                    <p>No materials in this sheet</p>
+                    <p>No materials in this job workbook</p>
                   </div>
                 ) : (
-                  <div className="space-y-4">
-                    {categoryGroups.map((catGroup) => (
-                      <div key={catGroup.category} className="border-2 rounded-lg overflow-hidden">
-                        <div className="bg-gradient-to-r from-indigo-100 to-indigo-50 p-3 border-b-2 border-indigo-200">
-                          <div className="flex items-center gap-2">
-                            <h3 className="font-bold text-lg text-indigo-900">{catGroup.category}</h3>
-                            <Badge variant="outline" className="bg-white">
-                              {catGroup.items.length} items
+                  <div className="space-y-8">
+                    {sheetsWithMaterials.map((sheet) => {
+                      const sheetCategoryGroups = groupByCategory(sheet.items);
+                      return (
+                        <div
+                          key={sheet.id}
+                          id={`package-sheet-${sheet.id}`}
+                          className="scroll-mt-14 space-y-4"
+                        >
+                          <div className="sticky top-0 z-10 flex items-center justify-between rounded-lg border-2 border-cyan-700/30 bg-gradient-to-r from-cyan-50 to-sky-50 px-4 py-2.5 shadow-sm">
+                            <h3 className="font-bold text-base text-cyan-950">{sheet.sheet_name}</h3>
+                            <Badge variant="outline" className="bg-white font-semibold">
+                              {sheet.items.length} items
                             </Badge>
                           </div>
-                        </div>
-                        <div className="divide-y">
-                          {catGroup.items.map((item) => {
-                            const isInPackage = isMaterialInPackage(item.id);
-                            const isSelected = selectedMaterialIds.has(item.id);
-                            
-                            return (
-                              <div
-                                key={item.id}
-                                className={`p-3 flex items-center gap-3 cursor-pointer transition-colors ${
-                                  isInPackage
-                                    ? 'bg-green-50 opacity-60'
-                                    : isSelected
-                                    ? 'bg-blue-50 border-l-4 border-blue-600'
-                                    : 'hover:bg-slate-50'
-                                }`}
-                                onClick={() => !isInPackage && toggleMaterialSelection(item.id)}
-                              >
-                                <div className="flex items-center justify-center w-6 h-6">
-                                  {isInPackage ? (
-                                    <CheckSquare className="w-5 h-5 text-green-600" />
-                                  ) : isSelected ? (
-                                    <CheckSquare className="w-5 h-5 text-blue-600" />
-                                  ) : (
-                                    <Square className="w-5 h-5 text-slate-400" />
-                                  )}
-                                </div>
-                                <div className="flex-1">
-                                  <div className="font-medium flex items-center gap-2">
-                                    {item.material_name}
-                                    {isInPackage && (
-                                      <Badge variant="outline" className="bg-green-100 text-green-800 border-green-300">
-                                        Already in package
-                                      </Badge>
-                                    )}
-                                  </div>
-                                  <div className="text-sm text-muted-foreground mt-1">
-                                    {item.usage && <span>{item.usage} • </span>}
-                                    Qty: {item.quantity}
-                                    {item.length && ` • ${item.length}`}
-                                    {item.cost_per_unit && ` • $${item.cost_per_unit.toFixed(2)}`}
-                                  </div>
+                          {sheetCategoryGroups.map((catGroup) => (
+                            <div key={`${sheet.id}-${catGroup.category}`} className="border-2 rounded-lg overflow-hidden">
+                              <div className="bg-gradient-to-r from-indigo-100 to-indigo-50 p-3 border-b-2 border-indigo-200">
+                                <div className="flex items-center gap-2">
+                                  <h4 className="font-bold text-lg text-indigo-900">{catGroup.category}</h4>
+                                  <Badge variant="outline" className="bg-white">
+                                    {catGroup.items.length} items
+                                  </Badge>
                                 </div>
                               </div>
-                            );
-                          })}
+                              <div className="divide-y">
+                                {catGroup.items.map((item) => renderMaterialPickerRow(item))}
+                              </div>
+                            </div>
+                          ))}
                         </div>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 )}
               </div>
@@ -1046,13 +1299,14 @@ export function MaterialPackages({ jobId, userId, workbook, job }: MaterialPacka
         <div className="space-y-3">
           {packages.map(pkg => {
             const isExpanded = expandedPackages.has(pkg.id);
+            const jobItems = bundleItemsOnJobWorkbook(pkg);
             
             return (
               <Card key={pkg.id} className="border-2">
-                <CardHeader className="pb-3">
-                  <div className="flex items-start justify-between">
-                    <div className="flex-1">
-                      <div className="flex items-center gap-3">
+                <CardHeader className="p-4 pb-3">
+                  <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-2">
                         <Button
                           variant="ghost"
                           size="sm"
@@ -1066,11 +1320,11 @@ export function MaterialPackages({ jobId, userId, workbook, job }: MaterialPacka
                           )}
                         </Button>
                         <div>
-                          <CardTitle className="text-lg flex items-center gap-2">
-                            <Package className="w-5 h-5" />
-                            {pkg.name}
+                          <CardTitle className="text-base flex items-center gap-2 min-w-0">
+                            <Package className="w-4 h-4 shrink-0" />
+                            <span className="truncate">{pkg.name}</span>
                             <Badge variant="outline">
-                              {pkg.bundle_items.length} items
+                              {jobItems.length} items
                             </Badge>
                           </CardTitle>
                           {pkg.description && (
@@ -1081,12 +1335,23 @@ export function MaterialPackages({ jobId, userId, workbook, job }: MaterialPacka
                         </div>
                       </div>
                     </div>
-                    <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-1.5 flex-wrap shrink-0">
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="h-8 text-xs border-blue-400 text-blue-800 hover:bg-blue-50 px-2"
+                        onClick={() => openAddMaterialsForPackage(pkg.id)}
+                        disabled={!packagesWorkbook}
+                        title="Pick materials from the job workbook and add to this package"
+                      >
+                        <Plus className="w-4 h-4 mr-1" />
+                        Add Materials
+                      </Button>
                       <Select
                         value={pkg.status || 'not_ordered'}
                         onValueChange={(value) => updatePackageStatus(pkg.id, value)}
                       >
-                        <SelectTrigger className={`h-9 min-w-[150px] text-xs font-semibold border-2 ${getStatusColor(pkg.status || 'pending')}`}>
+                        <SelectTrigger className={`h-8 min-w-[8.5rem] text-xs font-semibold border ${getStatusColor(pkg.status || 'pending')}`}>
                           <SelectValue />
                         </SelectTrigger>
                         <SelectContent>
@@ -1100,7 +1365,7 @@ export function MaterialPackages({ jobId, userId, workbook, job }: MaterialPacka
                       <Button
                         size="sm"
                         onClick={() => openZohoOrderDialog(pkg)}
-                        className="bg-gradient-to-r from-purple-600 to-purple-700 hover:from-purple-700 hover:to-purple-800 text-white"
+                        className="h-8 text-xs px-2 bg-gradient-to-r from-purple-600 to-purple-700 hover:from-purple-700 hover:to-purple-800 text-white"
                         title="Create Zoho Sales Order & PO for all unordered materials"
                       >
                         <ShoppingCart className="w-4 h-4 mr-1" />
@@ -1127,17 +1392,42 @@ export function MaterialPackages({ jobId, userId, workbook, job }: MaterialPacka
                 {isExpanded && (
                   <CardContent className="pt-0">
                     <div className="border-t pt-3 space-y-4">
-                      {pkg.bundle_items.length === 0 ? (
-                        <p className="text-sm text-muted-foreground text-center py-4">
-                          No materials in this package
-                        </p>
+                      {jobItems.length === 0 ? (
+                        <div className="text-center py-6 space-y-3">
+                          <p className="text-sm text-muted-foreground">
+                            No materials in this package yet. Add lines from the job workbook.
+                          </p>
+                          <Button
+                            size="sm"
+                            onClick={() => openAddMaterialsForPackage(pkg.id)}
+                            disabled={!packagesWorkbook}
+                          >
+                            <Plus className="w-4 h-4 mr-1" />
+                            Add Materials from Job Workbook
+                          </Button>
+                        </div>
                       ) : (
                         <>
-                          {/* Materials List */}
                           <div>
-                            <h4 className="font-semibold text-sm mb-2">Package Materials ({pkg.bundle_items.length})</h4>
-                            <div className="space-y-2">
-                              {pkg.bundle_items.map(item => {
+                            <h4 className="font-semibold text-sm mb-2">Package Materials ({jobItems.length})</h4>
+                            <div className="space-y-4">
+                              {(() => {
+                                const bySheet = new Map<string, BundleItem[]>();
+                                for (const item of jobItems) {
+                                  const sheetName = item.material_items.sheets?.sheet_name || 'Unknown';
+                                  const list = bySheet.get(sheetName) ?? [];
+                                  list.push(item);
+                                  bySheet.set(sheetName, list);
+                                }
+                                return Array.from(bySheet.entries()).map(([sheetName, sheetItems]) => (
+                                  <div key={sheetName} className="space-y-2">
+                                    <div className="flex items-center justify-between rounded-md border border-cyan-700/25 bg-cyan-50 px-3 py-1.5">
+                                      <span className="text-sm font-semibold text-cyan-950">{sheetName}</span>
+                                      <Badge variant="outline" className="bg-white text-xs">
+                                        {sheetItems.length} items
+                                      </Badge>
+                                    </div>
+                                    {sheetItems.map((item) => {
                                 const hasOrders = item.material_items.zoho_sales_order_id || item.material_items.zoho_purchase_order_id;
                                 const hasBothOrders = item.material_items.zoho_sales_order_id && item.material_items.zoho_purchase_order_id;
                                 const hasOnlySO = item.material_items.zoho_sales_order_id && !item.material_items.zoho_purchase_order_id;
@@ -1256,7 +1546,10 @@ export function MaterialPackages({ jobId, userId, workbook, job }: MaterialPacka
                                     )}
                                   </div>
                                 );
-                              })}
+                                    })}
+                                  </div>
+                                ));
+                              })()}
                             </div>
                           </div>
 
