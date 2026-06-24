@@ -5,7 +5,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
-import { Clock, Users, Calendar, ChevronDown, ChevronRight, TrendingUp, Target, Camera, FileText, AlertCircle, Package, Activity, Briefcase, Building2, MapPin, FileCheck, ArrowLeft, Edit, DollarSign, FileSpreadsheet, Mail, Printer, LayoutGrid, ShoppingCart, Key, StickyNote } from 'lucide-react';
+import { Clock, Users, Calendar, ChevronDown, ChevronRight, TrendingUp, Target, Camera, FileText, AlertCircle, Package, Activity, Briefcase, Building2, MapPin, FileCheck, ArrowLeft, Edit, DollarSign, FileSpreadsheet, Mail, Printer, LayoutGrid, ShoppingCart, Key, StickyNote, Download } from 'lucide-react';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
 import { Progress } from '@/components/ui/progress';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
@@ -51,6 +51,7 @@ import { JobDetailProposalToolbarContext } from '@/contexts/JobDetailProposalToo
 import { JobDetailMaterialsToolbarSlotContext } from '@/contexts/JobDetailMaterialsToolbarContext';
 import { ProposalSummaryProvider } from '@/contexts/ProposalSummaryContext';
 import { JobProposalBudgetBreakdownPanel } from '@/components/office/JobProposalBudgetBreakdownPanel';
+import { JobExportDialog } from '@/components/office/JobExportDialog';
 
 interface JobDetailedViewProps {
   job: Job;
@@ -485,6 +486,7 @@ export function JobDetailedView({ job, portalJobId, getPortalJobId, onBack, onEd
   const [savingProposalNotes, setSavingProposalNotes] = useState(false);
   /** `__clock_in__` or stringified component id — opens worker breakdown dialog on Overview */
   const [overviewComponentBreakdownKey, setOverviewComponentBreakdownKey] = useState<string | null>(null);
+  const [showExportDialog, setShowExportDialog] = useState(false);
 
   async function saveProposalPageNotes() {
     if (profile?.role !== 'office') {
@@ -1868,7 +1870,7 @@ export function JobDetailedView({ job, portalJobId, getPortalJobId, onBack, onEd
                       )}
                     </div>
                   </div>
-                  <div className="flex items-start gap-2">
+                  <div className="flex items-start gap-2 flex-wrap">
                     <Badge variant={job.status === 'active' ? 'default' : 'secondary'} className="text-sm">
                       {job.status}
                     </Badge>
@@ -1878,6 +1880,16 @@ export function JobDetailedView({ job, portalJobId, getPortalJobId, onBack, onEd
                         Edit Job
                       </Button>
                     )}
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setShowExportDialog(true)}
+                      className="border-yellow-500 text-yellow-700 hover:bg-yellow-50"
+                      title="Download all job data as JSON + CSV"
+                    >
+                      <Download className="w-4 h-4 mr-2" />
+                      Export Data
+                    </Button>
                   </div>
                 </div>
               </CardHeader>
@@ -2468,6 +2480,12 @@ export function JobDetailedView({ job, portalJobId, getPortalJobId, onBack, onEd
           </div>
         </TabsContent>
       </Tabs>
+
+      <JobExportDialog
+        job={job}
+        open={showExportDialog}
+        onOpenChange={setShowExportDialog}
+      />
 
       <Dialog
         open={!!overviewComponentBreakdownKey}
