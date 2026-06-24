@@ -27,6 +27,7 @@ import {
   dispatchMaterialItemStatusUpdated,
   updateMaterialItemStatus,
 } from '@/lib/materialPackageStatus';
+import { isTrimSlittingPlanV1, type TrimSlittingPlanV1 } from '@/lib/trimFlatstockOptimize';
 
 function toNum(v: unknown): number {
   if (typeof v === 'number' && Number.isFinite(v)) return v;

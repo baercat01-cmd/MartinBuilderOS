@@ -1308,6 +1308,7 @@ export function MaterialsManagement({
         materialItemIds: string[];
         newStatus: string;
         packageIds?: string[];
+        packageStatuses?: Record<string, string>;
       }>).detail;
       if (!detail) return;
       if (detail.jobId && detail.jobId !== job.id) return;
