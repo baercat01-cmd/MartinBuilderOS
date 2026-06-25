@@ -92,6 +92,12 @@ import {
 import { remapMaterialBundleItemsForJob } from '@/lib/materialBundleRemap';
 import { syncMissingWorkingSheetsFromLocked } from '@/lib/materialWorkbookSheetSync';
 import { getMaterialLineSellAndCost } from '@/lib/materialItemLineMoney';
+import {
+  generateProposalLineBreakdownHTML,
+  proposalLineBreakdownRowsToCsv,
+  type ProposalLineBreakdownRow,
+  type ProposalLineBreakdownSectionMeta,
+} from '@/lib/proposalLineBreakdownExport';
 
 interface CustomFinancialRow {
   id: string;
@@ -14166,6 +14172,500 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
     }
   }
 
+  function buildProposalLineBreakdownData(): {
+    rows: ProposalLineBreakdownRow[];
+    sectionMeta: Record<string, ProposalLineBreakdownSectionMeta>;
+    proposalNumber: string;
+  } {
+    const proposalNumber =
+      (quote as any)?.is_customer_estimate === true
+        ? displayNumberForQuoteRow(quote as any, true)
+        : quote?.proposal_number || job.id.split('-')[0].toUpperCase();
+    const rows: ProposalLineBreakdownRow[] = [];
+    const sectionMeta: Record<string, ProposalLineBreakdownSectionMeta> = {};
+
+    const ensureSectionMeta = (
+      sectionName: string,
+      meta: Partial<ProposalLineBreakdownSectionMeta>,
+    ) => {
+      const prev = sectionMeta[sectionName];
+      sectionMeta[sectionName] = {
+        description: meta.description ?? prev?.description,
+        optional: meta.optional ?? prev?.optional ?? false,
+      };
+    };
+
+    const pushRow = (row: {
+      section: string;
+      lineType: string;
+      category?: string;
+      description?: string;
+      sku?: string;
+      quantity?: number;
+      unit?: string;
+      unitCost?: number;
+      baseAmount: number;
+      markupPct?: number;
+      linePrice: number;
+      optional?: boolean | string;
+      notes?: string;
+      sectionDescription?: string;
+      sectionOptional?: boolean;
+    }) => {
+      const sectionName = String(row.section ?? '');
+      ensureSectionMeta(sectionName, {
+        description: row.sectionDescription,
+        optional:
+          row.sectionOptional ??
+          (typeof row.optional === 'string' ? row.optional === 'Yes' : !!row.optional),
+      });
+      rows.push({
+        section: sectionName,
+        lineType: String(row.lineType ?? ''),
+        category: String(row.category ?? ''),
+        description: String(row.description ?? ''),
+        sku: String(row.sku ?? ''),
+        quantity: Number(row.quantity) || 0,
+        unit: String(row.unit ?? ''),
+        unitCost: Number(row.unitCost) || 0,
+        baseAmount: Number(row.baseAmount) || 0,
+        markupPct: Number(row.markupPct) || 0,
+        linePrice: Number(row.linePrice) || 0,
+        optional:
+          typeof row.optional === 'string' ? row.optional === 'Yes' : !!row.optional,
+        notes: String(row.notes ?? ''),
+      });
+    };
+
+    if (estimateCatalogViewOpen) {
+      customerEstimateLines.forEach((r, i) => {
+        const qty = Number(r.quantity) || 0;
+        const uc = Number(r.unit_cost) || 0;
+        const mu = Number(r.markup_percent) || 0;
+        const base = qty * uc;
+        pushRow({
+          section: 'Price list (preliminary)',
+          lineType: 'Estimate line',
+          description: r.description || `Item ${i + 1}`,
+          quantity: qty,
+          unitCost: uc,
+          baseAmount: base,
+          markupPct: mu,
+          linePrice: estimateCatalogLineExtendedSell(r),
+          optional: false,
+          notes: r.notes || '',
+          sectionDescription:
+            'Office price list — rough pricing only; not the formal proposal workbook.',
+        });
+      });
+    } else {
+      const appendMaterialSheet = (sheet: any, sectionLabel?: string) => {
+        const sectionName = sectionLabel || sheet.sheetName || 'Section';
+        const sheetId = String(sheet.sheetId ?? sheet.id ?? '').trim();
+        const sectionOptional = !!sheet.isOptional;
+        const bdSheet =
+          materialsBreakdown.sheetBreakdowns.find((s: any) => String(s.sheetId) === sheetId) || sheet;
+        const defaultSheetMarkup = Number(sheet.markup_percent ?? 10) || 10;
+        const sectionDescription = String(
+          sheet.sheetDescription ?? bdSheet.sheetDescription ?? '',
+        ).trim();
+
+        ensureSectionMeta(sectionName, {
+          description: sectionDescription || undefined,
+          optional: sectionOptional,
+        });
+
+        for (const cat of bdSheet.categories || []) {
+          const categoryMarkup = lookupCategoryMarkup(
+            categoryMarkups,
+            sheetId,
+            cat.name,
+            defaultSheetMarkup,
+          );
+          const isLaborCat = isWorkbookLaborCategoryName(cat.name);
+          const catOptional = cat.isCategoryOptional || sectionOptional;
+
+          for (const matItem of cat.items || []) {
+            const line = getMaterialLineSellAndCost(matItem);
+            const qty = Number(matItem.quantity) || 0;
+            const unitCost = qty > 0 ? line.cost / qty : Number(matItem.cost_per_unit) || 0;
+            const basePrice = line.price;
+            pushRow({
+              section: sectionName,
+              lineType: isLaborCat ? 'Labor (workbook category)' : 'Material',
+              category: cat.name,
+              description: matItem.material_name || '',
+              sku: matItem.sku || '',
+              quantity: qty,
+              unit: matItem.unit || '',
+              unitCost,
+              baseAmount: basePrice,
+              markupPct: categoryMarkup,
+              linePrice: basePrice * (1 + categoryMarkup / 100),
+              optional: catOptional,
+            });
+          }
+        }
+
+        const sheetLaborRow = resolveSheetLaborForSection(
+          sheetLabor,
+          sheetId,
+          sheet.sheetName,
+          materialSheets,
+          materialsBreakdown.sheetBreakdowns,
+          sheetMetaById,
+        );
+        if (sheetLaborRow && effectiveSheetLaborTotal(sheetLaborRow) > 0) {
+          const hours = Number(sheetLaborRow.estimated_hours) || 0;
+          const rate = Number(sheetLaborRow.hourly_rate) || 0;
+          const total = effectiveSheetLaborTotal(sheetLaborRow);
+          pushRow({
+            section: sectionName,
+            lineType: 'Sheet labor',
+            category: 'Labor',
+            description: sheetLaborRow.description || 'Sheet labor',
+            quantity: hours,
+            unit: 'hrs',
+            unitCost: rate,
+            baseAmount: total,
+            markupPct: 0,
+            linePrice: total,
+            optional: sectionOptional,
+          });
+        }
+
+        const sheetLineItems = resolveCustomRowLineItemsForSheet(
+          displayCustomRowLineItems,
+          materialSheets,
+          sheetId,
+          sheet.sheetName,
+          materialsBreakdown.sheetBreakdowns,
+          sheetMetaById,
+        );
+        for (const li of sheetLineItems) {
+          const itemType = (li.item_type || 'material') === 'labor' ? 'Labor' : 'Material';
+          const markup = Number(li.markup_percent ?? 0) || 0;
+          const qty = Number(li.quantity) || 0;
+          const uc = Number(li.unit_cost) || 0;
+          const base = effectiveCustomRowLineItemBase(li);
+          pushRow({
+            section: sectionName,
+            lineType: `Section line item (${itemType.toLowerCase()})`,
+            category: itemType,
+            description: li.description || '',
+            quantity: qty,
+            unit: itemType === 'Labor' ? 'hrs' : '',
+            unitCost: uc,
+            baseAmount: base,
+            markupPct: markup,
+            linePrice: base * (1 + markup / 100),
+            optional: sectionOptional,
+            notes: li.notes || '',
+          });
+        }
+
+        const linkedRows = customRows.filter((r: any) => String(r.sheet_id ?? '').trim() === sheetId);
+        for (const row of linkedRows) {
+          const rowMarkup = Number(row.markup_percent ?? 0) || 0;
+          const lineItems = customRowLineItems[row.id] || [];
+          if (lineItems.length > 0) {
+            for (const li of lineItems) {
+              const itemType = (li.item_type || 'material') === 'labor' ? 'Labor' : 'Material';
+              const itemMarkup = Number(li.markup_percent ?? rowMarkup) || 0;
+              const qty = Number(li.quantity) || 0;
+              const uc = Number(li.unit_cost) || 0;
+              const base = effectiveCustomRowLineItemBase(li);
+              pushRow({
+                section: sectionName,
+                lineType: `Linked row line (${itemType.toLowerCase()})`,
+                category: row.category || itemType,
+                description: li.description || row.description || '',
+                quantity: qty,
+                unit: itemType === 'Labor' ? 'hrs' : '',
+                unitCost: uc,
+                baseAmount: base,
+                markupPct: itemMarkup,
+                linePrice: base * (1 + itemMarkup / 100),
+                optional: toBool((row as any).is_option) || sectionOptional,
+                notes: row.notes || li.notes || '',
+              });
+            }
+          } else {
+            const qty = Number(row.quantity) || 0;
+            const uc = Number(row.unit_cost) || 0;
+            const base = Number(row.total_cost) || qty * uc;
+            pushRow({
+              section: sectionName,
+              lineType: 'Linked custom row',
+              category: row.category || '',
+              description: row.description || '',
+              quantity: qty,
+              unitCost: uc,
+              baseAmount: base,
+              markupPct: rowMarkup,
+              linePrice: base * (1 + rowMarkup / 100),
+              optional: toBool((row as any).is_option) || sectionOptional,
+              notes: row.notes || '',
+            });
+          }
+        }
+
+        const linkedSubs = linkedSubcontractors[sheetId] || [];
+        for (const sub of linkedSubs) {
+          const subMarkup = Number(sub.markup_percent ?? 0) || 0;
+          const lineItems = (subcontractorLineItems[sub.id] || []).filter((li: any) => !li.excluded);
+          for (const li of lineItems) {
+            const itemType = (li.item_type || 'material') === 'labor' ? 'Labor' : 'Material';
+            const qty = Number(li.quantity) || 1;
+            const base = Number(li.total_price) || 0;
+            const unitCost = qty > 0 ? base / qty : base;
+            pushRow({
+              section: sectionName,
+              lineType: `Subcontractor (${itemType.toLowerCase()})`,
+              category: sub.company_name || 'Subcontractor',
+              description: li.description || sub.scope_of_work || '',
+              quantity: qty,
+              unitCost,
+              baseAmount: base,
+              markupPct: subMarkup,
+              linePrice: base * (1 + subMarkup / 100),
+              optional: toBool((sub as any).is_option) || sectionOptional,
+            });
+          }
+        }
+      };
+
+      const appendCustomRow = (row: CustomFinancialRow) => {
+        const sectionName = row.description || 'Custom row';
+        const rowOptional = toBool((row as any).is_option);
+        const rowMarkup = Number(row.markup_percent ?? 0) || 0;
+        const lineItems = customRowLineItems[row.id] || [];
+        const linkedSubs = linkedSubcontractors[row.id] || [];
+        ensureSectionMeta(sectionName, {
+          description: row.notes || undefined,
+          optional: rowOptional,
+        });
+
+        if (lineItems.length > 0) {
+          for (const li of lineItems) {
+            const itemType = (li.item_type || 'material') === 'labor' ? 'Labor' : 'Material';
+            const itemMarkup = Number(li.markup_percent ?? rowMarkup) || 0;
+            const qty = Number(li.quantity) || 0;
+            const uc = Number(li.unit_cost) || 0;
+            const base = effectiveCustomRowLineItemBase(li);
+            pushRow({
+              section: sectionName,
+              lineType: `Custom row line (${itemType.toLowerCase()})`,
+              category: row.category || itemType,
+              description: li.description || '',
+              quantity: qty,
+              unit: itemType === 'Labor' ? 'hrs' : '',
+              unitCost: uc,
+              baseAmount: base,
+              markupPct: itemMarkup,
+              linePrice: base * (1 + itemMarkup / 100),
+              optional: rowOptional,
+              notes: li.notes || row.notes || '',
+            });
+          }
+        } else {
+          const qty = Number(row.quantity) || 0;
+          const uc = Number(row.unit_cost) || 0;
+          const base = Number(row.total_cost) || qty * uc;
+          pushRow({
+            section: sectionName,
+            lineType: 'Custom row',
+            category: row.category || '',
+            description: row.description || '',
+            quantity: qty,
+            unitCost: uc,
+            baseAmount: base,
+            markupPct: rowMarkup,
+            linePrice: base * (1 + rowMarkup / 100),
+            optional: rowOptional,
+            notes: row.notes || '',
+          });
+        }
+
+        for (const sub of linkedSubs) {
+          const subMarkup = Number(sub.markup_percent ?? 0) || 0;
+          const subLineItems = (subcontractorLineItems[sub.id] || []).filter((li: any) => !li.excluded);
+          for (const li of subLineItems) {
+            const itemType = (li.item_type || 'material') === 'labor' ? 'Labor' : 'Material';
+            const qty = Number(li.quantity) || 1;
+            const base = Number(li.total_price) || 0;
+            pushRow({
+              section: sectionName,
+              lineType: `Subcontractor (${itemType.toLowerCase()})`,
+              category: sub.company_name || 'Subcontractor',
+              description: li.description || '',
+              quantity: qty,
+              baseAmount: base,
+              markupPct: subMarkup,
+              linePrice: base * (1 + subMarkup / 100),
+              optional: rowOptional,
+            });
+          }
+        }
+      };
+
+      const appendSubcontractor = (est: any) => {
+        const sectionName = est.company_name || 'Subcontractor';
+        const estOptional = toBool((est as any).is_option);
+        const estMarkup = Number(est.markup_percent ?? 0) || 0;
+        const lineItems = (subcontractorLineItems[est.id] || []).filter((li: any) => !li.excluded);
+        ensureSectionMeta(sectionName, {
+          description: est.scope_of_work || undefined,
+          optional: estOptional,
+        });
+        for (const li of lineItems) {
+          const itemType = (li.item_type || 'material') === 'labor' ? 'Labor' : 'Material';
+          const qty = Number(li.quantity) || 1;
+          const base = Number(li.total_price) || 0;
+          pushRow({
+            section: sectionName,
+            lineType: `Subcontractor (${itemType.toLowerCase()})`,
+            category: 'Subcontractor',
+            description: li.description || est.scope_of_work || '',
+            quantity: qty,
+            baseAmount: base,
+            markupPct: estMarkup,
+            linePrice: base * (1 + estMarkup / 100),
+            optional: estOptional,
+          });
+        }
+      };
+
+      for (const item of allItemsUnsorted) {
+        if (item.type === 'material') appendMaterialSheet(item.data);
+        else if (item.type === 'custom') appendCustomRow(item.data);
+        else if (item.type === 'subcontractor') appendSubcontractor(item.data);
+      }
+      for (const item of changeOrderItemsUnsorted) {
+        appendMaterialSheet(item.data, `${item.data.sheetName || 'Change order'} (CO)`);
+      }
+    }
+
+    return { rows, sectionMeta, proposalNumber };
+  }
+
+  function openLineBreakdownPrintWindow(html: string) {
+    const blob = new Blob([html], { type: 'text/html; charset=utf-8' });
+    const blobUrl = URL.createObjectURL(blob);
+    const win = window.open(blobUrl, '_blank');
+    if (!win) {
+      URL.revokeObjectURL(blobUrl);
+      toast.error('Allow popups to print or save as PDF.');
+      return;
+    }
+    win.focus();
+    toast.info('Choose "Save as PDF" in the print dialog to download.', { duration: 6000 });
+    setTimeout(() => {
+      try {
+        if (!win.closed) win.print();
+      } catch {
+        toast.error('Could not open print dialog');
+      }
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 3000);
+    }, 600);
+  }
+
+  function handleExportLineBreakdownCsv() {
+    setExporting(true);
+    try {
+      const { rows, proposalNumber } = buildProposalLineBreakdownData();
+      if (rows.length === 0) {
+        toast.error('No line items to export.');
+        return;
+      }
+      const csv = proposalLineBreakdownRowsToCsv(rows);
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `Proposal_${String(proposalNumber).replace(/[^a-zA-Z0-9_-]/g, '_')}_line_breakdown.csv`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      toast.success(`Exported ${rows.length} lines to CSV`);
+      setShowExportDialog(false);
+    } catch (error: any) {
+      console.error('Error exporting line breakdown CSV:', error);
+      toast.error(`Failed to export CSV: ${error.message || 'Unknown error'}`);
+    } finally {
+      setExporting(false);
+    }
+  }
+
+  function handleExportLineBreakdownPdf() {
+    setExporting(true);
+    try {
+      const { rows, sectionMeta, proposalNumber } = buildProposalLineBreakdownData();
+      if (rows.length === 0) {
+        toast.error('No line items to export.');
+        return;
+      }
+
+      const estimatePdfMaterialsTotal = estimateCatalogViewOpen
+        ? Math.round(
+            customerEstimateLines.reduce((s, r) => s + estimateCatalogLineExtendedSell(r), 0) * 100,
+          ) / 100
+        : proposalMaterialsTotalWithSubcontractors;
+      const estimatePdfTaxable = estimateCatalogViewOpen
+        ? Math.round(
+            customerEstimateLines
+              .filter((r) => r.taxable !== false)
+              .reduce((s, r) => s + estimateCatalogLineExtendedSell(r), 0) * 100,
+          ) / 100
+        : 0;
+      const estimatePdfTax = estimateCatalogViewOpen
+        ? taxExemptChecked
+          ? 0
+          : Math.round(estimatePdfTaxable * 0.07 * 100) / 100
+        : proposalTotalTax;
+      const estimatePdfGrand = estimateCatalogViewOpen
+        ? Math.round((estimatePdfMaterialsTotal + estimatePdfTax) * 100) / 100
+        : proposalGrandTotal;
+
+      const html = generateProposalLineBreakdownHTML({
+        proposalNumber,
+        date: new Date().toLocaleDateString(),
+        job: {
+          name: job.name,
+          client_name: job.client_name,
+          address: job.address,
+        },
+        rows,
+        sectionMeta,
+        totals: estimateCatalogViewOpen
+          ? {
+              materials: estimatePdfMaterialsTotal,
+              labor: 0,
+              subtotal: estimatePdfMaterialsTotal,
+              tax: estimatePdfTax,
+              grandTotal: estimatePdfGrand,
+            }
+          : {
+              materials: proposalMaterialsTotalWithSubcontractors,
+              labor: proposalLaborPrice,
+              subtotal: proposalSubtotal,
+              tax: proposalTotalTax,
+              grandTotal: proposalGrandTotal,
+            },
+        taxExempt: taxExemptChecked,
+      });
+
+      setShowExportDialog(false);
+      openLineBreakdownPrintWindow(html);
+    } catch (error: any) {
+      console.error('Error exporting line breakdown PDF:', error);
+      toast.error(`Failed to export PDF: ${error.message || 'Unknown error'}`);
+    } finally {
+      setExporting(false);
+    }
+  }
+
   // Calculate custom row total from line items (if any) or from quantity * unit_cost
   function getCustomRowTotal(row: CustomFinancialRow): number {
     const lineItems = customRowLineItems[row.id] || [];
@@ -17283,6 +17783,48 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
               </Select>
             </div>
 
+            {exportViewType === 'office' && (
+              <div className="rounded-md border border-emerald-200 bg-emerald-50/80 p-3 space-y-3">
+                <div>
+                  <p className="text-sm font-semibold text-emerald-950">Line-item breakdown</p>
+                  <p className="text-xs text-emerald-900/80 mt-0.5">
+                    Every proposal line with unit cost, base amount, markup %, and sell price — materials, labor, custom rows, and subs. No payment terms or signatures.
+                  </p>
+                </div>
+                <div className="flex flex-col sm:flex-row gap-2">
+                  <Button
+                    type="button"
+                    variant="default"
+                    className="flex-1 bg-emerald-800 hover:bg-emerald-900"
+                    onClick={handleExportLineBreakdownPdf}
+                    disabled={exporting}
+                  >
+                    {exporting ? (
+                      <>
+                        <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin mr-2" />
+                        Exporting…
+                      </>
+                    ) : (
+                      <>
+                        <Download className="w-4 h-4 mr-2" />
+                        Export line breakdown (PDF)
+                      </>
+                    )}
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="flex-1 border-emerald-300 bg-white hover:bg-emerald-50"
+                    onClick={handleExportLineBreakdownCsv}
+                    disabled={exporting}
+                  >
+                    <FileSpreadsheet className="w-4 h-4 mr-2 text-emerald-700" />
+                    Export Excel (CSV)
+                  </Button>
+                </div>
+              </div>
+            )}
+
             {exportViewType !== 'bid_spec' && (
               <div>
                 <Label className="mb-2 block">Style</Label>
@@ -17362,6 +17904,8 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
                   <ul className="list-disc list-inside text-blue-800 space-y-0.5">
                     <li>All line items with individual unit prices and totals</li>
                     <li>Detailed breakdown for each section</li>
+                    <li>CSV export with every line, markup %, and sell price</li>
+                    <li>PDF line breakdown — proposal scope only, every line with markup</li>
                     <li>No payment terms or signature sections</li>
                     <li>Internal use only - NOT for customer distribution</li>
                   </ul>
