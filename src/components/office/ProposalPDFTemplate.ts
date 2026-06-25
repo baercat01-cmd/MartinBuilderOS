@@ -803,7 +803,7 @@ export function generateProposalHTML(data: {
                 content += '<div class="section-title" style="margin-top: ' + sectionTitleMargin + ';">';
                 content += '<span style="font-weight: bold; font-size: ' + (sectionTitleSize + 1) + 'pt;">' + section.name + '</span>';
                 if (section.price) {
-                  content += '<span class="section-price" style="font-weight: bold; font-size: ' + (sectionTitleSize + 1) + 'pt;">$' + section.price.toLocaleString('en-US', { minimumFractionDigits: 2 }) + '</span>';
+                  content += '<span class="section-price" style="font-weight: bold; font-size: ' + (sectionTitleSize + 1) + 'pt;">$' + section.price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '</span>';
                 }
                 content += '</div>';
                 
@@ -828,14 +828,14 @@ export function generateProposalHTML(data: {
                     content += '<tr>';
                     content += '<td style="padding: 8px;">' + item.description + '</td>';
                     content += '<td style="text-align: center; padding: 8px;">' + qty + (item.unit ? ' ' + item.unit : '') + '</td>';
-                    content += '<td style="text-align: right; padding: 8px;">$' + unitPrice.toLocaleString('en-US', { minimumFractionDigits: 2 }) + '</td>';
-                    content += '<td style="text-align: right; padding: 8px; font-weight: 600;">$' + totalPrice.toLocaleString('en-US', { minimumFractionDigits: 2 }) + '</td>';
+                    content += '<td style="text-align: right; padding: 8px;">$' + unitPrice.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '</td>';
+                    content += '<td style="text-align: right; padding: 8px; font-weight: 600;">$' + totalPrice.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '</td>';
                     content += '</tr>';
                   });
                   
                   content += '<tr class="total-row">';
                   content += '<td colspan="3" style="text-align: right; font-weight: bold; padding: 10px 8px; background: #f0f0f0;">Section Total:</td>';
-                  content += '<td style="text-align: right; font-weight: bold; padding: 10px 8px; background: #f0f0f0; font-size: ' + bodyFontSize + 'pt;">$' + (section.price || 0).toLocaleString('en-US', { minimumFractionDigits: 2 }) + '</td>';
+                  content += '<td style="text-align: right; font-weight: bold; padding: 10px 8px; background: #f0f0f0; font-size: ' + bodyFontSize + 'pt;">$' + (section.price || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '</td>';
                   content += '</tr>';
                   content += '</tbody></table>';
                   content += '</div>';
@@ -844,7 +844,7 @@ export function generateProposalHTML(data: {
                 if (showSectionPrices && section.price) {
                   content += '<div class="section-title" style="margin-top: ' + sectionTitleMargin + ';">';
                   content += '<span>' + section.name + '</span>';
-                  content += '<span class="section-price">$' + section.price.toLocaleString('en-US', { minimumFractionDigits: 2 }) + '</span>';
+                  content += '<span class="section-price">$' + section.price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '</span>';
                   content += '</div>';
                 } else {
                   content += '<div class="section-title" style="display: block; margin-top: ' + sectionTitleMargin + ';">' + section.name + '</div>';
@@ -865,7 +865,7 @@ export function generateProposalHTML(data: {
           hasOptionalSections && showPdfOptionalPricing
             ? `<div style="margin-top: 12px; padding: 10px 14px; border: 1px solid #e2e8f0; background: #f8fafc; border-radius: 4px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
             <strong style="font-size: ${bodyFontSize}pt;">Subtotal (base scope — excludes optional items)</strong>
-            <strong style="font-size: ${bodyFontSize}pt;">$${(Number(totals.subtotal) || 0).toLocaleString('en-US', { minimumFractionDigits: 2 })}</strong>
+            <strong style="font-size: ${bodyFontSize}pt;">$${(Number(totals.subtotal) || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong>
           </div>`
             : ''
         }
@@ -888,7 +888,7 @@ export function generateProposalHTML(data: {
                     '<span class="section-price" style="font-weight: bold; font-size: ' +
                     (sectionTitleSize + 1) +
                     'pt;">$' +
-                    optTot.toLocaleString('en-US', { minimumFractionDigits: 2 }) +
+                    optTot.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) +
                     '</span>';
                 }
                 content += '</div>';
@@ -914,8 +914,8 @@ export function generateProposalHTML(data: {
                     content += '<tr>';
                     content += '<td style="padding: 8px;">' + item.description + '</td>';
                     content += '<td style="text-align: center; padding: 8px;">' + qty + (item.unit ? ' ' + item.unit : '') + '</td>';
-                    content += '<td style="text-align: right; padding: 8px;">$' + unitPrice.toLocaleString('en-US', { minimumFractionDigits: 2 }) + '</td>';
-                    content += '<td style="text-align: right; padding: 8px; font-weight: 600;">$' + totalPrice.toLocaleString('en-US', { minimumFractionDigits: 2 }) + '</td>';
+                    content += '<td style="text-align: right; padding: 8px;">$' + unitPrice.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '</td>';
+                    content += '<td style="text-align: right; padding: 8px; font-weight: 600;">$' + totalPrice.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '</td>';
                     content += '</tr>';
                   });
                   
@@ -925,7 +925,7 @@ export function generateProposalHTML(data: {
                     '<td style="text-align: right; font-weight: bold; padding: 10px 8px; background: #f0f0f0; font-size: ' +
                     bodyFontSize +
                     'pt;">$' +
-                    (optTot > 0 ? optTot : section.price || 0).toLocaleString('en-US', { minimumFractionDigits: 2 }) +
+                    (optTot > 0 ? optTot : section.price || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) +
                     '</td>';
                   content += '</tr>';
                   content += '</tbody></table>';
@@ -940,13 +940,13 @@ export function generateProposalHTML(data: {
                   content += '<span>' + section.name + '</span>';
                   content +=
                     '<span class="section-price">$' +
-                    tot.toLocaleString('en-US', { minimumFractionDigits: 2 }) +
+                    tot.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) +
                     '</span>';
                   content += '</div>';
                 } else if (showSectionPrices && section.price) {
                   content += '<div class="section-title" style="margin-top: ' + sectionTitleMargin + ';">';
                   content += '<span>' + section.name + '</span>';
-                  content += '<span class="section-price">$' + section.price.toLocaleString('en-US', { minimumFractionDigits: 2 }) + '</span>';
+                  content += '<span class="section-price">$' + section.price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '</span>';
                   content += '</div>';
                 } else {
                   content += '<div class="section-title" style="display: block; margin-top: ' + sectionTitleMargin + ';">' + section.name + '</div>';
@@ -961,7 +961,7 @@ export function generateProposalHTML(data: {
               if (section.comparisonData) {
                 const cd = section.comparisonData;
                 const diff = cd.optionTotal - cd.baseTotal;
-                const diffStr = (diff > 0 ? '+' : '') + '$' + Math.abs(diff).toLocaleString('en-US', { minimumFractionDigits: 2 }) + (diff > 0 ? ' more' : diff < 0 ? ' less' : ' same');
+                const diffStr = (diff > 0 ? '+' : '') + '$' + Math.abs(diff).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + (diff > 0 ? ' more' : diff < 0 ? ' less' : ' same');
                 const diffColor = diff > 0 ? '#dc2626' : diff < 0 ? '#16a34a' : '#64748b';
                 content += '<div style="margin: 10px 0 6px 0; border: 1px solid #bfdbfe; border-radius: 6px; overflow: hidden;">';
                 content += '<div style="background: #eff6ff; padding: 6px 10px; font-weight: 700; font-size: 9pt; color: #1e40af; border-bottom: 1px solid #bfdbfe;">Price Comparison</div>';
@@ -977,24 +977,24 @@ export function generateProposalHTML(data: {
                   const rowDiffColor = rowDiff > 0 ? '#dc2626' : rowDiff < 0 ? '#16a34a' : '#94a3b8';
                   content += '<tr style="border-bottom:1px solid #f1f5f9;">';
                   content += '<td style="padding:4px 8px; color:#475569;">' + row.name + '</td>';
-                  content += '<td style="text-align:right; padding:4px 8px; color:#1e3a8a;">' + (row.basePrice > 0 ? '$' + row.basePrice.toLocaleString('en-US', { minimumFractionDigits: 2 }) : '—') + '</td>';
-                  content += '<td style="text-align:right; padding:4px 8px; color:#1e40af;">' + (row.optionPrice > 0 ? '$' + row.optionPrice.toLocaleString('en-US', { minimumFractionDigits: 2 }) : '—') + '</td>';
-                  content += '<td style="text-align:right; padding:4px 8px; font-weight:600; color:' + rowDiffColor + ';">' + (rowDiff !== 0 ? (rowDiff > 0 ? '+' : '') + '$' + Math.abs(rowDiff).toLocaleString('en-US', { minimumFractionDigits: 2 }) : '—') + '</td>';
+                  content += '<td style="text-align:right; padding:4px 8px; color:#1e3a8a;">' + (row.basePrice > 0 ? '$' + row.basePrice.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '—') + '</td>';
+                  content += '<td style="text-align:right; padding:4px 8px; color:#1e40af;">' + (row.optionPrice > 0 ? '$' + row.optionPrice.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '—') + '</td>';
+                  content += '<td style="text-align:right; padding:4px 8px; font-weight:600; color:' + rowDiffColor + ';">' + (rowDiff !== 0 ? (rowDiff > 0 ? '+' : '') + '$' + Math.abs(rowDiff).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '—') + '</td>';
                   content += '</tr>';
                 });
                 if (cd.baseLaborPrice > 0 || cd.optionLaborPrice > 0) {
                   const laborDiff = cd.optionLaborPrice - cd.baseLaborPrice;
                   content += '<tr style="border-bottom:1px solid #e2e8f0;">';
                   content += '<td style="padding:4px 8px; color:#475569;">Labor</td>';
-                  content += '<td style="text-align:right; padding:4px 8px; color:#1e3a8a;">' + (cd.baseLaborPrice > 0 ? '$' + cd.baseLaborPrice.toLocaleString('en-US', { minimumFractionDigits: 2 }) : '—') + '</td>';
-                  content += '<td style="text-align:right; padding:4px 8px; color:#1e40af;">' + (cd.optionLaborPrice > 0 ? '$' + cd.optionLaborPrice.toLocaleString('en-US', { minimumFractionDigits: 2 }) : '—') + '</td>';
-                  content += '<td style="text-align:right; padding:4px 8px; font-weight:600; color:' + (laborDiff > 0 ? '#dc2626' : laborDiff < 0 ? '#16a34a' : '#94a3b8') + ';">' + (laborDiff !== 0 ? (laborDiff > 0 ? '+' : '') + '$' + Math.abs(laborDiff).toLocaleString('en-US', { minimumFractionDigits: 2 }) : '—') + '</td>';
+                  content += '<td style="text-align:right; padding:4px 8px; color:#1e3a8a;">' + (cd.baseLaborPrice > 0 ? '$' + cd.baseLaborPrice.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '—') + '</td>';
+                  content += '<td style="text-align:right; padding:4px 8px; color:#1e40af;">' + (cd.optionLaborPrice > 0 ? '$' + cd.optionLaborPrice.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '—') + '</td>';
+                  content += '<td style="text-align:right; padding:4px 8px; font-weight:600; color:' + (laborDiff > 0 ? '#dc2626' : laborDiff < 0 ? '#16a34a' : '#94a3b8') + ';">' + (laborDiff !== 0 ? (laborDiff > 0 ? '+' : '') + '$' + Math.abs(laborDiff).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '—') + '</td>';
                   content += '</tr>';
                 }
                 content += '<tr style="background:#eff6ff;">';
                 content += '<td style="padding:6px 8px; font-weight:700; color:#1e293b;">Total</td>';
-                content += '<td style="text-align:right; padding:6px 8px; font-weight:700; color:#1e40af; font-size:10pt;">$' + cd.baseTotal.toLocaleString('en-US', { minimumFractionDigits: 2 }) + '</td>';
-                content += '<td style="text-align:right; padding:6px 8px; font-weight:700; color:#1d4ed8; font-size:10pt;">$' + cd.optionTotal.toLocaleString('en-US', { minimumFractionDigits: 2 }) + '</td>';
+                content += '<td style="text-align:right; padding:6px 8px; font-weight:700; color:#1e40af; font-size:10pt;">$' + cd.baseTotal.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '</td>';
+                content += '<td style="text-align:right; padding:6px 8px; font-weight:700; color:#1d4ed8; font-size:10pt;">$' + cd.optionTotal.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '</td>';
                 content += '<td style="text-align:right; padding:6px 8px; font-weight:700; font-size:10pt; color:' + diffColor + ';">' + diffStr + '</td>';
                 content += '</tr>';
                 content += '</tbody></table>';
@@ -1008,7 +1008,7 @@ export function generateProposalHTML(data: {
               hasOptionalSections && showPdfOptionalPricing
                 ? `<div style="margin-top: 14px; padding: 10px 14px; border: 1px solid #e2e8f0; background: #f8fafc; border-radius: 4px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
             <strong style="font-size: ${bodyFontSize}pt;">Subtotal (optional items only)</strong>
-            <strong style="font-size: ${bodyFontSize}pt;">$${pdfOptionalSubtotal.toLocaleString('en-US', { minimumFractionDigits: 2 })}</strong>
+            <strong style="font-size: ${bodyFontSize}pt;">$${pdfOptionalSubtotal.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong>
           </div>`
                 : ''
             }
@@ -1024,37 +1024,37 @@ export function generateProposalHTML(data: {
               ${totals.materials > 0 ? `
                 <tr>
                   <td style="text-align: right; padding: 5px;"><strong>Materials & Subcontractors:</strong></td>
-                  <td style="text-align: right; width: 150px; padding: 5px;">$${totals.materials.toLocaleString('en-US', { minimumFractionDigits: 2 })}</td>
+                  <td style="text-align: right; width: 150px; padding: 5px;">$${totals.materials.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
                 </tr>
               ` : ''}
               ${totals.labor > 0 ? `
                 <tr>
                   <td style="text-align: right; padding: 5px;"><strong>Labor:</strong></td>
-                  <td style="text-align: right; padding: 5px;">$${totals.labor.toLocaleString('en-US', { minimumFractionDigits: 2 })}</td>
+                  <td style="text-align: right; padding: 5px;">$${totals.labor.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
                 </tr>
               ` : ''}
               ${
                 hasOptionalSections && pdfOptionalSubtotal > 0.005
                   ? `<tr>
                 <td style="text-align: right; padding: 5px;"><strong>Base scope subtotal (excludes optional):</strong></td>
-                <td style="text-align: right; padding: 5px;">$${(Number(totals.subtotal) || 0).toLocaleString('en-US', { minimumFractionDigits: 2 })}</td>
+                <td style="text-align: right; padding: 5px;">$${(Number(totals.subtotal) || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
               </tr>
               <tr>
                 <td style="text-align: right; padding: 5px;"><strong>Optional items subtotal:</strong></td>
-                <td style="text-align: right; padding: 5px;">$${pdfOptionalSubtotal.toLocaleString('en-US', { minimumFractionDigits: 2 })}</td>
+                <td style="text-align: right; padding: 5px;">$${pdfOptionalSubtotal.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
               </tr>
               <tr>
                 <td style="text-align: right; padding: 5px;"><strong>Subtotal (all scope):</strong></td>
-                <td style="text-align: right; padding: 5px;">$${pdfCombinedSubtotalBeforeTax.toLocaleString('en-US', { minimumFractionDigits: 2 })}</td>
+                <td style="text-align: right; padding: 5px;">$${pdfCombinedSubtotalBeforeTax.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
               </tr>`
                   : `<tr>
                 <td style="text-align: right; padding: 5px;"><strong>Subtotal:</strong></td>
-                <td style="text-align: right; padding: 5px;">$${totals.subtotal.toLocaleString('en-US', { minimumFractionDigits: 2 })}</td>
+                <td style="text-align: right; padding: 5px;">$${totals.subtotal.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
               </tr>`
               }
               <tr>
                 <td style="text-align: right; padding: 5px;"><strong>${taxExempt ? 'Tax:' : 'Sales Tax (7%):'}</strong></td>
-                <td style="text-align: right; padding: 5px;">${taxExempt ? 'Tax Exempt' : '$' + totals.tax.toLocaleString('en-US', { minimumFractionDigits: 2 })}</td>
+                <td style="text-align: right; padding: 5px;">${taxExempt ? 'Tax Exempt' : '$' + totals.tax.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
               </tr>
               ${
                 hasOptionalSections && pdfOptionalSubtotal > 0.005 && !taxExempt
@@ -1073,7 +1073,7 @@ export function generateProposalHTML(data: {
                       ? 'GRAND TOTAL (all scope + tax shown):'
                       : 'GRAND TOTAL:'
                 }</strong></td>
-                <td class="grand-total-amount" style="text-align: right; padding: 10px 5px 5px 5px;"><strong style="font-size: 14pt;">$${(hasOptionalSections && pdfOptionalSubtotal > 0.005 ? pdfGrandTotalAllScope : totals.grandTotal).toLocaleString('en-US', { minimumFractionDigits: 2 })}</strong></td>
+                <td class="grand-total-amount" style="text-align: right; padding: 10px 5px 5px 5px;"><strong style="font-size: 14pt;">$${(hasOptionalSections && pdfOptionalSubtotal > 0.005 ? pdfGrandTotalAllScope : totals.grandTotal).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong></td>
               </tr>
             </table>
           </div>
@@ -1082,7 +1082,7 @@ export function generateProposalHTML(data: {
             <div class="terms-header">
               <div class="terms-title">Standard Terms and Conditions</div>
               <div class="terms-reference">${docTitle} #${proposalNumber} | ${job.name} | ${job.client_name}</div>
-              <div class="terms-reference">${isEstimate ? 'Estimated amount (non-binding)' : 'Contract Amount'}: $${(hasOptionalSections && pdfOptionalSubtotal > 0.005 ? pdfGrandTotalAllScope : totals.grandTotal).toLocaleString('en-US', { minimumFractionDigits: 2 })}</div>
+              <div class="terms-reference">${isEstimate ? 'Estimated amount (non-binding)' : 'Contract Amount'}: $${(hasOptionalSections && pdfOptionalSubtotal > 0.005 ? pdfGrandTotalAllScope : totals.grandTotal).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
             </div>
             <div class="terms-content">
               <div class="terms-section">
@@ -1144,24 +1144,24 @@ export function generateProposalHTML(data: {
                 hasOptionalSections && pdfOptionalSubtotal > 0.005
                   ? `<tr>
                 <td style="text-align: right;"><strong>Base scope subtotal (excludes optional):</strong></td>
-                <td style="text-align: right; width: 150px;">$${(Number(totals.subtotal) || 0).toLocaleString('en-US', { minimumFractionDigits: 2 })}</td>
+                <td style="text-align: right; width: 150px;">$${(Number(totals.subtotal) || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
               </tr>
               <tr>
                 <td style="text-align: right;"><strong>Optional items subtotal:</strong></td>
-                <td style="text-align: right; width: 150px;">$${pdfOptionalSubtotal.toLocaleString('en-US', { minimumFractionDigits: 2 })}</td>
+                <td style="text-align: right; width: 150px;">$${pdfOptionalSubtotal.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
               </tr>
               <tr>
                 <td style="text-align: right;"><strong>Subtotal (all scope):</strong></td>
-                <td style="text-align: right; width: 150px;">$${pdfCombinedSubtotalBeforeTax.toLocaleString('en-US', { minimumFractionDigits: 2 })}</td>
+                <td style="text-align: right; width: 150px;">$${pdfCombinedSubtotalBeforeTax.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
               </tr>`
                   : `<tr>
                 <td style="text-align: right;"><strong>Subtotal:</strong></td>
-                <td style="text-align: right; width: 150px;">$${totals.subtotal.toLocaleString('en-US', { minimumFractionDigits: 2 })}</td>
+                <td style="text-align: right; width: 150px;">$${totals.subtotal.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
               </tr>`
               }
               <tr>
                 <td style="text-align: right;"><strong>${taxExempt ? 'Tax:' : 'Sales Tax (7%):'}</strong></td>
-                <td style="text-align: right;">${taxExempt ? 'Tax Exempt' : '$' + totals.tax.toLocaleString('en-US', { minimumFractionDigits: 2 })}</td>
+                <td style="text-align: right;">${taxExempt ? 'Tax Exempt' : '$' + totals.tax.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
               </tr>
               ${
                 hasOptionalSections && pdfOptionalSubtotal > 0.005 && !taxExempt
@@ -1180,7 +1180,7 @@ export function generateProposalHTML(data: {
                       ? 'GRAND TOTAL (all scope + tax shown):'
                       : 'GRAND TOTAL:'
                 }</strong></td>
-                <td class="grand-total-amount" style="text-align: right; padding-top: 10px; font-size: 14pt;"><strong>$${(hasOptionalSections && pdfOptionalSubtotal > 0.005 ? pdfGrandTotalAllScope : totals.grandTotal).toLocaleString('en-US', { minimumFractionDigits: 2 })}</strong></td>
+                <td class="grand-total-amount" style="text-align: right; padding-top: 10px; font-size: 14pt;"><strong>$${(hasOptionalSections && pdfOptionalSubtotal > 0.005 ? pdfGrandTotalAllScope : totals.grandTotal).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong></td>
               </tr>
             </table>
           </div>
@@ -1217,7 +1217,7 @@ export function generateProposalHTML(data: {
             <div class="terms-header">
               <div class="terms-title">Standard Terms and Conditions</div>
               <div class="terms-reference">${docTitle} #${proposalNumber} | ${job.name} | ${job.client_name}</div>
-              <div class="terms-reference">${isEstimate ? 'Estimated amount (non-binding)' : 'Contract Amount'}: $${(hasOptionalSections && pdfOptionalSubtotal > 0.005 ? pdfGrandTotalAllScope : totals.grandTotal).toLocaleString('en-US', { minimumFractionDigits: 2 })}</div>
+              <div class="terms-reference">${isEstimate ? 'Estimated amount (non-binding)' : 'Contract Amount'}: $${(hasOptionalSections && pdfOptionalSubtotal > 0.005 ? pdfGrandTotalAllScope : totals.grandTotal).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
             </div>
             <div class="terms-content">
               <div class="terms-section">

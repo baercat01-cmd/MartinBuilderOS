@@ -95,6 +95,7 @@ import { getMaterialLineSellAndCost } from '@/lib/materialItemLineMoney';
 import {
   generateProposalLineBreakdownHTML,
   proposalLineBreakdownRowsToCsv,
+  computeLineBreakdownTotals,
   type ProposalLineBreakdownRow,
   type ProposalLineBreakdownSectionMeta,
 } from '@/lib/proposalLineBreakdownExport';
@@ -15355,6 +15356,28 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
   const proposalSubtotal = (Number(materialsSubtotal) || 0) + (Number(laborSubtotal) || 0);
   const proposalGrandTotal = (Number(proposalSubtotal) || 0) + (Number(proposalTotalTax) || 0);
 
+  // Single source of truth: derive the proposal totals from the exact same line items the
+  // breakdown renders, so the header bar / saved totals can never diverge from the lines.
+  // This fixes the working-vs-locked workbook double-count that inflated the materials total
+  // (and grew on every lock/unlock). Falls back to the legacy aggregation if rows are
+  // unavailable, and is skipped entirely in the customer-estimate catalog view.
+  const lineItemDerivedTotals = (() => {
+    if (estimateCatalogViewOpen) return null;
+    try {
+      const { rows } = buildProposalLineBreakdownData();
+      if (!rows || rows.length === 0) return null;
+      return computeLineBreakdownTotals(rows, { taxExempt: taxExemptChecked, taxRate: TAX_RATE });
+    } catch {
+      return null;
+    }
+  })();
+  const effectiveProposalMaterials =
+    lineItemDerivedTotals?.materials ?? proposalMaterialsTotalWithSubcontractors;
+  const effectiveProposalLabor = lineItemDerivedTotals?.labor ?? proposalLaborPrice;
+  const effectiveProposalSubtotal = lineItemDerivedTotals?.subtotal ?? proposalSubtotal;
+  const effectiveProposalTax = lineItemDerivedTotals?.tax ?? proposalTotalTax;
+  const effectiveProposalGrandTotal = lineItemDerivedTotals?.grandTotal ?? proposalGrandTotal;
+
   const estimateCatalogMaterialsTotal = useMemo(() => {
     const raw = customerEstimateLines.reduce((s, r) => s + estimateCatalogLineExtendedSell(r), 0);
     return Math.round(raw * 100) / 100;
@@ -15649,11 +15672,11 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
     const showEstimateSummary = isLegacyEst || estimateCatalogViewOpen;
     setSummary({
       proposalNumber: displayNumberForQuoteRow(quote, isLegacyEst),
-      materials: showEstimateSummary ? Number(estimateCatalogMaterialsTotal) || 0 : Number(proposalMaterialsTotalWithSubcontractors) || 0,
-      labor: showEstimateSummary ? 0 : Number(proposalLaborPrice) || 0,
-      subtotal: showEstimateSummary ? Number(estimateCatalogMaterialsTotal) || 0 : Number(proposalSubtotal) || 0,
-      tax: showEstimateSummary ? Number(estimateCatalogTaxAmount) || 0 : Number(proposalTotalTax) || 0,
-      grandTotal: showEstimateSummary ? Number(estimateCatalogGrandTotalFull) || 0 : Number(proposalGrandTotal) || 0,
+      materials: showEstimateSummary ? Number(estimateCatalogMaterialsTotal) || 0 : Number(effectiveProposalMaterials) || 0,
+      labor: showEstimateSummary ? 0 : Number(effectiveProposalLabor) || 0,
+      subtotal: showEstimateSummary ? Number(estimateCatalogMaterialsTotal) || 0 : Number(effectiveProposalSubtotal) || 0,
+      tax: showEstimateSummary ? Number(estimateCatalogTaxAmount) || 0 : Number(effectiveProposalTax) || 0,
+      grandTotal: showEstimateSummary ? Number(estimateCatalogGrandTotalFull) || 0 : Number(effectiveProposalGrandTotal) || 0,
       jobWorkbookMaterials:
         typeof externalJobWorkbookMaterialsTotal === 'number' ? externalJobWorkbookMaterialsTotal : null,
       proposalWorkbookMaterials:
@@ -15671,11 +15694,11 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
     estimateCatalogMaterialsTotal,
     estimateCatalogTaxAmount,
     estimateCatalogGrandTotalFull,
-    proposalMaterialsTotalWithSubcontractors,
-    proposalLaborPrice,
-    proposalSubtotal,
-    proposalTotalTax,
-    proposalGrandTotal,
+    effectiveProposalMaterials,
+    effectiveProposalLabor,
+    effectiveProposalSubtotal,
+    effectiveProposalTax,
+    effectiveProposalGrandTotal,
     externalJobWorkbookMaterialsTotal,
     externalProposalWorkbookMaterialsTotal,
   ]);
@@ -15684,10 +15707,10 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
   const lastSyncedTotalsRef = useRef<{ quoteId: string; sub: number; tax: number; grand: number } | null>(null);
   useEffect(() => {
     if (estimateCatalogViewOpen) return;
-    if (!quote?.id || !Number.isFinite(proposalSubtotal) || !Number.isFinite(proposalGrandTotal)) return;
-    const sub = Math.round(proposalSubtotal * 100) / 100;
-    const tax = Math.round((proposalTotalTax ?? 0) * 100) / 100;
-    const grand = Math.round(proposalGrandTotal * 100) / 100;
+    if (!quote?.id || !Number.isFinite(effectiveProposalSubtotal) || !Number.isFinite(effectiveProposalGrandTotal)) return;
+    const sub = Math.round(effectiveProposalSubtotal * 100) / 100;
+    const tax = Math.round((effectiveProposalTax ?? 0) * 100) / 100;
+    const grand = Math.round(effectiveProposalGrandTotal * 100) / 100;
     const prev = lastSyncedTotalsRef.current;
     if (prev && prev.quoteId === quote.id && prev.sub === sub && prev.tax === tax && prev.grand === grand) return;
     lastSyncedTotalsRef.current = { quoteId: quote.id, sub, tax, grand };
@@ -15727,7 +15750,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
       })
       .eq('id', quote.id)
       .then(({ error }) => { if (error) console.warn('Sync proposal totals to quote:', error?.message); });
-  }, [quote?.id, proposalSubtotal, proposalTotalTax, proposalGrandTotal, estimateCatalogViewOpen]);
+  }, [quote?.id, effectiveProposalSubtotal, effectiveProposalTax, effectiveProposalGrandTotal, estimateCatalogViewOpen]);
 
   if (loading) {
     return (

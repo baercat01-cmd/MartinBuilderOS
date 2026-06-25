@@ -13,6 +13,8 @@ export interface ProposalLineBreakdownRow {
   linePrice: number;
   optional: boolean;
   notes: string;
+  /** Defaults to taxable (true) when omitted. Set false for tax-exempt material lines. */
+  taxable?: boolean;
 }
 
 export interface ProposalLineBreakdownSectionMeta {
@@ -38,6 +40,16 @@ export interface ProposalLineBreakdownExportData {
     grandTotal: number;
   };
   taxExempt?: boolean;
+  /** Tax rate applied to taxable materials. Defaults to 0.07. */
+  taxRate?: number;
+}
+
+export interface LineBreakdownTotals {
+  materials: number;
+  labor: number;
+  subtotal: number;
+  tax: number;
+  grandTotal: number;
 }
 
 function escapeHtml(s: string): string {
@@ -56,6 +68,53 @@ function money(n: number): string {
 function fmtQty(n: number): string {
   if (!Number.isFinite(n)) return '0';
   return Number.isInteger(n) ? String(n) : n.toFixed(2);
+}
+
+function round2(n: number): number {
+  return Math.round((Number(n) || 0) * 100) / 100;
+}
+
+/** True when a line represents labor (section labor, subcontractor labor, or a labor-category row). */
+export function isLaborBreakdownRow(
+  row: Pick<ProposalLineBreakdownRow, 'lineType' | 'category'>,
+): boolean {
+  return /labor/i.test(row.lineType || '') || /^labor$/i.test((row.category || '').trim());
+}
+
+/**
+ * Single source of truth for the "Proposal totals" box: derive every total from the line
+ * rows themselves so the totals can never diverge from the lines shown above them.
+ *
+ * - Optional rows are excluded from the totals.
+ * - Labor = sum of labor rows; Materials & subcontractors = sum of all other rows.
+ * - Tax applies to taxable materials only (a row counts as taxable unless taxable === false).
+ */
+export function computeLineBreakdownTotals(
+  rows: ProposalLineBreakdownRow[],
+  opts: { taxExempt?: boolean; taxRate?: number } = {},
+): LineBreakdownTotals {
+  const taxRate = opts.taxRate ?? 0.07;
+  let materials = 0;
+  let labor = 0;
+  let taxableMaterials = 0;
+
+  for (const row of rows) {
+    if (row.optional) continue;
+    const linePrice = Number(row.linePrice) || 0;
+    if (isLaborBreakdownRow(row)) {
+      labor += linePrice;
+    } else {
+      materials += linePrice;
+      if (row.taxable !== false) taxableMaterials += linePrice;
+    }
+  }
+
+  materials = round2(materials);
+  labor = round2(labor);
+  const subtotal = round2(materials + labor);
+  const tax = opts.taxExempt ? 0 : round2(round2(taxableMaterials) * taxRate);
+  const grandTotal = round2(subtotal + tax);
+  return { materials, labor, subtotal, tax, grandTotal };
 }
 
 /** Flat CSV with fixed column order. */
@@ -105,7 +164,12 @@ export function proposalLineBreakdownRowsToCsv(rows: ProposalLineBreakdownRow[])
 
 /** Internal PDF: proposal scope + every line with base, markup %, and sell price — no terms or signatures. */
 export function generateProposalLineBreakdownHTML(data: ProposalLineBreakdownExportData): string {
-  const { proposalNumber, date, job, rows, sectionMeta, totals, taxExempt = false } = data;
+  const { proposalNumber, date, job, rows, sectionMeta, taxExempt = false } = data;
+
+  // Totals are derived from the line rows themselves (single source of truth) so the
+  // "Proposal totals" box can never disagree with the lines above it. The passed-in
+  // data.totals is intentionally ignored here.
+  const totals = computeLineBreakdownTotals(rows, { taxExempt, taxRate: data.taxRate });
 
   const sectionOrder: string[] = [];
   const rowsBySection = new Map<string, ProposalLineBreakdownRow[]>();

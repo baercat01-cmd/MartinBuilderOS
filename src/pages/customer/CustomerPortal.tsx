@@ -2976,7 +2976,7 @@ function JobDetailView({
                         </div>
                         <div className="text-right">
                           <p className="text-xl font-bold text-green-600">
-                            ${parseFloat(payment.amount.toString()).toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                            ${parseFloat(payment.amount.toString()).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                           </p>
                           {payment.receipt_url && (
                             <Button

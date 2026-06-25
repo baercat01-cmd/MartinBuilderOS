@@ -42,7 +42,7 @@ export function ProposalSummaryRow({ className }: { className?: string }) {
   const ctx = useProposalSummary();
   const s = ctx?.summary;
   if (!s) return null;
-  const fmt = (n: number) => (Number.isFinite(n) ? n : 0).toLocaleString('en-US', { minimumFractionDigits: 2 });
+  const fmt = (n: number) => (Number.isFinite(n) ? n : 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   return (
     <div className={`flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs ${className ?? ''}`}>
       <span className="inline-flex items-baseline gap-1">
