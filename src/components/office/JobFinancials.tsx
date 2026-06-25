@@ -91,6 +91,7 @@ import {
 } from '@/lib/proposalIsolation';
 import { remapMaterialBundleItemsForJob } from '@/lib/materialBundleRemap';
 import { syncMissingWorkingSheetsFromLocked } from '@/lib/materialWorkbookSheetSync';
+import { getMaterialLineSellAndCost } from '@/lib/materialItemLineMoney';
 
 interface CustomFinancialRow {
   id: string;
@@ -335,20 +336,22 @@ async function fetchMaterialWorkbooksFullForQuote(quoteId: string) {
   return { data: null, error: lastErr };
 }
 
-/** Pick one canonical workbook to clone (working preferred; labor + items break ties). */
+/** Pick one canonical workbook to clone (working preferred; descriptions, labor + items break ties). */
 function pickWorkbookForProposalClone(workbooks: any[]): any | null {
   if (!workbooks?.length) return null;
   const score = (wb: any) => {
     const sheets = ((wb.material_sheets as any[]) || []);
     let itemCount = 0;
     let laborCount = 0;
+    let describedCount = 0;
     sheets.forEach((s) => {
       itemCount += (s.material_items || []).length;
       laborCount += (s.material_sheet_labor || []).length;
+      if (typeof s.description === 'string' && s.description.trim() !== '') describedCount += 1;
     });
     const statusBoost =
       wb.status === 'working' ? 1_000_000 : wb.status === 'locked' ? 500_000 : 0;
-    return statusBoost + laborCount * 10_000 + itemCount * 100 + sheets.length;
+    return statusBoost + describedCount * 100_000 + laborCount * 10_000 + itemCount * 100 + sheets.length;
   };
   return workbooks.reduce((best, wb) => (score(wb) > score(best) ? wb : best));
 }
@@ -366,6 +369,194 @@ function normalizeLaborSheetName(v: unknown): string {
     .toLowerCase()
     .trim()
     .replace(/\s+/g, ' ');
+}
+
+/** Fill empty section descriptions from sibling quote workbooks (locked vs working copies). */
+async function mergeSheetDescriptionsFromSiblingWorkbooks(
+  targetQuoteId: string,
+  displayedWbId: string,
+  sheetsData: any[],
+): Promise<void> {
+  if (!targetQuoteId || !displayedWbId || sheetsData.length === 0) return;
+
+  const { data: quoteWbs } = await supabase
+    .from('material_workbooks')
+    .select('id')
+    .eq('quote_id', targetQuoteId);
+  const otherWbIds = (quoteWbs || [])
+    .map((w: any) => String(w?.id ?? '').trim())
+    .filter((id: string) => id && id !== String(displayedWbId).trim());
+  if (otherWbIds.length === 0) return;
+
+  const { data: otherSheets } = await supabase
+    .from('material_sheets')
+    .select('sheet_name, order_index, description')
+    .in('workbook_id', otherWbIds);
+
+  const descByName = new Map<string, string>();
+  const descByOrder = new Map<number, string>();
+  (otherSheets || []).forEach((s: any) => {
+    const desc = String(s?.description ?? '').trim();
+    if (!desc) return;
+    const nameKey = normalizeLaborSheetName(s?.sheet_name);
+    if (nameKey && !descByName.has(nameKey)) descByName.set(nameKey, desc);
+    const oi = Number(s?.order_index);
+    if (Number.isFinite(oi) && !descByOrder.has(oi)) descByOrder.set(oi, desc);
+  });
+
+  sheetsData.forEach((sheet: any) => {
+    if (String(sheet?.description ?? '').trim()) return;
+    const nameKey = normalizeLaborSheetName(sheet?.sheet_name);
+    const byName = nameKey ? descByName.get(nameKey) : undefined;
+    const oi = Number(sheet?.order_index);
+    const byOrder = Number.isFinite(oi) ? descByOrder.get(oi) : undefined;
+    const merged = byName || byOrder;
+    if (merged) sheet.description = merged;
+  });
+}
+
+function materialItemExtendedPrice(item: Record<string, unknown>): number {
+  return getMaterialLineSellAndCost(item as any).price;
+}
+
+function materialItemExtendedCost(item: Record<string, unknown>): number {
+  return getMaterialLineSellAndCost(item as any).cost;
+}
+
+function dedupeMaterialItemsById(items: any[]): any[] {
+  const seen = new Set<string>();
+  return (items || []).filter((item) => {
+    const id = String(item?.id ?? '').trim();
+    if (id) {
+      if (seen.has(id)) return false;
+      seen.add(id);
+      return true;
+    }
+    const fallback = `${item?.material_name ?? ''}|${item?.category ?? ''}|${item?.quantity ?? ''}|${item?.sku ?? ''}`;
+    if (seen.has(fallback)) return false;
+    seen.add(fallback);
+    return true;
+  });
+}
+
+/** Build per-category sell totals for a workbook (matches materials Breakdown cards). */
+async function fetchCategoryPricesForWorkbook(
+  workbookId: string,
+): Promise<{ sheetId: string; sheetName: string; categories: Record<string, number> }[]> {
+  const { data: sheets } = await supabase
+    .from('material_sheets')
+    .select('id, sheet_name, category_order')
+    .eq('workbook_id', workbookId)
+    .order('order_index');
+  if (!sheets?.length) return [];
+
+  const sheetIds = sheets.map((s) => s.id).filter(Boolean);
+  const { data: items } = await supabase
+    .from('material_items')
+    .select('id, sheet_id, category, extended_price, quantity, price_per_unit')
+    .in('sheet_id', sheetIds);
+
+  const itemsBySheet = new Map<string, any[]>();
+  (items || []).forEach((item) => {
+    const sid = String(item.sheet_id ?? '').trim();
+    if (!sid) return;
+    if (!itemsBySheet.has(sid)) itemsBySheet.set(sid, []);
+    itemsBySheet.get(sid)!.push(item);
+  });
+
+  return sheets.map((sheet) => {
+    const sheetItems = dedupeMaterialItemsById(itemsBySheet.get(sheet.id) || []);
+    const categories: Record<string, number> = {};
+    for (const item of sheetItems) {
+      const key = String(item.category ?? '').trim().toLowerCase();
+      if (!key) continue;
+      const price = materialItemExtendedPrice(item);
+      if (price > 0) categories[key] = (categories[key] ?? 0) + price;
+    }
+    return {
+      sheetId: sheet.id,
+      sheetName: sheet.sheet_name || '',
+      categories,
+    };
+  });
+}
+
+/** Fill missing Labor-category material lines from sibling quote workbooks for display/totals. */
+async function supplementLaborCategoryItemsFromSiblingWorkbooks(
+  targetQuoteId: string,
+  displayedWbId: string,
+  sheetsData: any[],
+): Promise<void> {
+  if (!targetQuoteId || !displayedWbId || sheetsData.length === 0) return;
+
+  const { data: quoteWbs } = await supabase
+    .from('material_workbooks')
+    .select('id')
+    .eq('quote_id', targetQuoteId);
+  const otherWbIds = (quoteWbs || [])
+    .map((w: any) => String(w?.id ?? '').trim())
+    .filter((id: string) => id && id !== String(displayedWbId).trim());
+  if (otherWbIds.length === 0) return;
+
+  const { data: otherSheets } = await supabase
+    .from('material_sheets')
+    .select('id, sheet_name, order_index')
+    .in('workbook_id', otherWbIds);
+  const otherSheetRows = (otherSheets || []) as {
+    id: string;
+    sheet_name?: string;
+    order_index?: number;
+  }[];
+  if (otherSheetRows.length === 0) return;
+
+  const otherSheetIds = otherSheetRows.map((s) => s.id).filter(Boolean);
+  const { data: otherItems } = await supabase
+    .from('material_items')
+    .select('*')
+    .in('sheet_id', otherSheetIds)
+    .order('order_index');
+
+  const laborItemsByName = new Map<string, any[]>();
+  const laborItemsByOrder = new Map<number, any[]>();
+  for (const row of otherSheetRows) {
+    const sheetLaborItems = (otherItems || []).filter(
+      (it) =>
+        it.sheet_id === row.id &&
+        isWorkbookLaborCategoryName(it.category) &&
+        ((Number(it.extended_price) || 0) > 0 ||
+          (Number(it.quantity) || 0) * (Number(it.price_per_unit) || 0) > 0),
+    );
+    if (!sheetLaborItems.length) continue;
+    const nameKey = normalizeLaborSheetName(row.sheet_name);
+    if (nameKey && !laborItemsByName.has(nameKey)) laborItemsByName.set(nameKey, sheetLaborItems);
+    const oi = Number(row.order_index);
+    if (Number.isFinite(oi) && !laborItemsByOrder.has(oi)) laborItemsByOrder.set(oi, sheetLaborItems);
+  }
+
+  for (const sheet of sheetsData) {
+    const existing = (sheet.material_items || []) as any[];
+    const existingLaborTotal = existing
+      .filter((it) => isWorkbookLaborCategoryName(it.category))
+      .reduce((sum, it) => {
+        const price = Number(it.extended_price);
+        if (Number.isFinite(price) && price > 0) return sum + price;
+        return sum + (Number(it.quantity) || 0) * (Number(it.price_per_unit) || 0);
+      }, 0);
+    if (existingLaborTotal > 0) continue;
+
+    const nameKey = normalizeLaborSheetName(sheet.sheet_name);
+    const byName = nameKey ? laborItemsByName.get(nameKey) : undefined;
+    const oi = Number(sheet.order_index);
+    const byOrder = Number.isFinite(oi) ? laborItemsByOrder.get(oi) : undefined;
+    const donorItems = byName || byOrder;
+    if (!donorItems?.length) continue;
+
+    const sid = String(sheet.id ?? '').trim();
+    sheet.material_items = [
+      ...existing,
+      ...donorItems.map((it) => ({ ...it, sheet_id: sid })),
+    ];
+  }
 }
 
 /** Resolve sheet-linked line items when map keys drift (locked vs working workbook sheet ids). */
@@ -836,6 +1027,7 @@ async function mergeLaborFromJobWorkbooksForQuote(
 /** Resolve proposal display sheets directly from DB (no materials panel required). */
 async function resolveDisplayedSheetsForQuoteFromDb(
   quoteId: string,
+  preferredWorkbookId?: string | null,
 ): Promise<{ sheets: LaborSheetRef[]; workbookId: string | null }> {
   const { data: wbRows } = await supabase
     .from('material_workbooks')
@@ -848,15 +1040,16 @@ async function resolveDisplayedSheetsForQuoteFromDb(
     wbs
       .filter((w) => w.status === status)
       .sort((a, b) => (Number(b.version_number) || 0) - (Number(a.version_number) || 0));
-  const hasLocked = wbs.some((w) => w.status === 'locked');
-  const hasWorking = wbs.some((w) => w.status === 'working');
-  let primaryWbId = '';
-  if (hasLocked && hasWorking) {
-    primaryWbId = byStatus('locked')[0]?.id ?? '';
-  } else if (hasWorking) {
-    primaryWbId = byStatus('working')[0]?.id ?? '';
-  } else {
-    primaryWbId = byStatus('locked')[0]?.id ?? wbs[0]?.id ?? '';
+  const preferred = String(preferredWorkbookId ?? '').trim();
+  let primaryWbId = preferred && wbs.some((w) => w.id === preferred) ? preferred : '';
+  if (!primaryWbId) {
+    const hasWorking = wbs.some((w) => w.status === 'working');
+    if (hasWorking) {
+      primaryWbId = byStatus('working')[0]?.id ?? '';
+    }
+    if (!primaryWbId) {
+      primaryWbId = byStatus('locked')[0]?.id ?? wbs[0]?.id ?? '';
+    }
   }
   if (!primaryWbId) return { sheets: [], workbookId: null };
 
@@ -1480,10 +1673,7 @@ function SortableRow({
 
         // Fallback: compute from items in this category's own breakdown data.
         const itemsPrice = ((cat?.items || []) as any[]).reduce((sum: number, item: any) => {
-          if (item?.extended_price != null && item.extended_price !== '') {
-            return sum + (Number(item.extended_price) || 0);
-          }
-          return sum + ((Number(item?.quantity) || 0) * (Number(item?.price_per_unit) || 0));
+          return sum + getMaterialLineSellAndCost(item).price;
         }, 0);
         if (itemsPrice > 0) return itemsPrice;
 
@@ -4176,6 +4366,7 @@ export function JobFinancials({
   // Optional-category overlay is per workbook/sheet keys — must not carry over to another proposal
   useEffect(() => {
     setOptionalCategoryOverlay({});
+    setLockedSiblingCategoryPrices([]);
   }, [quote?.id]);
 
   const isDefaultLocked = isQuoteDefaultLockedForProposalPanel(quote, allJobQuotes);
@@ -4183,28 +4374,37 @@ export function JobFinancials({
   const isExternallyViewingLockedWorkbook = externalMaterialsWorkbookView?.status === 'locked';
   const isPriceIsolated = isReadOnly || isExternallyViewingLockedWorkbook;
 
+  const [lockedSiblingCategoryPrices, setLockedSiblingCategoryPrices] = useState<
+    { sheetId: string; sheetName: string; categories: Record<string, number> }[]
+  >([]);
+
   // Build a fast lookup from the structured Breakdown prices: (sheetId|sheetName) → categoryName → price.
-  // Signed contract: only apply Materials-panel category sync when that panel reports the **locked** contract workbook.
-  // If status is working, null (before sync), or anything other than locked, ignore external prices so the header
-  // stays on DB-loaded locked snapshot totals instead of the job-tracking working copy (~$ mismatch while editing).
+  // Locked snapshot prices are loaded first; live materials-panel sync overwrites when present.
   const externalPriceLookup = useMemo(() => {
-    if (quote && quoteHasActiveContract(quote as any) && externalMaterialsWorkbookView?.status !== 'locked') {
-      return new Map<string, Record<string, number>>();
-    }
     const map = new Map<string, Record<string, number>>();
-    (externalBreakdownSheetPrices || []).forEach((sp) => {
-      // Normalize category keys so lookups by lowercased names always work.
+    const ingest = (sp: { sheetId: string; sheetName: string; categories: Record<string, number> }) => {
       const normalizedCategories: Record<string, number> = {};
       Object.entries(sp.categories || {}).forEach(([k, v]) => {
         const key = String(k ?? '').trim().toLowerCase();
         if (!key) return;
         normalizedCategories[key] = Number(v) || 0;
       });
+      if (!Object.keys(normalizedCategories).length) return;
       map.set(sp.sheetId, normalizedCategories);
       map.set(sp.sheetName.trim().toLowerCase(), normalizedCategories);
-    });
+    };
+    // Locked snapshot category totals — always available as fallback when working copy is displayed.
+    (lockedSiblingCategoryPrices || []).forEach(ingest);
+    // Live materials-panel sync (only when panel shows the locked contract workbook).
+    const blockLivePanelSync =
+      quote &&
+      quoteHasActiveContract(quote as any) &&
+      externalMaterialsWorkbookView?.status !== 'locked';
+    if (!blockLivePanelSync) {
+      (externalBreakdownSheetPrices || []).forEach(ingest);
+    }
     return map;
-  }, [externalBreakdownSheetPrices, quote, externalMaterialsWorkbookView?.status]);
+  }, [externalBreakdownSheetPrices, lockedSiblingCategoryPrices, quote, externalMaterialsWorkbookView?.status]);
   
   // Document viewer state — Building Description is quote-level only (quotes.description), not job-level
   const [showDocumentViewer, setShowDocumentViewer] = useState(false);
@@ -4926,9 +5126,10 @@ export function JobFinancials({
     let primaryWbId = '';
     if (hasLocked && hasWorking) {
       primaryWbId =
-        wbs
-          .filter((w) => w.status === 'locked')
-          .sort((a, b) => (Number(b.version_number) || 0) - (Number(a.version_number) || 0))[0]?.id ?? '';
+        String(displayedWorkbookIdRef.current ?? '').trim() ||
+        (wbs
+          .filter((w) => w.status === 'working')
+          .sort((a, b) => (Number(b.version_number) || 0) - (Number(a.version_number) || 0))[0]?.id ?? '');
     } else if (hasWorking) {
       primaryWbId =
         wbs
@@ -4967,8 +5168,11 @@ export function JobFinancials({
       setSheetMetaById((prev) => ({ ...prev, ...metaPatch }));
     }
 
+    const displayWbId =
+      String(displayedWorkbookIdRef.current ?? '').trim() || String(primaryWbId).trim();
+
     const displayedSheets: LaborSheetRef[] = allSheets
-      .filter((s: any) => String(s?.workbook_id ?? '').trim() === String(primaryWbId).trim())
+      .filter((s: any) => String(s?.workbook_id ?? '').trim() === displayWbId)
       .map((s: any) => ({
         id: String(s.id),
         sheet_name: s.sheet_name,
@@ -5019,6 +5223,7 @@ export function JobFinancials({
       message: 'prefetch rekeyed sheet line items onto displayed workbook',
       data: {
         quoteId,
+        displayWbId,
         primaryWbId,
         rawKeyCount: Object.keys(rawMap).length,
         rekeyedKeyCount: Object.keys(rekeyed).length,
@@ -5045,7 +5250,10 @@ export function JobFinancials({
       refs = lastDisplayedSheetRefsRef.current.filter((s) => s.id);
     }
     if (!refs.length) {
-      const resolved = await resolveDisplayedSheetsForQuoteFromDb(targetQuoteId);
+      const resolved = await resolveDisplayedSheetsForQuoteFromDb(
+        targetQuoteId,
+        displayedWorkbookIdRef.current,
+      );
       refs = resolved.sheets;
       if (resolved.workbookId) {
         displayedWorkbookIdRef.current = resolved.workbookId;
@@ -9580,22 +9788,63 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
         // both sorted by version_number desc — NOT updated_at alone, or locking the working copy can surface an
         // older locked snapshot and change materials totals on the left panel.
         if (contractFrozen) {
-          // Office lock OR signed contract: one `locked` workbook row holds the proposal materials total (no edits on a separate job workbook affect this).
-          // When signed contract + working duplicate exists, this is always the locked snapshot; when office-locked only, it is the single flipped workbook.
           const { data: lockedRows, error: lockedErr } = await supabase
             .from('material_workbooks')
             .select(wbSelect)
             .eq('quote_id', targetQuoteId)
             .eq('status', 'locked')
             .order('version_number', { ascending: false });
-          workbookError = lockedErr;
-          workbookData =
-            Array.isArray(lockedRows) && lockedRows.length > 0 ? lockedRows[0] : null;
+          const { data: workingRows, error: workingErr } = await supabase
+            .from('material_workbooks')
+            .select(wbSelect)
+            .eq('quote_id', targetQuoteId)
+            .eq('status', 'working')
+            .order('version_number', { ascending: false });
+          workbookError = lockedErr || workingErr;
+          const lockedWb = Array.isArray(lockedRows) && lockedRows.length > 0 ? lockedRows[0] : null;
+          const workingWb = pickWorkbookForProposalClone(workingRows || []) ?? null;
+
+          if (lockedWb && workingWb) {
+            try {
+              await syncMissingWorkingSheetsFromLocked({
+                lockedWorkbookId: lockedWb.id,
+                workingWorkbookId: workingWb.id,
+              });
+              const { data: refreshedWorking } = await supabase
+                .from('material_workbooks')
+                .select(wbSelect)
+                .eq('id', workingWb.id)
+                .limit(1)
+                .maybeSingle();
+              workbookData = refreshedWorking ?? workingWb;
+            } catch (syncErr) {
+              console.warn('sync locked metadata into working before proposal display:', syncErr);
+              workbookData = workingWb;
+            }
+            try {
+              const lockedPrices = await fetchCategoryPricesForWorkbook(String(lockedWb.id));
+              if (!isFinancialLoadStale(cooperativeGen)) {
+                setLockedSiblingCategoryPrices(lockedPrices);
+              }
+            } catch (priceErr) {
+              console.warn('fetch locked sibling category prices:', priceErr);
+            }
+          } else {
+            workbookData = lockedWb ?? workingWb;
+            if (lockedWb?.id) {
+              try {
+                const lockedPrices = await fetchCategoryPricesForWorkbook(String(lockedWb.id));
+                if (!isFinancialLoadStale(cooperativeGen)) {
+                  setLockedSiblingCategoryPrices(lockedPrices);
+                }
+              } catch {
+                /* ignore */
+              }
+            }
+          }
           usedFallbackWorkbook = false;
           proposalWorkbookIdForLabor = null;
           if (!workbookData && !workbookError) {
-            // Hard guarantee: do NOT fall back to working when this quote is frozen/locked.
-            // Falling back would let working edits change locked proposal totals.
             toast.error('Locked proposal workbook not found. Create/restore the locked contract workbook to view locked totals.');
           }
         } else {
@@ -9766,9 +10015,81 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
       });
       // #endregion
 
+      // Heal working sheets from locked proposal copy (descriptions, labor) before building the view.
+      if (hasQuote && targetQuoteId && workbookData?.id) {
+        try {
+          const { data: wbStatuses } = await supabase
+            .from('material_workbooks')
+            .select('id, status, version_number')
+            .eq('quote_id', targetQuoteId);
+          const list = (wbStatuses || []) as { id?: string; status?: string; version_number?: number }[];
+          const sortByVersion = (a: { version_number?: number }, b: { version_number?: number }) =>
+            (Number(b.version_number) || 0) - (Number(a.version_number) || 0);
+          const lockedRow = list.filter((w) => w.status === 'locked').sort(sortByVersion)[0];
+          const workingRow = list.filter((w) => w.status === 'working').sort(sortByVersion)[0];
+          const displayedId = String(workbookData.id).trim();
+          if (
+            lockedRow?.id &&
+            workingRow?.id &&
+            displayedId === String(workingRow.id).trim()
+          ) {
+            const heal = await syncMissingWorkingSheetsFromLocked({
+              lockedWorkbookId: lockedRow.id,
+              workingWorkbookId: workingRow.id,
+            });
+            const healed =
+              heal.addedSheetCount > 0 ||
+              heal.backfilledDescriptionCount > 0 ||
+              heal.copiedLaborRowCount > 0 ||
+              heal.copiedSheetLineItemCount > 0 ||
+              heal.copiedLaborCategoryItemCount > 0;
+            if (healed) {
+              const healSelect = `
+                id,
+                status,
+                quote_id,
+                material_sheets (
+                  *,
+                  material_items (*),
+                  material_sheet_labor (*),
+                  material_category_markups (*)
+                )
+              `;
+              const { data: refreshed } = await supabase
+                .from('material_workbooks')
+                .select(healSelect)
+                .eq('id', workingRow.id)
+                .limit(1)
+                .maybeSingle();
+              if (refreshed) workbookData = refreshed;
+            }
+          }
+        } catch (healErr) {
+          console.warn('heal working sheets from locked metadata:', healErr);
+        }
+      }
+
       const sheetsData: any[] = (workbookData.material_sheets || [])
         .slice()
         .sort((a: any, b: any) => (a.order_index ?? 0) - (b.order_index ?? 0));
+
+      if (hasQuote && targetQuoteId && workbookData?.id) {
+        try {
+          await mergeSheetDescriptionsFromSiblingWorkbooks(
+            targetQuoteId,
+            String(workbookData.id),
+            sheetsData,
+          );
+          await supplementLaborCategoryItemsFromSiblingWorkbooks(
+            targetQuoteId,
+            String(workbookData.id),
+            sheetsData,
+          );
+        } catch (descMergeErr) {
+          console.warn('merge sibling workbook descriptions/labor categories:', descMergeErr);
+        }
+      }
+
       lastDisplayedSheetRefsRef.current = sheetsData.map((s: any) => ({
         id: String(s?.id ?? '').trim(),
         sheet_name: s?.sheet_name,
@@ -9943,9 +10264,8 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
       }
 
       // Labor sometimes remains only on another workbook for the SAME quote (locked vs working).
-      // When multiple formal proposals exist on the job, never merge labor from other quotes' sheets.
       const isolateProposals = jobHasMultipleFormalProposals(allJobQuotes);
-      if (job?.id && sheetsData.length > 0 && !isolateProposals) {
+      if (job?.id && sheetsData.length > 0) {
         try {
           const normalizeSheetNameJl = (v: unknown) =>
             String(v ?? '')
@@ -9975,7 +10295,11 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
             .select('id, quote_id')
             .eq('job_id', job.id);
           const jobWbIds = (jobWbList || [])
-            .filter((w: any) => !w.quote_id || w.quote_id === targetQuoteId)
+            .filter((w: any) => {
+              const qid = String(w?.quote_id ?? '').trim();
+              if (isolateProposals) return qid === targetQuoteId;
+              return !qid || qid === targetQuoteId;
+            })
             .map((w: any) => String(w?.id ?? '').trim())
             .filter(Boolean);
           if (jobWbIds.length > 0) {
@@ -10058,7 +10382,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
         } catch (e) {
           console.warn('mergeLaborFromAllQuoteWorkbooks:', e);
         }
-        if (job?.id && laborMapTotal(laborMap) === 0) {
+        if (job?.id) {
           try {
             await mergeLaborFromJobWorkbooksForQuote(
               job.id,
@@ -10286,7 +10610,9 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
 
       // Calculate breakdown by sheet and category
       const breakdowns = (sheetsData || []).map(sheet => {
-        const sheetItems = (itemsData || []).filter(item => item.sheet_id === sheet.id);
+        const sheetItems = dedupeMaterialItemsById(
+          (itemsData || []).filter(item => item.sheet_id === sheet.id),
+        );
 
         // Group by category
         const categoryMap = new Map<string, any[]>();
@@ -10298,18 +10624,12 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
           categoryMap.get(category)!.push(item);
         });
 
-        // Calculate totals per category from item-level prices (no category-level recalculation).
-        const itemEffectivePrice = (item: any) =>
-          (item.extended_price != null && item.extended_price !== '')
-            ? Number(item.extended_price)
-            : (Number(item.quantity) || 0) * (Number(item.price_per_unit) || 0);
+        // Calculate totals per category — same line math as MaterialsManagement getDisplayExtended.
+        const itemEffectivePrice = (item: any) => getMaterialLineSellAndCost(item).price;
+        const itemEffectiveCost = (item: any) => getMaterialLineSellAndCost(item).cost;
         const builtCategories = Array.from(categoryMap.entries()).map(([categoryName, items]) => {
           const isCategoryOptional = categoryOptionalMap.get(`${sheet.id}_${categoryName}`) === true;
-          const totalCost = isCategoryOptional ? 0 : items.reduce((sum, item) => {
-            const extended = Number(item.extended_cost) || 0;
-            if (extended > 0) return sum + extended;
-            return sum + ((Number(item.cost_per_unit) || 0) * (Number(item.quantity) || 0));
-          }, 0);
+          const totalCost = isCategoryOptional ? 0 : items.reduce((sum, item) => sum + itemEffectiveCost(item), 0);
           const totalPrice = isCategoryOptional ? 0 : items.reduce((sum, item) => sum + itemEffectivePrice(item), 0);
 
           const profit = totalPrice - totalCost;
@@ -10318,7 +10638,9 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
           return {
             name: categoryName,
             itemCount: items.length,
-            items: items.map((item: any) => ({
+            items: items.map((item: any) => {
+              const line = getMaterialLineSellAndCost(item);
+              return {
               id: item.id,
               order_index: item.order_index ?? 0,
               isOptional: isCategoryOptional,
@@ -10327,13 +10649,10 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
               quantity: item.quantity || 0,
               cost_per_unit: item.cost_per_unit || 0,
               price_per_unit: item.price_per_unit || 0,
-              extended_cost: (item.extended_cost != null && item.extended_cost !== '')
-                ? Number(item.extended_cost)
-                : (Number(item.cost_per_unit) || 0) * (Number(item.quantity) || 0),
-              extended_price: (item.extended_price != null && item.extended_price !== '')
-                ? Number(item.extended_price)
-                : (Number(item.quantity) || 0) * (Number(item.price_per_unit) || 0),
-            })),
+              extended_cost: line.cost,
+              extended_price: line.price,
+            };
+            }),
             totalCost,
             totalPrice,
             profit,
@@ -14060,19 +14379,12 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
         );
         if (synced !== undefined) return synced;
         const itemsPrice = ((cat?.items || []) as any[]).reduce((sum: number, item: any) => {
-        if (item?.extended_price != null && item.extended_price !== '') {
-          return sum + (Number(item.extended_price) || 0);
-        }
-        return sum + ((Number(item?.quantity) || 0) * (Number(item?.price_per_unit) || 0));
+        return sum + getMaterialLineSellAndCost(item).price;
       }, 0);
       if (itemsPrice > 0) return itemsPrice;
       // Fallback: if selling price fields are missing, use cost fields so category markup can still produce a price.
-      // This fixes under-counting when rows have cost populated but price_per_unit / extended_price are blank.
       const itemsCost = ((cat?.items || []) as any[]).reduce((sum: number, item: any) => {
-        if (item?.extended_cost != null && item.extended_cost !== '') {
-          return sum + (Number(item.extended_cost) || 0);
-        }
-        return sum + ((Number(item?.quantity) || 0) * (Number(item?.cost_per_unit) || 0));
+        return sum + getMaterialLineSellAndCost(item).cost;
       }, 0);
       if (itemsCost > 0) return itemsCost;
       const directTotalPrice = Number(cat?.totalPrice);
