@@ -1730,9 +1730,13 @@ function SortableRow({
         linkedRowTotals.materialTotal +
         linkedSubsMaterialsTotal;
       
-      // Total labor: DB sheet labor + line items + linked rows/subs + workbook "Labor" category
+      // Total labor: DB sheet labor + line items + linked rows/subs + workbook "Labor" category.
+      // The workbook "Labor" category and the material_sheet_labor row are both synced from the
+      // locked workbook and represent the SAME labor, so adding both double-counts. When the
+      // section already carries labor as a "Labor" category, ignore the duplicate sheet-labor row.
+      const dedupedSheetLaborTotal = laborSubtotalFromCategories > 0 ? 0 : sheetLaborTotal;
       const totalLaborCost =
-        sheetLaborTotal +
+        dedupedSheetLaborTotal +
         sheetLaborLineItemsTotal +
         linkedRowTotals.laborTotal +
         linkedSubsLaborTotal +
@@ -4400,16 +4404,10 @@ export function JobFinancials({
       map.set(sp.sheetId, normalizedCategories);
       map.set(sp.sheetName.trim().toLowerCase(), normalizedCategories);
     };
-    // Locked snapshot category totals — always available as fallback when working copy is displayed.
+    // Locked snapshot category totals — fallback before live materials-panel sync.
     (lockedSiblingCategoryPrices || []).forEach(ingest);
-    // Live materials-panel sync (only when panel shows the locked contract workbook).
-    const blockLivePanelSync =
-      quote &&
-      quoteHasActiveContract(quote as any) &&
-      externalMaterialsWorkbookView?.status !== 'locked';
-    if (!blockLivePanelSync) {
-      (externalBreakdownSheetPrices || []).forEach(ingest);
-    }
+    // Live materials-panel sync — always used for office category display (working copy is authoritative).
+    (externalBreakdownSheetPrices || []).forEach(ingest);
     return map;
   }, [externalBreakdownSheetPrices, lockedSiblingCategoryPrices, quote, externalMaterialsWorkbookView?.status]);
   
@@ -14212,6 +14210,8 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
       notes?: string;
       sectionDescription?: string;
       sectionOptional?: boolean;
+      /** Omit (or pass true) for taxable material lines; pass false for non-taxable / "No Tax" lines. */
+      taxable?: boolean;
     }) => {
       const sectionName = String(row.section ?? '');
       ensureSectionMeta(sectionName, {
@@ -14235,6 +14235,8 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
         optional:
           typeof row.optional === 'string' ? row.optional === 'Yes' : !!row.optional,
         notes: String(row.notes ?? ''),
+        // Default to taxable; only persist an explicit false so tax math honors "No Tax" lines.
+        ...(row.taxable === false ? { taxable: false } : {}),
       });
     };
 
@@ -14255,6 +14257,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
           linePrice: estimateCatalogLineExtendedSell(r),
           optional: false,
           notes: r.notes || '',
+          taxable: (r as any).taxable !== false,
           sectionDescription:
             'Office price list — rough pricing only; not the formal proposal workbook.',
         });
@@ -14263,9 +14266,18 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
       const appendMaterialSheet = (sheet: any, sectionLabel?: string) => {
         const sectionName = sectionLabel || sheet.sheetName || 'Section';
         const sheetId = String(sheet.sheetId ?? sheet.id ?? '').trim();
+        const sheetNameLower = String(sheet.sheetName ?? sheet.sheet_name ?? '').trim().toLowerCase();
         const sectionOptional = !!sheet.isOptional;
+        // Resolve the breakdown sheet by id then name — exactly like the proposal panel — so the
+        // exported categories/prices come from the same source the on-screen section uses.
         const bdSheet =
-          materialsBreakdown.sheetBreakdowns.find((s: any) => String(s.sheetId) === sheetId) || sheet;
+          materialsBreakdown.sheetBreakdowns.find(
+            (s: any) => String(s.sheetId ?? s.id ?? '').trim() === sheetId,
+          ) ||
+          materialsBreakdown.sheetBreakdowns.find(
+            (s: any) => String(s.sheetName ?? s.sheet_name ?? '').trim().toLowerCase() === sheetNameLower,
+          ) ||
+          sheet;
         const defaultSheetMarkup = Number(sheet.markup_percent ?? 10) || 10;
         const sectionDescription = String(
           sheet.sheetDescription ?? bdSheet.sheetDescription ?? '',
@@ -14276,7 +14288,18 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
           optional: sectionOptional,
         });
 
-        for (const cat of bdSheet.categories || []) {
+        // Track workbook "Labor" category labor so we never also add the duplicate
+        // material_sheet_labor "Sheet labor" row for the same section (both are synced
+        // from the locked workbook and represent the SAME labor → would double-count).
+        let workbookCategoryLaborBase = 0;
+
+        // The proposal panel shows ONE line per category (name, base price, markup %, sell price),
+        // not individual material items. Mirror that here so the PDF/CSV lines match the program.
+        const breakdownCategories = (bdSheet.categories || []) as any[];
+        const displayCategories =
+          breakdownCategories.length > 0 ? breakdownCategories : ((sheet.categories || []) as any[]);
+
+        for (const cat of displayCategories) {
           const categoryMarkup = lookupCategoryMarkup(
             categoryMarkups,
             sheetId,
@@ -14286,26 +14309,50 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
           const isLaborCat = isWorkbookLaborCategoryName(cat.name);
           const catOptional = cat.isCategoryOptional || sectionOptional;
 
-          for (const matItem of cat.items || []) {
-            const line = getMaterialLineSellAndCost(matItem);
-            const qty = Number(matItem.quantity) || 0;
-            const unitCost = qty > 0 ? line.cost / qty : Number(matItem.cost_per_unit) || 0;
-            const basePrice = line.price;
-            pushRow({
-              section: sectionName,
-              lineType: isLaborCat ? 'Labor (workbook category)' : 'Material',
-              category: cat.name,
-              description: matItem.material_name || '',
-              sku: matItem.sku || '',
-              quantity: qty,
-              unit: matItem.unit || '',
-              unitCost,
-              baseAmount: basePrice,
-              markupPct: categoryMarkup,
-              linePrice: basePrice * (1 + categoryMarkup / 100),
-              optional: catOptional,
-            });
+          // Same base-price resolution as the on-screen category row (getCategoryDisplayPrice):
+          // synced materials-panel price → sum of item sell prices → category total → 0.
+          const syncedCategoryBase = lookupSyncedCategoryBasePrice(
+            externalPriceLookup,
+            sheetId,
+            sheetNameLower,
+            cat.name,
+          );
+          let categoryBase: number;
+          if (syncedCategoryBase !== undefined) {
+            categoryBase = syncedCategoryBase;
+          } else {
+            const itemsPrice = (cat.items || []).reduce(
+              (sum: number, it: any) => sum + getMaterialLineSellAndCost(it).price,
+              0,
+            );
+            if (itemsPrice > 0) {
+              categoryBase = itemsPrice;
+            } else {
+              const directTotal = Number(cat.totalPrice);
+              categoryBase = Number.isFinite(directTotal) && directTotal > 0 ? directTotal : 0;
+            }
           }
+
+          if (isLaborCat) workbookCategoryLaborBase += categoryBase;
+
+          const itemCount = Number(cat.itemCount ?? (cat.items || []).length) || 0;
+          // One aggregate row per category (no per-item tax split), so treat it as taxable
+          // unless every item in the category is explicitly "No Tax". Labor is never taxed.
+          const catItemsForTax = cat.items || [];
+          const categoryAllNonTaxable =
+            catItemsForTax.length > 0 && catItemsForTax.every((it: any) => it?.taxable === false);
+          pushRow({
+            section: sectionName,
+            lineType: isLaborCat ? 'Labor (workbook category)' : 'Material',
+            category: cat.name,
+            description: `${cat.name} (${itemCount} item${itemCount === 1 ? '' : 's'})`,
+            quantity: 0,
+            baseAmount: categoryBase,
+            markupPct: categoryMarkup,
+            linePrice: categoryBase * (1 + categoryMarkup / 100),
+            optional: catOptional,
+            taxable: isLaborCat ? false : !categoryAllNonTaxable,
+          });
         }
 
         const sheetLaborRow = resolveSheetLaborForSection(
@@ -14316,7 +14363,13 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
           materialsBreakdown.sheetBreakdowns,
           sheetMetaById,
         );
-        if (sheetLaborRow && effectiveSheetLaborTotal(sheetLaborRow) > 0) {
+        // Skip the material_sheet_labor row when the workbook already carries this
+        // section's labor as a "Labor" category — counting both doubles the labor.
+        if (
+          workbookCategoryLaborBase <= 0 &&
+          sheetLaborRow &&
+          effectiveSheetLaborTotal(sheetLaborRow) > 0
+        ) {
           const hours = Number(sheetLaborRow.estimated_hours) || 0;
           const rate = Number(sheetLaborRow.hourly_rate) || 0;
           const total = effectiveSheetLaborTotal(sheetLaborRow);
@@ -14332,6 +14385,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
             markupPct: 0,
             linePrice: total,
             optional: sectionOptional,
+            taxable: false,
           });
         }
 
@@ -14362,6 +14416,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
             linePrice: base * (1 + markup / 100),
             optional: sectionOptional,
             notes: li.notes || '',
+            taxable: itemType === 'Labor' ? false : (li as any).taxable !== false,
           });
         }
 
@@ -14389,6 +14444,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
                 linePrice: base * (1 + itemMarkup / 100),
                 optional: toBool((row as any).is_option) || sectionOptional,
                 notes: row.notes || li.notes || '',
+                taxable: itemType === 'Labor' ? false : (li as any).taxable !== false,
               });
             }
           } else {
@@ -14407,6 +14463,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
               linePrice: base * (1 + rowMarkup / 100),
               optional: toBool((row as any).is_option) || sectionOptional,
               notes: row.notes || '',
+              taxable: (row as any).taxable !== false,
             });
           }
         }
@@ -14431,6 +14488,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
               markupPct: subMarkup,
               linePrice: base * (1 + subMarkup / 100),
               optional: toBool((sub as any).is_option) || sectionOptional,
+              taxable: itemType === 'Labor' ? false : (li as any).taxable !== false,
             });
           }
         }
@@ -14467,6 +14525,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
               linePrice: base * (1 + itemMarkup / 100),
               optional: rowOptional,
               notes: li.notes || row.notes || '',
+              taxable: itemType === 'Labor' ? false : (li as any).taxable !== false,
             });
           }
         } else {
@@ -14485,6 +14544,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
             linePrice: base * (1 + rowMarkup / 100),
             optional: rowOptional,
             notes: row.notes || '',
+            taxable: (row as any).taxable !== false,
           });
         }
 
@@ -14505,6 +14565,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
               markupPct: subMarkup,
               linePrice: base * (1 + subMarkup / 100),
               optional: rowOptional,
+              taxable: itemType === 'Labor' ? false : (li as any).taxable !== false,
             });
           }
         }
@@ -14533,6 +14594,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
             markupPct: estMarkup,
             linePrice: base * (1 + estMarkup / 100),
             optional: estOptional,
+            taxable: itemType === 'Labor' ? false : (li as any).taxable !== false,
           });
         }
       };
@@ -15396,11 +15458,17 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
     return Math.round((estimateCatalogMaterialsTotal + estimateCatalogTaxAmount) * 100) / 100;
   }, [estimateCatalogMaterialsTotal, estimateCatalogTaxAmount]);
 
-  const financialBarMaterials = estimateCatalogViewOpen ? estimateCatalogMaterialsTotal : sumAllSectionBlueTotals;
-  const financialBarLabor = estimateCatalogViewOpen ? 0 : proposalLaborPrice;
-  const financialBarSubtotal = estimateCatalogViewOpen ? estimateCatalogMaterialsTotal : proposalSubtotal;
-  const financialBarTax = estimateCatalogViewOpen ? estimateCatalogTaxAmount : proposalTotalTax;
-  const financialBarGrand = estimateCatalogViewOpen ? estimateCatalogGrandTotalFull : proposalGrandTotal;
+  const financialBarMaterials = estimateCatalogViewOpen
+    ? estimateCatalogMaterialsTotal
+    : effectiveProposalMaterials;
+  const financialBarLabor = estimateCatalogViewOpen ? 0 : effectiveProposalLabor;
+  const financialBarSubtotal = estimateCatalogViewOpen
+    ? estimateCatalogMaterialsTotal
+    : effectiveProposalSubtotal;
+  const financialBarTax = estimateCatalogViewOpen ? estimateCatalogTaxAmount : effectiveProposalTax;
+  const financialBarGrand = estimateCatalogViewOpen
+    ? estimateCatalogGrandTotalFull
+    : effectiveProposalGrandTotal;
   const showingCatalogOrLegacyEstimate =
     estimateCatalogViewOpen || (quote as any)?.is_customer_estimate === true;
   const showJobWorkbookComparison =
@@ -15883,7 +15951,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
             <span className="text-slate-600">Subtotal:</span>
             <span className="font-semibold text-slate-900">${financialBarSubtotal.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
             {taxExemptChecked ? null : (
-              <span className="text-slate-600">Tax (7%): <span className="font-semibold text-amber-700">${financialBarTax.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span></span>
+              <span className="text-slate-600">Tax (7% on materials): <span className="font-semibold text-amber-700">${financialBarTax.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span></span>
             )}
             {!isReadOnly && (
               <label className="flex items-center gap-1.5 cursor-pointer text-slate-600" title={taxExemptChecked && taxExemptSaved ? 'Saved — all users will see this job as tax exempt' : taxExemptChecked ? 'Not yet saved to database' : 'Mark this job as tax exempt'}>
@@ -16251,7 +16319,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
             <span className="text-slate-600">Subtotal:</span>
             <span className="font-semibold">${financialBarSubtotal.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
             {taxExemptChecked ? null : (
-              <span className="text-slate-600">Tax (7%): <span className="font-semibold text-amber-700">${financialBarTax.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span></span>
+              <span className="text-slate-600">Tax (7% on materials): <span className="font-semibold text-amber-700">${financialBarTax.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span></span>
             )}
             <span className="text-slate-400">|</span>
             <span

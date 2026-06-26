@@ -4831,6 +4831,10 @@ export function MaterialsManagement({
     try {
       const XLSX = await import('xlsx');
       const wb = XLSX.utils.book_new();
+      // Mirror the on-screen layout: each workbook sheet becomes its own tab, and within a
+      // tab the items are grouped by category in the same display order as the program
+      // (category_order), with a category banner, per-category subtotals, and sheet totals.
+      const NUM_COLS = 15;
       const headers = [
         'Category',
         'Usage',
@@ -4848,29 +4852,111 @@ export function MaterialsManagement({
         'Notes',
         'Status',
       ];
+      const blankRow = () => Array.from({ length: NUM_COLS }, () => '' as string | number | boolean | null);
+
       for (const sheet of workbook.sheets) {
-        const rows: (string | number | null | boolean)[][] = [headers];
-        for (const item of sheet.items) {
-          const markupDisplay = item.markup_percent != null ? (item.markup_percent * 100).toFixed(2) : '';
-          rows.push([
-            item.category ?? '',
-            item.usage ?? '',
-            item.sku ?? '',
-            item.material_name ?? '',
-            item.quantity ?? 0,
-            item.length ?? '',
-            item.color ?? '',
-            item.cost_per_unit ?? '',
-            markupDisplay,
-            item.price_per_unit ?? '',
-            item.extended_cost ?? '',
-            item.extended_price ?? '',
-            item.taxable ?? false,
-            item.notes ?? '',
-            item.status ?? '',
-          ]);
+        const rows: (string | number | null | boolean)[][] = [];
+        const merges: { s: { r: number; c: number }; e: { r: number; c: number } }[] = [];
+
+        // Sheet title banner (merged across all columns).
+        const titleRowIdx = rows.length;
+        const titleRow = blankRow();
+        titleRow[0] = sheet.sheet_name || 'Sheet';
+        rows.push(titleRow);
+        merges.push({ s: { r: titleRowIdx, c: 0 }, e: { r: titleRowIdx, c: NUM_COLS - 1 } });
+        rows.push(blankRow());
+
+        // Column headers (kept once at the top, matching the program's table columns).
+        rows.push([...headers]);
+
+        const groups = groupByCategory(sheet.items, sheet.category_order);
+        let sheetCost = 0;
+        let sheetPrice = 0;
+
+        for (const group of groups) {
+          if (!group.items || group.items.length === 0) continue;
+
+          // Category banner row (merged) — keeps each section visually together like the program.
+          const bannerIdx = rows.length;
+          const bannerRow = blankRow();
+          bannerRow[0] = `${group.category}  (${group.items.length} item${group.items.length === 1 ? '' : 's'})`;
+          rows.push(bannerRow);
+          merges.push({ s: { r: bannerIdx, c: 0 }, e: { r: bannerIdx, c: NUM_COLS - 1 } });
+
+          let catCost = 0;
+          let catPrice = 0;
+
+          for (const item of group.items) {
+            const isMetal = item.category === 'Metal';
+            const costPerUnit = isMetal ? getMetalCostPerFootDisplay(item) : item.cost_per_unit;
+            const pricePerUnit = isMetal ? getMetalPricePerFootDisplay(item) : item.price_per_unit;
+            const { cost: extCost, price: extPrice } = getDisplayExtended(item);
+            // Accumulate the same 2-decimal values that are written to the row so the visible
+            // column always sums to the printed subtotal (no penny drift from rounding).
+            const extCostRounded = Number(extCost.toFixed(2));
+            const extPriceRounded = Number(extPrice.toFixed(2));
+            catCost += extCostRounded;
+            catPrice += extPriceRounded;
+            const markupDisplay = item.markup_percent != null ? (item.markup_percent * 100).toFixed(2) : '';
+            rows.push([
+              item.category ?? '',
+              item.usage ?? '',
+              item.sku ?? '',
+              item.material_name ?? '',
+              item.quantity ?? 0,
+              item.length ?? '',
+              item.color ?? '',
+              costPerUnit ?? '',
+              markupDisplay,
+              pricePerUnit ?? '',
+              extCostRounded,
+              extPriceRounded,
+              item.taxable ?? false,
+              item.notes ?? '',
+              item.status ?? '',
+            ]);
+          }
+
+          // Per-category subtotal row (sum of the rounded line values above).
+          const catCostRounded = Number(catCost.toFixed(2));
+          const catPriceRounded = Number(catPrice.toFixed(2));
+          const subtotalRow = blankRow();
+          subtotalRow[9] = `${group.category} Subtotal`;
+          subtotalRow[10] = catCostRounded;
+          subtotalRow[11] = catPriceRounded;
+          rows.push(subtotalRow);
+          rows.push(blankRow());
+
+          sheetCost += catCostRounded;
+          sheetPrice += catPriceRounded;
         }
+
+        // Sheet totals row (sum of the category subtotals above).
+        const totalsRow = blankRow();
+        totalsRow[9] = 'Sheet Total';
+        totalsRow[10] = Number(sheetCost.toFixed(2));
+        totalsRow[11] = Number(sheetPrice.toFixed(2));
+        rows.push(totalsRow);
+
         const ws = XLSX.utils.aoa_to_sheet(rows);
+        ws['!merges'] = merges;
+        ws['!cols'] = [
+          { wch: 16 }, // Category
+          { wch: 14 }, // Usage
+          { wch: 14 }, // SKU
+          { wch: 34 }, // Material
+          { wch: 7 }, // Qty
+          { wch: 10 }, // Length
+          { wch: 12 }, // Color
+          { wch: 13 }, // Cost Per Unit
+          { wch: 9 }, // Mark Up
+          { wch: 14 }, // Price Per Unit
+          { wch: 14 }, // Extended Cost
+          { wch: 14 }, // Extended Price
+          { wch: 9 }, // Taxable
+          { wch: 24 }, // Notes
+          { wch: 12 }, // Status
+        ];
         const sheetName = (sheet.sheet_name || 'Sheet').replace(/[:\\/?*\[\]]/g, ' ').slice(0, 31);
         XLSX.utils.book_append_sheet(wb, ws, sheetName);
       }
@@ -5036,13 +5122,6 @@ export function MaterialsManagement({
 
     if (!workbook?.sheets?.length || quoteMismatch) {
       onBreakdownPriceSync?.([]);
-      return;
-    }
-    // Signed contract + internal working copy: do not push category prices to the proposal panel (customer totals).
-    const signedContract = quoteHasActiveContract(
-      buildQuoteForContract(jobQuotes, effectiveQuoteId, contractQuoteFields) as any
-    );
-    if (signedContract && workbook.status === 'working' && !snapshotWorkbookId) {
       return;
     }
 

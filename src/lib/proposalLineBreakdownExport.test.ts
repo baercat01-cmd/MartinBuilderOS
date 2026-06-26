@@ -79,6 +79,24 @@ describe('computeLineBreakdownTotals', () => {
     expect(t.tax).toBe(round2(100 * 0.07));
   });
 
+  // Regression for the "No Tax" flag fix: the proposal builder now forwards each line's
+  // taxable status, so a non-taxable material must add to the materials subtotal (and the
+  // grand total) but must NOT be taxed. Labor is always non-taxable; optional rows drop out.
+  it('honors a realistic mix of taxable, no-tax, labor, and optional lines', () => {
+    const rows = [
+      mkRow({ lineType: 'Material', category: 'Lumber', linePrice: 1000, taxable: true }),
+      mkRow({ lineType: 'Material', category: 'Permit', linePrice: 500, taxable: false }),
+      mkRow({ lineType: 'Section line item (labor)', category: 'Labor', linePrice: 800 }),
+      mkRow({ lineType: 'Material', category: 'Lumber', linePrice: 9999, optional: true }),
+    ];
+    const t = computeLineBreakdownTotals(rows);
+    expect(t.materials).toBe(1500); // 1000 taxable + 500 no-tax
+    expect(t.labor).toBe(800);
+    expect(t.subtotal).toBe(2300);
+    expect(t.tax).toBe(round2(1000 * 0.07)); // only the taxable $1000
+    expect(t.grandTotal).toBe(round2(2300 + 1000 * 0.07));
+  });
+
   // Regression: the proposal-software bug shipped a "Materials & subcontractors" figure that
   // did NOT equal (line items - labor). For the Odell Shop v2 export the lines summed to
   // $81,276.76 (materials $44,784.96 + labor $36,491.80), but the totals box claimed
