@@ -452,11 +452,10 @@ export function JobMaterialsByStatus({ job, status }: JobMaterialsByStatusProps)
         }
       }
 
-      // Pull tab should mirror package rows too, so include bundled items there as well.
-      // Ready tab keeps prior behavior (sheet list = non-packaged only) to avoid duplication.
-      const sheetListRows = status === 'pull_from_shop'
-        ? (unbundledRows || [])
-        : (unbundledRows || []).filter((r: any) => !bundledItemIds.has(r.id));
+      // Items that belong to a bundle are already shown in their package group, so they must be
+      // excluded from the per-sheet list on every tab (including Pull) to avoid showing the same
+      // material twice.
+      const sheetListRows = (unbundledRows || []).filter((r: any) => !bundledItemIds.has(r.id));
 
       const bySheet = new Map<string, MaterialItem[]>();
       for (const item of sheetListRows) {
