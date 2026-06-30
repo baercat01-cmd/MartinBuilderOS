@@ -1362,3 +1362,206 @@ export function generateChangeOrderDocumentHTML(data: {
   <p style="margin-top:32px;font-size:9pt;color:#94a3b8;">This document is separate from your main building proposal. Change order ${changeOrderNumber}.</p>
 </body></html>`;
 }
+
+/** One material line on the customer material list. */
+export interface MaterialListRow {
+  material_name: string;
+  usage?: string;
+  length?: string;
+  quantity: number;
+  color?: string;
+  pricePerUnit: number;
+  total: number;
+}
+
+/** One material-list page = one workbook sheet/section. Rendered on its own PDF page. */
+export interface MaterialListPage {
+  sheetName: string;
+  description?: string;
+  optional?: boolean;
+  rows: MaterialListRow[];
+  subtotal: number;
+}
+
+/**
+ * Customer-facing comprehensive material list (for customers who buy only the building
+ * materials). Same header as the proposal, then each material sheet/section is rendered on
+ * its own PDF page with columns: Material, Usage, Length, Qty, Color, Price/Unit, Total.
+ */
+export function generateMaterialListHTML(data: {
+  proposalNumber: string;
+  date: string;
+  job: { client_name: string; address: string; name: string; customer_phone?: string };
+  pages: MaterialListPage[];
+  totals: { materials: number; taxable: number; tax: number; grandTotal: number };
+  taxExempt?: boolean;
+  templateSettings?: any;
+}): string {
+  const { proposalNumber, date, job, pages, totals, taxExempt = false } = data;
+  const t = data.templateSettings || {};
+  const companyName = t.company_name ?? 'Martin Builder';
+  const companyAddress1 = t.company_address_1 ?? '27608-A CR 36';
+  const companyAddress2 = t.company_address_2 ?? 'Goshen, IN 46526';
+  const companyPhone = t.company_phone ?? '574-862-4448';
+  const companyEmail = t.company_email ?? 'office@martinbuilder.net';
+  const companyLogoUrl =
+    t.company_logo_url ??
+    'https://cdn-ai.onspace.ai/onspace/files/4ZzeFr2RKnB7oAxZwNpsZR/MB_Logo_Green_192x64_12.9kb.png';
+
+  const money = (n: number) =>
+    `$${(Number(n) || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  const qtyFmt = (n: number) => {
+    const v = Number(n) || 0;
+    return Number.isInteger(v) ? String(v) : v.toLocaleString('en-US', { maximumFractionDigits: 2 });
+  };
+  const cell = (s: unknown) => {
+    const v = s == null ? '' : String(s).trim();
+    return v === '' ? '—' : escapeHtmlBid(v);
+  };
+
+  const renderPage = (page: MaterialListPage, index: number) => {
+    const rows =
+      page.rows.length > 0
+        ? page.rows
+            .map(
+              (r) => `<tr>
+                <td class="mat">${cell(r.material_name)}</td>
+                <td>${cell(r.usage)}</td>
+                <td class="center">${cell(r.length)}</td>
+                <td class="center">${qtyFmt(r.quantity)}</td>
+                <td>${cell(r.color)}</td>
+                <td class="right">${money(r.pricePerUnit)}</td>
+                <td class="right">${money(r.total)}</td>
+              </tr>`,
+            )
+            .join('')
+        : `<tr><td colspan="7" class="empty">No materials listed for this section.</td></tr>`;
+
+    return `<section class="sheet-page${index === 0 ? ' first' : ''}">
+      <div class="sheet-title">${escapeHtmlBid(page.sheetName)}${
+        page.optional ? ' <span class="opt">(Optional)</span>' : ''
+      }</div>
+      ${page.description ? `<div class="sheet-desc">${escapeHtmlBid(page.description)}</div>` : ''}
+      <table class="mat-table">
+        <thead>
+          <tr>
+            <th style="width: 26%;">Material</th>
+            <th style="width: 16%;">Usage</th>
+            <th style="width: 9%;" class="center">Length</th>
+            <th style="width: 7%;" class="center">Qty</th>
+            <th style="width: 13%;">Color</th>
+            <th style="width: 13%;" class="right">Price / Unit</th>
+            <th style="width: 16%;" class="right">Total</th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+        <tfoot>
+          <tr>
+            <td colspan="6" class="right subtotal-label">Section subtotal</td>
+            <td class="right subtotal-value">${money(page.subtotal)}</td>
+          </tr>
+        </tfoot>
+      </table>
+    </section>`;
+  };
+
+  const summaryRows = `
+    <tr><td>Materials subtotal</td><td class="right">${money(totals.materials)}</td></tr>
+    ${
+      taxExempt
+        ? `<tr><td>Tax</td><td class="right">Tax Exempt</td></tr>`
+        : `<tr><td>Tax (7% on taxable materials)</td><td class="right">${money(totals.tax)}</td></tr>`
+    }
+    <tr class="grand"><td>Grand total</td><td class="right">${money(totals.grandTotal)}</td></tr>`;
+
+  return `<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <title>Material list-${proposalNumber}</title>
+    <style>
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      @page { size: letter; margin: 0.5in; }
+      body { font-family: Arial, Helvetica, sans-serif; color: #1f2937; font-size: 10pt; line-height: 1.35; }
+      .header-row { display: flex; justify-content: space-between; align-items: flex-start; border-bottom: 3px solid #2d5f3f; padding-bottom: 12px; margin-bottom: 14px; }
+      .company-logo { height: 52px; width: auto; max-width: 200px; object-fit: contain; margin-bottom: 6px; }
+      .company-address, .company-contact { font-size: 9pt; color: #374151; }
+      .doc-header { text-align: right; }
+      .doc-title { font-size: 22pt; font-weight: 700; color: #2d5f3f; letter-spacing: 0.5px; }
+      .doc-sub { font-size: 9pt; color: #6b7280; margin-top: 2px; }
+      .info-table { border-collapse: collapse; margin-top: 8px; margin-left: auto; }
+      .info-table th, .info-table td { border: 1px solid #cbd5e1; padding: 4px 10px; font-size: 9pt; text-align: center; }
+      .info-table th { background: #f1f5f9; }
+      .customer-row { display: flex; gap: 14px; margin-bottom: 16px; }
+      .info-box { flex: 1; border: 1px solid #cbd5e1; border-radius: 4px; padding: 8px 10px; }
+      .box-header { font-size: 8pt; font-weight: 700; text-transform: uppercase; color: #2d5f3f; letter-spacing: 0.5px; margin-bottom: 4px; }
+      .intro { font-size: 9.5pt; color: #4b5563; margin-bottom: 16px; }
+      .sheet-page { page-break-before: always; }
+      .sheet-page.first { page-break-before: avoid; }
+      .sheet-title { font-size: 13pt; font-weight: 700; color: #2d5f3f; border-bottom: 2px solid #2d5f3f; padding-bottom: 4px; margin-bottom: 6px; }
+      .sheet-title .opt { font-size: 9pt; font-weight: 400; color: #6b7280; }
+      .sheet-desc { font-size: 9pt; color: #4b5563; margin-bottom: 8px; white-space: pre-wrap; }
+      .mat-table { width: 100%; border-collapse: collapse; }
+      .mat-table th { background: #2d5f3f; color: #fff; font-size: 8.5pt; text-align: left; padding: 6px 8px; }
+      .mat-table td { border-bottom: 1px solid #e5e7eb; padding: 5px 8px; font-size: 9pt; vertical-align: top; }
+      .mat-table tbody tr:nth-child(even) { background: #f8faf9; }
+      .mat-table .mat { font-weight: 600; }
+      .mat-table .center { text-align: center; }
+      .mat-table .right { text-align: right; white-space: nowrap; }
+      .mat-table .empty { text-align: center; color: #9ca3af; padding: 12px; }
+      .mat-table tfoot td { border-top: 2px solid #2d5f3f; font-weight: 700; padding-top: 6px; }
+      .subtotal-label { color: #374151; }
+      .subtotal-value { color: #2d5f3f; }
+      .summary { margin-top: 22px; page-break-inside: avoid; }
+      .summary-title { font-size: 11pt; font-weight: 700; color: #2d5f3f; margin-bottom: 6px; }
+      .summary-table { width: 280px; margin-left: auto; border-collapse: collapse; }
+      .summary-table td { padding: 5px 10px; font-size: 10pt; border-bottom: 1px solid #e5e7eb; }
+      .summary-table .right { text-align: right; }
+      .summary-table .grand td { border-top: 2px solid #2d5f3f; border-bottom: none; font-weight: 700; font-size: 11pt; color: #2d5f3f; }
+      .foot-note { margin-top: 18px; font-size: 8pt; color: #9ca3af; }
+    </style>
+  </head>
+  <body>
+    <div class="header-row">
+      <div>
+        <img src="${companyLogoUrl}" alt="${escapeHtmlBid(companyName)}" class="company-logo" />
+        <div class="company-address">${escapeHtmlBid(companyAddress1)}, ${escapeHtmlBid(companyAddress2)}</div>
+        <div class="company-contact">Phone: ${escapeHtmlBid(companyPhone)}</div>
+        <div class="company-contact">Email: ${escapeHtmlBid(companyEmail)}</div>
+      </div>
+      <div class="doc-header">
+        <div class="doc-title">Material List</div>
+        <div class="doc-sub">Building materials</div>
+        <table class="info-table">
+          <tr><th>Date</th><th>Proposal #</th></tr>
+          <tr><td>${escapeHtmlBid(date)}</td><td>${escapeHtmlBid(proposalNumber)}</td></tr>
+        </table>
+      </div>
+    </div>
+
+    <div class="customer-row">
+      <div class="info-box">
+        <div class="box-header">Name / Address</div>
+        <div>${escapeHtmlBid(job.client_name || '—')}</div>
+        <div>${escapeHtmlBid(job.address || '')}</div>
+        <div style="margin-top: 6px;">${escapeHtmlBid(job.customer_phone || 'N/A')}</div>
+      </div>
+      <div class="info-box">
+        <div class="box-header">Project</div>
+        <div>${escapeHtmlBid(job.name || '—')}</div>
+      </div>
+    </div>
+
+    <div class="intro">Comprehensive list of building materials, organized by section. Each section begins on its own page.</div>
+
+    ${pages.map((p, i) => renderPage(p, i)).join('')}
+
+    <div class="summary">
+      <div class="summary-title">Material Summary</div>
+      <table class="summary-table">${summaryRows}</table>
+    </div>
+
+    <div class="foot-note">${escapeHtmlBid(companyName)} — Material list for ${escapeHtmlBid(job.name || '')} (#${escapeHtmlBid(proposalNumber)}). Materials only; labor and installation are not included on this list.</div>
+  </body>
+</html>`;
+}

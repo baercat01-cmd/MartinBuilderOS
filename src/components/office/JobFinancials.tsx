@@ -45,7 +45,12 @@ import {
   BudgetMaterialCatalogLineItemPicker,
   BudgetMaterialCatalogManageDialog,
 } from './BudgetMaterialCatalog';
-import { generateProposalHTML } from './ProposalPDFTemplate';
+import {
+  generateProposalHTML,
+  generateMaterialListHTML,
+  type MaterialListPage,
+  type MaterialListRow,
+} from './ProposalPDFTemplate';
 import { FloatingDocumentViewer } from './FloatingDocumentViewer';
 import { ProposalTemplateEditor } from './ProposalTemplateEditor';
 import { BulkMaterialMover } from './BulkMaterialMover';
@@ -4214,7 +4219,7 @@ export function JobFinancials({
   const [showExportDialog, setShowExportDialog] = useState(false);
   const [showLineItems, setShowLineItems] = useState(false); // Default to false - no row pricing by default
   const [exportViewType, setExportViewType] = useState<
-    'customer' | 'office' | 'descriptions_only' | 'bid_spec'
+    'customer' | 'office' | 'descriptions_only' | 'bid_spec' | 'material_list'
   >('customer');
   const [exportTheme, setExportTheme] = useState<'default' | 'premium'>('default'); // default = black & white; premium = dark green + gold
   const [bidSpecDueDate, setBidSpecDueDate] = useState('');
@@ -9738,7 +9743,30 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
       // (orphan_sheet_id → displayed_sheet_id) entries can't bleed into this load.
       siblingSheetRemapRef.current = {};
       const hasQuote = targetQuoteId != null && targetQuoteId !== '';
-      const isolateProposalsOnJob = jobHasMultipleFormalProposals(allJobQuotes);
+      let isolateProposalsOnJob = jobHasMultipleFormalProposals(allJobQuotes);
+      // Guard against a load-order race: `allJobQuotes` is populated by loadQuoteData, which can
+      // finish AFTER materials load. If the in-memory list still looks like a single-proposal job,
+      // confirm against the DB before we ever allow borrowing/sharing a workbook. This only ever
+      // flips isolation ON (never off), so a real single-proposal job is unaffected — but a
+      // multi-proposal job can never accidentally share sheet rows (which would make an edit on one
+      // proposal change another).
+      if (!isolateProposalsOnJob && hasQuote) {
+        try {
+          let jobQuoteRows: any[] | null = null;
+          const res = await supabase.from('quotes').select('id, is_customer_estimate').eq('job_id', job.id);
+          if (res.error) {
+            const resFallback = await supabase.from('quotes').select('id').eq('job_id', job.id);
+            jobQuoteRows = (resFallback.data as any[] | null) ?? null;
+          } else {
+            jobQuoteRows = (res.data as any[] | null) ?? null;
+          }
+          if (jobQuoteRows && jobHasMultipleFormalProposals(jobQuoteRows)) {
+            isolateProposalsOnJob = true;
+          }
+        } catch {
+          // Best-effort: keep the in-memory value if the count query fails.
+        }
+      }
       let workbookData: any = null;
       let workbookError: any = null;
       let usedFallbackWorkbook = false;
@@ -13836,7 +13864,119 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
     openPrintDialog(false);
   }
 
+  /**
+   * Customer-facing comprehensive material list PDF (for customers who buy only the building
+   * materials). Same header as the proposal; each base material section/sheet renders on its own
+   * PDF page with columns: material name, usage, length, qty, color, price per unit, and total.
+   * Pulls the raw material_items (the breakdown rollup drops usage/length/color), grouped by sheet.
+   */
+  async function handleExportMaterialList() {
+    setExporting(true);
+    try {
+      const proposalNumber =
+        (quote as any)?.is_customer_estimate === true
+          ? displayNumberForQuoteRow(quote as any, true)
+          : quote?.proposal_number || job.id.split('-')[0].toUpperCase();
+
+      // Base (non-optional) proposal sheets in display order; exclude change orders and optionals.
+      const baseSheets = (materialsBreakdown?.sheetBreakdowns || [])
+        .filter((s: any) => (s?.sheetType ?? 'proposal') !== 'change_order' && !s?.isOptional)
+        .sort((a: any, b: any) => (a?.orderIndex ?? 0) - (b?.orderIndex ?? 0));
+
+      const sheetIds = baseSheets.map((s: any) => s.sheetId).filter(Boolean);
+      if (sheetIds.length === 0) {
+        toast.error('No material sections to export.');
+        return;
+      }
+
+      const { data: itemsData, error: itemsError } = await supabase
+        .from('material_items')
+        .select('*')
+        .in('sheet_id', sheetIds)
+        .order('order_index', { ascending: true });
+      if (itemsError) throw itemsError;
+
+      const itemsBySheet = new Map<string, any[]>();
+      (itemsData || []).forEach((it: any) => {
+        if (!itemsBySheet.has(it.sheet_id)) itemsBySheet.set(it.sheet_id, []);
+        itemsBySheet.get(it.sheet_id)!.push(it);
+      });
+
+      let materialsTotal = 0;
+      let taxableTotal = 0;
+
+      const pages: MaterialListPage[] = baseSheets.map((sheet: any) => {
+        const items = (itemsBySheet.get(sheet.sheetId) || [])
+          .filter((it: any) => !toBool(it.is_optional))
+          .sort((a: any, b: any) => {
+            const ca = String(a.category ?? '');
+            const cb = String(b.category ?? '');
+            if (ca !== cb) return ca.localeCompare(cb);
+            return (a.order_index ?? 0) - (b.order_index ?? 0);
+          });
+
+        let subtotal = 0;
+        const rows: MaterialListRow[] = items.map((it: any) => {
+          const { price } = getMaterialLineSellAndCost(it);
+          const qty = Number(it.quantity) || 0;
+          const pricePerUnit = qty > 0 ? price / qty : price;
+          subtotal += price;
+          if (it.taxable !== false) taxableTotal += price;
+          return {
+            material_name: it.material_name ?? '',
+            usage: it.usage ?? '',
+            length: it.length != null ? String(it.length) : '',
+            quantity: qty,
+            color: it.color ?? '',
+            pricePerUnit,
+            total: price,
+          };
+        });
+
+        materialsTotal += subtotal;
+        return {
+          sheetName: sheet.sheetName || 'Section',
+          description: sheet.sheetDescription || '',
+          optional: false,
+          rows,
+          subtotal: Math.round(subtotal * 100) / 100,
+        };
+      });
+
+      materialsTotal = Math.round(materialsTotal * 100) / 100;
+      taxableTotal = Math.round(taxableTotal * 100) / 100;
+      const tax = taxExemptChecked ? 0 : Math.round(taxableTotal * 0.07 * 100) / 100;
+      const grandTotal = Math.round((materialsTotal + tax) * 100) / 100;
+
+      const html = generateMaterialListHTML({
+        proposalNumber,
+        date: new Date().toLocaleDateString(),
+        job: {
+          client_name: job.client_name,
+          address: job.address,
+          name: job.name,
+          customer_phone: job.customer_phone,
+        },
+        pages,
+        totals: { materials: materialsTotal, taxable: taxableTotal, tax, grandTotal },
+        taxExempt: taxExemptChecked,
+      });
+
+      setShowExportDialog(false);
+      openLineBreakdownPrintWindow(html);
+    } catch (error: any) {
+      console.error('Error exporting material list PDF:', error);
+      toast.error(`Failed to export material list: ${error.message || 'Unknown error'}`);
+    } finally {
+      setExporting(false);
+    }
+  }
+
   async function handleExportPDF() {
+    if (exportViewType === 'material_list') {
+      await handleExportMaterialList();
+      return;
+    }
     setExporting(true);
     
     try {
@@ -17859,7 +17999,9 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
               <Select
                 value={exportViewType}
                 onValueChange={(v) =>
-                  setExportViewType(v as 'customer' | 'office' | 'descriptions_only' | 'bid_spec')
+                  setExportViewType(
+                    v as 'customer' | 'office' | 'descriptions_only' | 'bid_spec' | 'material_list',
+                  )
                 }
               >
                 <SelectTrigger>
@@ -17870,6 +18012,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
                   <SelectItem value="office">Office View (Internal)</SelectItem>
                   <SelectItem value="descriptions_only">Descriptions only</SelectItem>
                   <SelectItem value="bid_spec">Bid spec (subcontractors)</SelectItem>
+                  <SelectItem value="material_list">Material list (customer)</SelectItem>
                 </SelectContent>
               </Select>
             </div>
@@ -17916,7 +18059,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
               </div>
             )}
 
-            {exportViewType !== 'bid_spec' && (
+            {exportViewType !== 'bid_spec' && exportViewType !== 'material_list' && (
               <div>
                 <Label className="mb-2 block">Style</Label>
                 <Select value={exportTheme} onValueChange={(v) => setExportTheme(v as 'default' | 'premium')}>
@@ -18021,6 +18164,17 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
                     <li>No prices, totals, payment language, signatures, or terms</li>
                   </ul>
                 </>
+              ) : exportViewType === 'material_list' ? (
+                <>
+                  <p className="font-semibold text-blue-900 mb-1">Material list (customer) includes:</p>
+                  <ul className="list-disc list-inside text-blue-800 space-y-0.5">
+                    <li>Same header as the proposal (company, customer, project, date, proposal #)</li>
+                    <li>Each material section/sheet on its own PDF page</li>
+                    <li>Per material: name, usage, length, qty, color, price per unit, and total</li>
+                    <li>Section subtotals plus a materials summary (subtotal, tax, grand total)</li>
+                    <li>Materials only — labor and installation are not included</li>
+                  </ul>
+                </>
               ) : (
                 <>
                   <p className="font-semibold text-blue-900 mb-1">Customer Version includes:</p>
@@ -18054,7 +18208,9 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
                         ? 'descriptions'
                         : exportViewType === 'bid_spec'
                           ? 'bid spec PDF'
-                          : 'Customer PDF'}
+                          : exportViewType === 'material_list'
+                            ? 'material list PDF'
+                            : 'Customer PDF'}
                   </>
                 )}
               </Button>

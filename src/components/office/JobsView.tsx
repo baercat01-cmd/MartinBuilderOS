@@ -228,11 +228,52 @@ export function JobsView({
   const [showShopMaterialsDialog, setShowShopMaterialsDialog] = useState(false);
   const [showOrdersDialog, setShowOrdersDialog] = useState(false);
   const [jobBudgets, setJobBudgets] = useState<Record<string, any>>({});
+  /** Figured labor hours per job, derived from the proposal's sheet labor. Used as the
+   *  "time figured" fallback for the progress bar when a job has no manual Estimated Hours. */
+  const [jobFiguredHours, setJobFiguredHours] = useState<Record<string, number>>({});
   const [showBudgetDialog, setShowBudgetDialog] = useState(false);
   const [budgetJobId, setBudgetJobId] = useState<string | null>(null);
   const [jobQuotes, setJobQuotes] = useState<Record<string, any>>({});
   /** Primary proposal is on hold (quote row) — board shows these in On Hold alongside job.status === 'on_hold' */
   const isPrimaryProposalOnHold = (jobId: string) => !!jobQuotes[jobId]?.on_hold;
+  /** Combined on-hold state for menu labels: the per-proposal flag OR job-level on-hold fallback. */
+  const isJobOnHoldForBoard = (job: any) =>
+    !!job && (isPrimaryProposalOnHold(job.id) || job.status === 'on_hold');
+
+  /**
+   * Labor progress bar (time clocked vs. figured) shared by the quoting / on-hold / other
+   * job columns. "Time figured" prefers manual Estimated Hours, else the proposal's figured
+   * labor hours. Renders nothing when there are no figured hours to compare against.
+   */
+  const renderJobLaborBar = (job: any) => {
+    const jobStats = stats[job.id] || {};
+    const figuredHours =
+      job.estimated_hours && job.estimated_hours > 0
+        ? job.estimated_hours
+        : jobFiguredHours[job.id] || 0;
+    if (!(figuredHours > 0)) return null;
+    const clockInHours = Number(jobStats.totalClockInHours) || 0;
+    const pct = (clockInHours / figuredHours) * 100;
+    const overBudget = clockInHours > figuredHours;
+    return (
+      <div className="space-y-1.5 pt-2">
+        <div className="flex items-center justify-between text-xs">
+          <span className="text-muted-foreground">Progress (Clock-In)</span>
+          <span className="font-bold">{pct.toFixed(0)}%</span>
+        </div>
+        <div className="h-2 bg-muted rounded-full overflow-hidden">
+          <div
+            className={`h-full transition-all duration-500 ${overBudget ? 'bg-destructive' : 'bg-primary'}`}
+            style={{ width: `${Math.min(pct, 100)}%` }}
+          />
+        </div>
+        <div className="flex items-center justify-between text-xs text-muted-foreground">
+          <span>{jobStats.totalHours || '0'} / {figuredHours} hrs</span>
+          {overBudget && <span className="text-destructive font-medium">Over Budget</span>}
+        </div>
+      </div>
+    );
+  };
   const [recentMessages, setRecentMessages] = useState<Array<{ id: string; job_id: string; subject: string; from_name: string | null; from_email: string | null; body_text: string | null; email_date: string; direction?: string; jobs: { id: string; name: string } | null }>>([]);
   const [loadingMessages, setLoadingMessages] = useState(false);
   const [showReplyDialog, setShowReplyDialog] = useState(false);
@@ -309,6 +350,7 @@ export function JobsView({
     loadCrewOrderCounts();
     loadJobBudgets();
     loadJobQuotes();
+    loadJobFiguredHours();
     if (!showArchived) loadRecentMessages();
 
     // Subscribe to material changes to update crew order counts in real-time
@@ -683,6 +725,116 @@ export function JobsView({
     }
   }
 
+  /**
+   * Sum the figured labor hours per job from the proposal's sheet labor so the progress
+   * bar can show a "time figured" value even when nobody typed Estimated Hours into the
+   * Edit Job dialog. A job can have several workbooks (one per proposal copy); summing all
+   * of them would double-count, so we take the fullest single workbook per job — the same
+   * "pick the most complete workbook" heuristic used elsewhere for proposals.
+   */
+  async function loadJobFiguredHours() {
+    const DEFAULT_LABOR_RATE = 60;
+    try {
+      const [sheetLaborRes, laborLineItemsRes, sheetsRes, workbooksRes, rowsRes, quotesRes, ratesRes] =
+        await Promise.all([
+          // Crew labor entered as a sheet-labor row (hours, or a lump-sum cost we convert to hours).
+          supabase
+            .from('material_sheet_labor')
+            .select('estimated_hours, total_labor_cost, hourly_rate, sheet_id'),
+          // Crew labor entered as line items (item_type='labor' → quantity is hours).
+          supabase
+            .from('custom_financial_row_items')
+            .select('quantity, sheet_id, row_id')
+            .eq('item_type', 'labor'),
+          supabase.from('material_sheets').select('id, workbook_id'),
+          supabase.from('material_workbooks').select('id, job_id, quote_id'),
+          supabase.from('custom_financial_rows').select('id, job_id, quote_id'),
+          // quote_id -> job_id, so we can still attribute labor when a workbook only carries quote_id.
+          supabase.from('quotes').select('id, job_id').not('job_id', 'is', null),
+          supabase.from('labor_pricing').select('job_id, hourly_rate'),
+        ]);
+
+      if (sheetLaborRes.error) throw sheetLaborRes.error;
+
+      const quoteToJob: Record<string, string> = {};
+      (quotesRes.data || []).forEach((q: any) => {
+        if (q?.id && q?.job_id) quoteToJob[q.id] = q.job_id;
+      });
+      const sheetToWorkbook: Record<string, string> = {};
+      (sheetsRes.data || []).forEach((s: any) => {
+        if (s?.id && s?.workbook_id) sheetToWorkbook[s.id] = s.workbook_id;
+      });
+      const workbookById: Record<string, any> = {};
+      (workbooksRes.data || []).forEach((w: any) => {
+        if (w?.id) workbookById[w.id] = w;
+      });
+      const rowById: Record<string, any> = {};
+      (rowsRes.data || []).forEach((r: any) => {
+        if (r?.id) rowById[r.id] = r;
+      });
+      const jobRate: Record<string, number> = {};
+      (ratesRes.data || []).forEach((r: any) => {
+        if (r?.job_id && Number(r.hourly_rate) > 0) jobRate[r.job_id] = Number(r.hourly_rate);
+      });
+      const rateForJob = (jobId: string) => jobRate[jobId] || DEFAULT_LABOR_RATE;
+
+      // Resolve a sheet/row to its owning job and a per-proposal "scope" key, so multiple
+      // proposal copies (different quotes) don't get summed — we take the fullest copy.
+      const scopeForSheet = (sheetId?: string | null) => {
+        if (!sheetId) return null;
+        const wbId = sheetToWorkbook[sheetId];
+        const wb = wbId ? workbookById[wbId] : undefined;
+        if (!wb) return null;
+        const jobId = wb.job_id || (wb.quote_id ? quoteToJob[wb.quote_id] : undefined);
+        if (!jobId) return null;
+        return { jobId, scope: wb.quote_id ? `q:${wb.quote_id}` : `w:${wbId}` };
+      };
+      const scopeForRow = (rowId?: string | null) => {
+        if (!rowId) return null;
+        const row = rowById[rowId];
+        if (!row) return null;
+        const jobId = row.job_id || (row.quote_id ? quoteToJob[row.quote_id] : undefined);
+        if (!jobId) return null;
+        return { jobId, scope: row.quote_id ? `q:${row.quote_id}` : `r:${rowId}` };
+      };
+
+      // job_id -> (proposal scope -> summed figured crew hours)
+      const byJobScope: Record<string, Record<string, number>> = {};
+      const addHours = (jobId: string, scope: string, hours: number) => {
+        if (!jobId || !(hours > 0)) return;
+        if (!byJobScope[jobId]) byJobScope[jobId] = {};
+        byJobScope[jobId][scope] = (byJobScope[jobId][scope] || 0) + hours;
+      };
+
+      (sheetLaborRes.data || []).forEach((row: any) => {
+        const sc = scopeForSheet(row.sheet_id);
+        if (!sc) return;
+        const rate = Number(row.hourly_rate) > 0 ? Number(row.hourly_rate) : rateForJob(sc.jobId);
+        const eh = Number(row.estimated_hours) || 0;
+        const cost = Number(row.total_labor_cost) || 0;
+        // Prefer explicit hours; otherwise back out hours from the figured labor cost.
+        const hours = eh > 0 ? eh : rate > 0 ? cost / rate : 0;
+        addHours(sc.jobId, sc.scope, hours);
+      });
+
+      (laborLineItemsRes.data || []).forEach((li: any) => {
+        const sc = li.sheet_id ? scopeForSheet(li.sheet_id) : scopeForRow(li.row_id);
+        if (!sc) return;
+        addHours(sc.jobId, sc.scope, Number(li.quantity) || 0);
+      });
+
+      const figured: Record<string, number> = {};
+      Object.entries(byJobScope).forEach(([jobId, scopes]) => {
+        const totals = Object.values(scopes);
+        figured[jobId] = totals.length ? Math.max(...totals) : 0;
+      });
+
+      setJobFiguredHours(figured);
+    } catch (error: any) {
+      if (!isAbortLikeError(error)) console.error('Error loading job figured hours:', error);
+    }
+  }
+
   async function loadJobQuotes() {
     try {
       const { data, error } = await supabase
@@ -702,12 +854,15 @@ export function JobsView({
       });
       const quotesMap: Record<string, any> = {};
       Object.entries(byJob).forEach(([jobId, quotes]) => {
+        // Pick the SAME "primary" quote that togglePrimaryQuoteOnHold updates: newest
+        // non-change-order, else newest overall. Sorting first (instead of relying on row
+        // order) keeps the displayed on_hold state in sync with the row the toggle writes.
+        const byNewest = [...quotes].sort(
+          (a: any, b: any) =>
+            new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime()
+        );
         const main =
-          quotes.find((q: any) => !q.is_change_order_proposal) ??
-          [...quotes].sort(
-            (a: any, b: any) =>
-              new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime()
-          )[0];
+          byNewest.find((q: any) => !q.is_change_order_proposal) ?? byNewest[0];
         if (main) quotesMap[jobId] = main;
       });
 
@@ -717,35 +872,61 @@ export function JobsView({
     }
   }
 
-  /** Toggle `quotes.on_hold` for the job's primary proposal (same rules as loadJobQuotes). */
+  /**
+   * Move a job's primary proposal in/out of "On Hold".
+   *
+   * Preferred storage is the per-proposal `quotes.on_hold` flag. If that column doesn't exist
+   * on this database yet (some OnSpace deployments are missing the migration), we fall back to
+   * the job-level on-hold (`jobs.status = 'on_hold'`) that the On Hold column already reads, so
+   * the card still moves and the change persists/syncs across users without any schema change.
+   */
   async function togglePrimaryQuoteOnHold(jobId: string) {
+    const job = jobs.find((j: any) => j.id === jobId);
+    const currentlyOnHold = isJobOnHoldForBoard(job);
+    const next = !currentlyOnHold;
     try {
+      // Resolve the primary proposal using only columns guaranteed to exist on every DB.
       const { data: rows, error } = await supabase
         .from('quotes')
-        .select('id, on_hold, is_change_order_proposal, created_at')
+        .select('*')
         .eq('job_id', jobId)
         .order('created_at', { ascending: false });
-
       if (error) throw error;
       const list = rows || [];
-      const main =
-        list.find((q: any) => !q.is_change_order_proposal) ?? list[0];
-      if (!main) {
-        toast.error('No proposal for this job');
-        return;
+      const main = list.find((q: any) => !q.is_change_order_proposal) ?? list[0];
+
+      // Preferred path: per-proposal on_hold flag (when the column exists).
+      if (main) {
+        const { error: uErr } = await supabase
+          .from('quotes')
+          .update({ on_hold: next, updated_at: new Date().toISOString() })
+          .eq('id', main.id);
+        if (!uErr) {
+          toast.success(next ? 'Proposal put on hold' : 'Proposal resumed');
+          await loadJobQuotes();
+          loadJobs();
+          return;
+        }
+        const msg = String(uErr.message || '');
+        const missingColumn =
+          uErr.code === '42703' || (/on_hold/i.test(msg) && /column|does not exist|schema/i.test(msg));
+        if (!missingColumn) throw uErr;
+        // else: column not present — fall through to the job-status fallback below.
       }
-      const next = !main.on_hold;
-      const { error: uErr } = await supabase
-        .from('quotes')
-        .update({ on_hold: next, updated_at: new Date().toISOString() })
-        .eq('id', main.id);
-      if (uErr) throw uErr;
+
+      // Fallback: use the existing job-level on-hold so the card still moves to On Hold.
+      const fallbackStatus = next ? 'on_hold' : 'quoting';
+      const { error: jErr } = await supabase
+        .from('jobs')
+        .update({ status: fallbackStatus, updated_at: new Date().toISOString() })
+        .eq('id', jobId);
+      if (jErr) throw jErr;
       toast.success(next ? 'Proposal put on hold' : 'Proposal resumed');
       await loadJobQuotes();
       loadJobs();
     } catch (error: any) {
       console.error('Error toggling proposal on hold:', error);
-      toast.error(error?.message || 'Failed to update proposal');
+      toast.error(String(error?.message || '') || 'Failed to update proposal');
     }
   }
 
@@ -1114,6 +1295,12 @@ export function JobsView({
               .filter((job) => isVisibleJobCard(job))
               .map((job) => {
               const jobStats = stats[job.id] || {};
+              // "Time figured" for the progress bar: manual Estimated Hours wins, else fall
+              // back to the proposal's figured labor hours so the bar shows like other jobs.
+              const figuredHours =
+                job.estimated_hours && job.estimated_hours > 0
+                  ? job.estimated_hours
+                  : jobFiguredHours[job.id] || 0;
               
               // Calculate scheduling status
               const today = new Date();
@@ -1262,29 +1449,29 @@ export function JobsView({
                     </div>
 
                     {/* Progress Bar - Clock-In Hours Only */}
-                    {job.estimated_hours && job.estimated_hours > 0 && (
+                    {figuredHours > 0 && (
                       <div className="space-y-1.5 pt-2">
                         <div className="flex items-center justify-between text-xs">
                           <span className="text-muted-foreground">Progress (Clock-In)</span>
                           <span className="font-bold">
-                            {((jobStats.totalClockInHours || 0) / job.estimated_hours * 100).toFixed(0)}%
+                            {((jobStats.totalClockInHours || 0) / figuredHours * 100).toFixed(0)}%
                           </span>
                         </div>
                         <div className="h-2 bg-muted rounded-full overflow-hidden">
                           <div 
                             className={`h-full transition-all duration-500 ${
-                              (jobStats.totalClockInHours || 0) > job.estimated_hours
+                              (jobStats.totalClockInHours || 0) > figuredHours
                                 ? 'bg-destructive'
                                 : 'bg-primary'
                             }`}
                             style={{ 
-                              width: `${Math.min(((jobStats.totalClockInHours || 0) / job.estimated_hours * 100), 100)}%` 
+                              width: `${Math.min(((jobStats.totalClockInHours || 0) / figuredHours * 100), 100)}%` 
                             }}
                           />
                         </div>
                         <div className="flex items-center justify-between text-xs text-muted-foreground">
-                          <span>{jobStats.totalHours || '0'} / {job.estimated_hours} hrs</span>
-                          {(jobStats.totalClockInHours || 0) > job.estimated_hours && (
+                          <span>{jobStats.totalHours || '0'} / {figuredHours} hrs</span>
+                          {(jobStats.totalClockInHours || 0) > figuredHours && (
                             <span className="text-destructive font-medium">Over Budget</span>
                           )}
                         </div>
@@ -1356,6 +1543,12 @@ export function JobsView({
                   .filter((job) => job.status === 'active' && isVisibleJobCard(job) && !isPrimaryProposalOnHold(job.id))
                   .map((job) => {
                     const jobStats = stats[job.id] || {};
+                    // "Time figured" for the progress bar: manual Estimated Hours wins, else
+                    // fall back to the proposal's figured labor hours so the bar shows.
+                    const figuredHours =
+                      job.estimated_hours && job.estimated_hours > 0
+                        ? job.estimated_hours
+                        : jobFiguredHours[job.id] || 0;
                     
                     // Calculate scheduling status
                     const today = new Date();
@@ -1497,29 +1690,29 @@ export function JobsView({
                           </div>
 
                           {/* Progress Bar - Clock-In Hours Only */}
-                          {job.estimated_hours && job.estimated_hours > 0 && (
+                          {figuredHours > 0 && (
                             <div className="space-y-0.5">
                               <div className="flex items-center justify-between text-[10px]">
                                 <span className="text-muted-foreground">Progress</span>
                                 <span className="font-bold">
-                                  {((jobStats.totalClockInHours || 0) / job.estimated_hours * 100).toFixed(0)}%
+                                  {((jobStats.totalClockInHours || 0) / figuredHours * 100).toFixed(0)}%
                                 </span>
                               </div>
                               <div className="h-1.5 bg-muted rounded-full overflow-hidden">
                                 <div 
                                   className={`h-full transition-all duration-500 ${
-                                    (jobStats.totalClockInHours || 0) > job.estimated_hours
+                                    (jobStats.totalClockInHours || 0) > figuredHours
                                       ? 'bg-destructive'
                                       : 'bg-primary'
                                   }`}
                                   style={{ 
-                                    width: `${Math.min(((jobStats.totalClockInHours || 0) / job.estimated_hours * 100), 100)}%` 
+                                    width: `${Math.min(((jobStats.totalClockInHours || 0) / figuredHours * 100), 100)}%` 
                                   }}
                                 />
                               </div>
                               <div className="flex items-center justify-between text-[10px] text-muted-foreground">
-                                <span>{jobStats.totalHours || '0'} / {job.estimated_hours} hrs</span>
-                                {(jobStats.totalClockInHours || 0) > job.estimated_hours && (
+                                <span>{jobStats.totalHours || '0'} / {figuredHours} hrs</span>
+                                {(jobStats.totalClockInHours || 0) > figuredHours && (
                                   <span className="text-destructive font-medium">Over</span>
                                 )}
                               </div>
@@ -1757,6 +1950,9 @@ export function JobsView({
                             </div>
                           </div>
 
+                          {/* Labor progress: time clocked vs. figured */}
+                          {renderJobLaborBar(job)}
+
                           {/* Financial Summary */}
                           {jobBudgets[job.id] && (
                             <div 
@@ -1937,13 +2133,12 @@ export function JobsView({
                               </DropdownMenuTrigger>
                               <DropdownMenuContent align="end">
                                 <DropdownMenuItem
-                                  disabled={!jobQuotes[job.id]}
                                   onClick={(e) => {
                                     e.stopPropagation();
                                     void togglePrimaryQuoteOnHold(job.id);
                                   }}
                                 >
-                                  {jobQuotes[job.id]?.on_hold ? (
+                                  {isJobOnHoldForBoard(job) ? (
                                     <>
                                       <PlayCircle className="w-4 h-4 mr-2" />
                                       Resume proposal
@@ -1998,6 +2193,9 @@ export function JobsView({
                             </div>
 
                           </div>
+
+                          {/* Labor progress: time clocked vs. figured */}
+                          {renderJobLaborBar(job)}
 
                           {/* Financial Summary */}
                           {jobBudgets[job.id] && (
@@ -2188,13 +2386,12 @@ export function JobsView({
                                   Move to Quoting
                                 </DropdownMenuItem>
                                 <DropdownMenuItem
-                                  disabled={!jobQuotes[job.id]}
                                   onClick={(e) => {
                                     e.stopPropagation();
                                     void togglePrimaryQuoteOnHold(job.id);
                                   }}
                                 >
-                                  {jobQuotes[job.id]?.on_hold ? (
+                                  {isJobOnHoldForBoard(job) ? (
                                     <>
                                       <PlayCircle className="w-4 h-4 mr-2" />
                                       Resume proposal
@@ -2248,6 +2445,9 @@ export function JobsView({
                             </div>
 
                           </div>
+
+                          {/* Labor progress: time clocked vs. figured */}
+                          {renderJobLaborBar(job)}
 
                           {/* Financial Summary */}
                           {jobBudgets[job.id] && (
