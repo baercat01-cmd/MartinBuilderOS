@@ -13930,6 +13930,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
             color: it.color ?? '',
             pricePerUnit,
             total: price,
+            category: it.category ?? '',
           };
         });
 

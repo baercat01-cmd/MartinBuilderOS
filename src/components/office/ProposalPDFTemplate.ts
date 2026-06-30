@@ -1372,6 +1372,8 @@ export interface MaterialListRow {
   color?: string;
   pricePerUnit: number;
   total: number;
+  /** Category the line belongs to, used to group the breakdown within a section. */
+  category?: string;
 }
 
 /** One material-list page = one workbook sheet/section. Rendered on its own PDF page. */
@@ -1420,11 +1422,22 @@ export function generateMaterialListHTML(data: {
   };
 
   const renderPage = (page: MaterialListPage, index: number) => {
-    const rows =
-      page.rows.length > 0
-        ? page.rows
-            .map(
-              (r) => `<tr>
+    // Group the section's lines by category (preserving incoming order) so each section shows a
+    // clean breakdown: a category header, its material lines, then a category subtotal.
+    const groups: { category: string; rows: MaterialListRow[]; subtotal: number }[] = [];
+    for (const r of page.rows) {
+      const cat = (r.category ?? '').trim() || 'Other';
+      let g = groups.length && groups[groups.length - 1].category === cat ? groups[groups.length - 1] : null;
+      if (!g) {
+        g = { category: cat, rows: [], subtotal: 0 };
+        groups.push(g);
+      }
+      g.rows.push(r);
+      g.subtotal += Number(r.total) || 0;
+    }
+    const showCatSubtotals = groups.length > 1;
+
+    const renderRow = (r: MaterialListRow) => `<tr>
                 <td class="mat">${cell(r.material_name)}</td>
                 <td>${cell(r.usage)}</td>
                 <td class="center">${cell(r.length)}</td>
@@ -1432,8 +1445,23 @@ export function generateMaterialListHTML(data: {
                 <td>${cell(r.color)}</td>
                 <td class="right">${money(r.pricePerUnit)}</td>
                 <td class="right">${money(r.total)}</td>
-              </tr>`,
-            )
+              </tr>`;
+
+    const rows =
+      page.rows.length > 0
+        ? groups
+            .map((g) => {
+              const header = `<tr class="cat-row"><td colspan="7" class="cat-cell">${escapeHtmlBid(
+                g.category,
+              )}</td></tr>`;
+              const lines = g.rows.map(renderRow).join('');
+              const sub = showCatSubtotals
+                ? `<tr class="cat-subtotal"><td colspan="6" class="right">${escapeHtmlBid(
+                    g.category,
+                  )} subtotal</td><td class="right">${money(g.subtotal)}</td></tr>`
+                : '';
+              return header + lines + sub;
+            })
             .join('')
         : `<tr><td colspan="7" class="empty">No materials listed for this section.</td></tr>`;
 
@@ -1505,6 +1533,9 @@ export function generateMaterialListHTML(data: {
       .mat-table th { background: #2d5f3f; color: #fff; font-size: 8.5pt; text-align: left; padding: 6px 8px; }
       .mat-table td { border-bottom: 1px solid #e5e7eb; padding: 5px 8px; font-size: 9pt; vertical-align: top; }
       .mat-table tbody tr:nth-child(even) { background: #f8faf9; }
+      .mat-table .cat-row td { background: #eef3ef; border-bottom: 1px solid #cdddd3; }
+      .mat-table .cat-cell { font-weight: 700; font-size: 8.5pt; letter-spacing: .03em; text-transform: uppercase; color: #2d5f3f; padding: 5px 8px; }
+      .mat-table .cat-subtotal td { background: #fff; border-bottom: 1px solid #cdddd3; font-style: italic; font-weight: 600; color: #374151; }
       .mat-table .mat { font-weight: 600; }
       .mat-table .center { text-align: center; }
       .mat-table .right { text-align: right; white-space: nowrap; }
