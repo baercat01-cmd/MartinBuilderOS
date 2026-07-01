@@ -13866,9 +13866,14 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
 
   /**
    * Customer-facing comprehensive material list PDF (for customers who buy only the building
-   * materials). Same header as the proposal; each base material section/sheet renders on its own
-   * PDF page with columns: material name, usage, length, qty, color, price per unit, and total.
-   * Pulls the raw material_items (the breakdown rollup drops usage/length/color), grouped by sheet.
+   * materials). Same header as the proposal; each proposal section renders on its own PDF page
+   * with columns: material name, usage, length, qty, color, price per unit, and total.
+   *
+   * Sections included (in proposal order):
+   *   - Material workbook sheets → raw material_items (breakdown rollup drops usage/length/color).
+   *   - Standalone custom rows and subcontractor sections that carry itemized MATERIAL line items.
+   * Pure labor / lump-sum sections (no itemized material lines) are skipped, and section
+   * descriptions are pulled straight from the DB so they always print.
    */
   async function handleExportMaterialList() {
     setExporting(true);
@@ -13877,23 +13882,21 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
         (quote as any)?.is_customer_estimate === true
           ? displayNumberForQuoteRow(quote as any, true)
           : quote?.proposal_number || job.id.split('-')[0].toUpperCase();
+      const round2 = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
 
-      // Base (non-optional) proposal sheets in display order; exclude change orders and optionals.
+      // Base (non-optional) proposal sheets; exclude change orders and optionals.
       const baseSheets = (materialsBreakdown?.sheetBreakdowns || [])
-        .filter((s: any) => (s?.sheetType ?? 'proposal') !== 'change_order' && !s?.isOptional)
-        .sort((a: any, b: any) => (a?.orderIndex ?? 0) - (b?.orderIndex ?? 0));
+        .filter((s: any) => (s?.sheetType ?? 'proposal') !== 'change_order' && !s?.isOptional);
 
       const sheetIds = baseSheets.map((s: any) => s.sheetId).filter(Boolean);
-      if (sheetIds.length === 0) {
-        toast.error('No material sections to export.');
-        return;
-      }
 
-      const { data: itemsData, error: itemsError } = await supabase
-        .from('material_items')
-        .select('*')
-        .in('sheet_id', sheetIds)
-        .order('order_index', { ascending: true });
+      const { data: itemsData, error: itemsError } = sheetIds.length
+        ? await supabase
+            .from('material_items')
+            .select('*')
+            .in('sheet_id', sheetIds)
+            .order('order_index', { ascending: true })
+        : { data: [] as any[], error: null };
       if (itemsError) throw itemsError;
 
       const itemsBySheet = new Map<string, any[]>();
@@ -13902,47 +13905,155 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
         itemsBySheet.get(it.sheet_id)!.push(it);
       });
 
+      // Authoritative section descriptions straight from material_sheets so they always print,
+      // regardless of what the in-memory breakdown carries.
+      const sheetDescById = new Map<string, string>();
+      if (sheetIds.length) {
+        const { data: sheetRows } = await supabase
+          .from('material_sheets')
+          .select('id, description')
+          .in('id', sheetIds);
+        (sheetRows || []).forEach((s: any) => sheetDescById.set(s.id, s.description || ''));
+      }
+
       let materialsTotal = 0;
       let taxableTotal = 0;
 
-      const pages: MaterialListPage[] = baseSheets.map((sheet: any) => {
-        const items = (itemsBySheet.get(sheet.sheetId) || [])
-          .filter((it: any) => !toBool(it.is_optional))
-          .sort((a: any, b: any) => {
-            const ca = String(a.category ?? '');
-            const cb = String(b.category ?? '');
-            if (ca !== cb) return ca.localeCompare(cb);
-            return (a.order_index ?? 0) - (b.order_index ?? 0);
+      // Unified, proposal-ordered section list: material sheets + standalone custom rows + subs.
+      type ExportSection =
+        | { kind: 'sheet'; orderIndex: number; data: any }
+        | { kind: 'custom'; orderIndex: number; data: any }
+        | { kind: 'sub'; orderIndex: number; data: any };
+      const sections: ExportSection[] = [
+        ...baseSheets.map((s: any) => ({ kind: 'sheet' as const, orderIndex: s.orderIndex ?? 0, data: s })),
+        ...customRows
+          .filter((r: any) => !r.sheet_id && !toBool((r as any).is_option))
+          .map((r: any) => ({ kind: 'custom' as const, orderIndex: (r as any).order_index ?? 0, data: r })),
+        ...subcontractorEstimates
+          .filter((e: any) => !e.sheet_id && !e.row_id && !toBool((e as any).is_option))
+          .map((e: any) => ({ kind: 'sub' as const, orderIndex: (e as any).order_index ?? 0, data: e })),
+      ].sort((a, b) => a.orderIndex - b.orderIndex);
+
+      const pages: MaterialListPage[] = [];
+
+      for (const section of sections) {
+        if (section.kind === 'sheet') {
+          const sheet = section.data;
+          const items = (itemsBySheet.get(sheet.sheetId) || [])
+            .filter((it: any) => !toBool(it.is_optional))
+            .sort((a: any, b: any) => {
+              const ca = String(a.category ?? '');
+              const cb = String(b.category ?? '');
+              if (ca !== cb) return ca.localeCompare(cb);
+              return (a.order_index ?? 0) - (b.order_index ?? 0);
+            });
+
+          let subtotal = 0;
+          const rows: MaterialListRow[] = items.map((it: any) => {
+            const { price } = getMaterialLineSellAndCost(it);
+            const qty = Number(it.quantity) || 0;
+            const pricePerUnit = qty > 0 ? price / qty : price;
+            subtotal += price;
+            if (it.taxable !== false) taxableTotal += price;
+            return {
+              material_name: it.material_name ?? '',
+              usage: it.usage ?? '',
+              length: it.length != null ? String(it.length) : '',
+              quantity: qty,
+              color: it.color ?? '',
+              pricePerUnit,
+              total: price,
+              category: it.category ?? '',
+            };
           });
 
-        let subtotal = 0;
-        const rows: MaterialListRow[] = items.map((it: any) => {
-          const { price } = getMaterialLineSellAndCost(it);
-          const qty = Number(it.quantity) || 0;
-          const pricePerUnit = qty > 0 ? price / qty : price;
-          subtotal += price;
-          if (it.taxable !== false) taxableTotal += price;
-          return {
-            material_name: it.material_name ?? '',
-            usage: it.usage ?? '',
-            length: it.length != null ? String(it.length) : '',
-            quantity: qty,
-            color: it.color ?? '',
-            pricePerUnit,
-            total: price,
-            category: it.category ?? '',
-          };
-        });
+          materialsTotal += subtotal;
+          pages.push({
+            sheetName: sheet.sheetName || 'Section',
+            description: sheetDescById.get(sheet.sheetId) ?? sheet.sheetDescription ?? '',
+            optional: false,
+            rows,
+            subtotal: round2(subtotal),
+          });
+        } else if (section.kind === 'custom') {
+          // Custom row: include only its itemized MATERIAL line items (skip labor / lump-sum rows).
+          const row = section.data;
+          const rowMarkup = Number(row.markup_percent ?? 0) || 0;
+          const matLines = (customRowLineItems[row.id] || []).filter(
+            (li: any) => (li.item_type || 'material') !== 'labor'
+          );
+          if (matLines.length === 0) continue;
 
-        materialsTotal += subtotal;
-        return {
-          sheetName: sheet.sheetName || 'Section',
-          description: sheet.sheetDescription || '',
-          optional: false,
-          rows,
-          subtotal: Math.round(subtotal * 100) / 100,
-        };
-      });
+          let subtotal = 0;
+          const rows: MaterialListRow[] = matLines.map((li: any) => {
+            const markup = Number(li.markup_percent ?? rowMarkup) || 0;
+            const sell = effectiveCustomRowLineItemBase(li) * (1 + markup / 100);
+            const qty = Number(li.quantity) || 0;
+            const pricePerUnit = qty > 0 ? sell / qty : sell;
+            subtotal += sell;
+            if ((li as any).taxable !== false) taxableTotal += sell;
+            return {
+              material_name: li.description || row.description || '',
+              usage: '',
+              length: '',
+              quantity: qty,
+              color: '',
+              pricePerUnit,
+              total: sell,
+              category: row.category || 'Additional Materials',
+            };
+          });
+
+          materialsTotal += subtotal;
+          pages.push({
+            sheetName: row.description || 'Additional Materials',
+            description: row.notes || '',
+            optional: false,
+            rows,
+            subtotal: round2(subtotal),
+          });
+        } else {
+          // Subcontractor: include only its itemized MATERIAL line items (skip labor / lump-sum).
+          const est = section.data;
+          const estMarkup = Number(est.markup_percent ?? 0) || 0;
+          const matLines = (subcontractorLineItems[est.id] || [])
+            .filter((li: any) => !li.excluded && (li.item_type || 'material') !== 'labor');
+          if (matLines.length === 0) continue;
+
+          let subtotal = 0;
+          const rows: MaterialListRow[] = matLines.map((li: any) => {
+            const sell = (Number(li.total_price) || 0) * (1 + estMarkup / 100);
+            const qty = Number(li.quantity) || 1;
+            const pricePerUnit = qty > 0 ? sell / qty : sell;
+            subtotal += sell;
+            if ((li as any).taxable !== false) taxableTotal += sell;
+            return {
+              material_name: li.description || est.scope_of_work || '',
+              usage: '',
+              length: '',
+              quantity: qty,
+              color: '',
+              pricePerUnit,
+              total: sell,
+              category: est.company_name || 'Subcontractor',
+            };
+          });
+
+          materialsTotal += subtotal;
+          pages.push({
+            sheetName: est.company_name || 'Subcontractor',
+            description: est.scope_of_work || '',
+            optional: false,
+            rows,
+            subtotal: round2(subtotal),
+          });
+        }
+      }
+
+      if (pages.length === 0) {
+        toast.error('No material sections to export.');
+        return;
+      }
 
       materialsTotal = Math.round(materialsTotal * 100) / 100;
       taxableTotal = Math.round(taxableTotal * 100) / 100;
