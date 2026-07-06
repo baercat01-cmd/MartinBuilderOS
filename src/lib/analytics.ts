@@ -65,6 +65,9 @@ export function enableStaffAnalytics(profile: UserProfile): void {
   }
 
   posthog.opt_in_capturing();
+  // Super property: stamps role_app on every event/replay so usage can be
+  // sliced by which staff app (Office/Foreman/Payroll/Shop/Fleet) was in use.
+  posthog.register({ role_app: roleApp, staff_role: profile.role });
   posthog.identify(profile.id, {
     email: profile.email,
     username: profile.username ?? undefined,
