@@ -20,6 +20,7 @@ import SubcontractorPortal from '@/pages/SubcontractorPortal';
 import PlanShare from '@/pages/PlanShare';
 import { Toaster } from '@/components/ui/sonner';
 import { UndoProvider } from '@/contexts/UndoContext';
+import { enableStaffAnalytics, disableStaffAnalytics } from '@/lib/analytics';
 import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { AlertTriangle } from 'lucide-react';
@@ -80,7 +81,19 @@ class ErrorBoundary extends Component<
 
 function AppContent() {
   const { profile, loading, selectUser, clearUser, authState, userSelectKey } = useAuth();
-  
+
+  // Internal-usage analytics: capture only for authenticated staff on the
+  // internal role-apps. Never runs on the public portal routes (they mount
+  // outside AuthProvider) and analytics.ts independently refuses portal paths.
+  useEffect(() => {
+    if (authState === 'authenticated' && profile) {
+      enableStaffAnalytics(profile);
+    } else {
+      disableStaffAnalytics();
+    }
+  }, [authState, profile]);
+
+
   // Debug logging in development only
   if (import.meta.env.DEV) {
     console.log('🔍 AppContent rendering...', { profile: profile?.username, loading });
