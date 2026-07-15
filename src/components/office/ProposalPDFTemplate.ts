@@ -287,8 +287,10 @@ export function generateProposalHTML(data: {
     (showInternalDetails ||
       showSectionPrices ||
       sections.some((s: any) => pdfSectionLineTotal(s) > 0.005));
-  const pdfCombinedSubtotalBeforeTax = (Number(totals.subtotal) || 0) + pdfOptionalSubtotal;
-  const pdfGrandTotalAllScope = pdfCombinedSubtotalBeforeTax + (taxExempt ? 0 : Number(totals.tax) || 0);
+  // Contract Subtotal / Tax / Grand Total always match the program (base scope).
+  // Optional section dollars may be listed separately but never inflate those totals.
+  const pdfContractSubtotal = Number(totals.subtotal) || 0;
+  const pdfContractGrandTotal = Number(totals.grandTotal) || 0;
   const paymentText = t.payment_text ?? 'Payment to be made as follows: 20% Down, 60% COD, 20% Final';
   const defaultAcceptanceProposal =
     'The above prices, specifications and conditions are satisfactory and are hereby accepted. You are authorized to do the work as specified. Payment will be made as outlined above.';
@@ -1033,47 +1035,27 @@ export function generateProposalHTML(data: {
                   <td style="text-align: right; padding: 5px;">$${totals.labor.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
                 </tr>
               ` : ''}
+              <tr>
+                <td style="text-align: right; padding: 5px;"><strong>Subtotal:</strong></td>
+                <td style="text-align: right; padding: 5px;">$${pdfContractSubtotal.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+              </tr>
               ${
                 hasOptionalSections && pdfOptionalSubtotal > 0.005
                   ? `<tr>
-                <td style="text-align: right; padding: 5px;"><strong>Base scope subtotal (excludes optional):</strong></td>
-                <td style="text-align: right; padding: 5px;">$${(Number(totals.subtotal) || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
-              </tr>
-              <tr>
-                <td style="text-align: right; padding: 5px;"><strong>Optional items subtotal:</strong></td>
+                <td style="text-align: right; padding: 5px;"><strong>Optional items (not included in total):</strong></td>
                 <td style="text-align: right; padding: 5px;">$${pdfOptionalSubtotal.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
-              </tr>
-              <tr>
-                <td style="text-align: right; padding: 5px;"><strong>Subtotal (all scope):</strong></td>
-                <td style="text-align: right; padding: 5px;">$${pdfCombinedSubtotalBeforeTax.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
               </tr>`
-                  : `<tr>
-                <td style="text-align: right; padding: 5px;"><strong>Subtotal:</strong></td>
-                <td style="text-align: right; padding: 5px;">$${totals.subtotal.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
-              </tr>`
+                  : ''
               }
               <tr>
                 <td style="text-align: right; padding: 5px;"><strong>${taxExempt ? 'Tax:' : 'Sales Tax (7%):'}</strong></td>
                 <td style="text-align: right; padding: 5px;">${taxExempt ? 'Tax Exempt' : '$' + totals.tax.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
               </tr>
-              ${
-                hasOptionalSections && pdfOptionalSubtotal > 0.005 && !taxExempt
-                  ? `<tr>
-                <td colspan="2" style="font-size: 9pt; color: #64748b; padding: 2px 5px 8px 5px; text-align: right; line-height: 1.35;">
-                  Tax reflects taxable materials in the base scope; optional selections may change the tax amount.
-                </td>
-              </tr>`
-                  : ''
-              }
               <tr class="summary-table-total" style="border-top: 2px solid #333;">
                 <td style="text-align: right; padding: 10px 5px 5px 5px;"><strong style="font-size: 12pt;">${
-                  isEstimate
-                    ? 'ESTIMATED TOTAL (non-binding):'
-                    : hasOptionalSections && pdfOptionalSubtotal > 0.005
-                      ? 'GRAND TOTAL (all scope + tax shown):'
-                      : 'GRAND TOTAL:'
+                  isEstimate ? 'ESTIMATED TOTAL (non-binding):' : 'GRAND TOTAL:'
                 }</strong></td>
-                <td class="grand-total-amount" style="text-align: right; padding: 10px 5px 5px 5px;"><strong style="font-size: 14pt;">$${(hasOptionalSections && pdfOptionalSubtotal > 0.005 ? pdfGrandTotalAllScope : totals.grandTotal).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong></td>
+                <td class="grand-total-amount" style="text-align: right; padding: 10px 5px 5px 5px;"><strong style="font-size: 14pt;">$${pdfContractGrandTotal.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong></td>
               </tr>
             </table>
           </div>
@@ -1082,7 +1064,7 @@ export function generateProposalHTML(data: {
             <div class="terms-header">
               <div class="terms-title">Standard Terms and Conditions</div>
               <div class="terms-reference">${docTitle} #${proposalNumber} | ${job.name} | ${job.client_name}</div>
-              <div class="terms-reference">${isEstimate ? 'Estimated amount (non-binding)' : 'Contract Amount'}: $${(hasOptionalSections && pdfOptionalSubtotal > 0.005 ? pdfGrandTotalAllScope : totals.grandTotal).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
+              <div class="terms-reference">${isEstimate ? 'Estimated amount (non-binding)' : 'Contract Amount'}: $${pdfContractGrandTotal.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
             </div>
             <div class="terms-content">
               <div class="terms-section">
@@ -1140,47 +1122,27 @@ export function generateProposalHTML(data: {
             }</p>
             
             <table style="margin-top: 15px;">
+              <tr>
+                <td style="text-align: right;"><strong>Subtotal:</strong></td>
+                <td style="text-align: right; width: 150px;">$${pdfContractSubtotal.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+              </tr>
               ${
                 hasOptionalSections && pdfOptionalSubtotal > 0.005
                   ? `<tr>
-                <td style="text-align: right;"><strong>Base scope subtotal (excludes optional):</strong></td>
-                <td style="text-align: right; width: 150px;">$${(Number(totals.subtotal) || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
-              </tr>
-              <tr>
-                <td style="text-align: right;"><strong>Optional items subtotal:</strong></td>
+                <td style="text-align: right;"><strong>Optional items (not included in total):</strong></td>
                 <td style="text-align: right; width: 150px;">$${pdfOptionalSubtotal.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
-              </tr>
-              <tr>
-                <td style="text-align: right;"><strong>Subtotal (all scope):</strong></td>
-                <td style="text-align: right; width: 150px;">$${pdfCombinedSubtotalBeforeTax.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
               </tr>`
-                  : `<tr>
-                <td style="text-align: right;"><strong>Subtotal:</strong></td>
-                <td style="text-align: right; width: 150px;">$${totals.subtotal.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
-              </tr>`
+                  : ''
               }
               <tr>
                 <td style="text-align: right;"><strong>${taxExempt ? 'Tax:' : 'Sales Tax (7%):'}</strong></td>
                 <td style="text-align: right;">${taxExempt ? 'Tax Exempt' : '$' + totals.tax.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
               </tr>
-              ${
-                hasOptionalSections && pdfOptionalSubtotal > 0.005 && !taxExempt
-                  ? `<tr>
-                <td colspan="2" style="font-size: 9pt; color: #64748b; padding: 4px 0 8px 0; text-align: right; line-height: 1.35;">
-                  Tax reflects taxable materials in the base scope; optional selections may change the tax amount.
-                </td>
-              </tr>`
-                  : ''
-              }
               <tr class="summary-table-total">
                 <td style="text-align: right; padding-top: 10px;"><strong>${
-                  isEstimate
-                    ? 'ESTIMATED TOTAL (non-binding):'
-                    : hasOptionalSections && pdfOptionalSubtotal > 0.005
-                      ? 'GRAND TOTAL (all scope + tax shown):'
-                      : 'GRAND TOTAL:'
+                  isEstimate ? 'ESTIMATED TOTAL (non-binding):' : 'GRAND TOTAL:'
                 }</strong></td>
-                <td class="grand-total-amount" style="text-align: right; padding-top: 10px; font-size: 14pt;"><strong>$${(hasOptionalSections && pdfOptionalSubtotal > 0.005 ? pdfGrandTotalAllScope : totals.grandTotal).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong></td>
+                <td class="grand-total-amount" style="text-align: right; padding-top: 10px; font-size: 14pt;"><strong>$${pdfContractGrandTotal.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong></td>
               </tr>
             </table>
           </div>
@@ -1217,7 +1179,7 @@ export function generateProposalHTML(data: {
             <div class="terms-header">
               <div class="terms-title">Standard Terms and Conditions</div>
               <div class="terms-reference">${docTitle} #${proposalNumber} | ${job.name} | ${job.client_name}</div>
-              <div class="terms-reference">${isEstimate ? 'Estimated amount (non-binding)' : 'Contract Amount'}: $${(hasOptionalSections && pdfOptionalSubtotal > 0.005 ? pdfGrandTotalAllScope : totals.grandTotal).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
+              <div class="terms-reference">${isEstimate ? 'Estimated amount (non-binding)' : 'Contract Amount'}: $${pdfContractGrandTotal.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
             </div>
             <div class="terms-content">
               <div class="terms-section">

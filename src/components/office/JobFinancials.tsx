@@ -13871,7 +13871,8 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
    *
    * Sections included (in proposal order):
    *   - Material workbook sheets → raw material_items (breakdown rollup drops usage/length/color).
-   *   - Standalone custom rows and subcontractor sections that carry itemized MATERIAL line items.
+   *   - Standalone custom rows and subcontractor sections that carry itemized line items. These list
+   *     BOTH material and labor lines (grouped Materials then Labor); labor is non-taxable.
    * Pure labor / lump-sum sections (no itemized material lines) are skipped, and section
    * descriptions are pulled straight from the DB so they always print.
    */
@@ -13976,31 +13977,34 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
             subtotal: round2(subtotal),
           });
         } else if (section.kind === 'custom') {
-          // Custom row: include only its itemized MATERIAL line items (skip labor / lump-sum rows).
+          // Custom row: list its itemized line items (materials AND labor) line by line, grouped as
+          // Materials then Labor. Excluded lines are dropped; pure labor / lump-sum rows are skipped.
           const row = section.data;
           const rowMarkup = Number(row.markup_percent ?? 0) || 0;
-          const matLines = (customRowLineItems[row.id] || []).filter(
-            (li: any) => (li.item_type || 'material') !== 'labor'
-          );
-          if (matLines.length === 0) continue;
+          const lineItems = (customRowLineItems[row.id] || [])
+            .filter((li: any) => !li.excluded)
+            .slice()
+            .sort((a: any, b: any) => Number((a.item_type || 'material') === 'labor') - Number((b.item_type || 'material') === 'labor'));
+          if (!lineItems.some((li: any) => (li.item_type || 'material') !== 'labor')) continue;
 
           let subtotal = 0;
-          const rows: MaterialListRow[] = matLines.map((li: any) => {
+          const rows: MaterialListRow[] = lineItems.map((li: any) => {
+            const isLabor = (li.item_type || 'material') === 'labor';
             const markup = Number(li.markup_percent ?? rowMarkup) || 0;
             const sell = effectiveCustomRowLineItemBase(li) * (1 + markup / 100);
             const qty = Number(li.quantity) || 0;
             const pricePerUnit = qty > 0 ? sell / qty : sell;
             subtotal += sell;
-            if ((li as any).taxable !== false) taxableTotal += sell;
+            if (!isLabor && (li as any).taxable !== false) taxableTotal += sell;
             return {
               material_name: li.description || row.description || '',
-              usage: '',
+              usage: isLabor ? 'Labor' : '',
               length: '',
               quantity: qty,
               color: '',
               pricePerUnit,
               total: sell,
-              category: row.category || 'Additional Materials',
+              category: isLabor ? 'Labor' : (row.category || 'Materials'),
             };
           });
 
@@ -14013,29 +14017,33 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
             subtotal: round2(subtotal),
           });
         } else {
-          // Subcontractor: include only its itemized MATERIAL line items (skip labor / lump-sum).
+          // Subcontractor: list its itemized line items (materials AND labor) line by line, grouped
+          // as Materials then Labor. Excluded lines are dropped; pure labor / lump-sum sections skipped.
           const est = section.data;
           const estMarkup = Number(est.markup_percent ?? 0) || 0;
-          const matLines = (subcontractorLineItems[est.id] || [])
-            .filter((li: any) => !li.excluded && (li.item_type || 'material') !== 'labor');
-          if (matLines.length === 0) continue;
+          const lineItems = (subcontractorLineItems[est.id] || [])
+            .filter((li: any) => !li.excluded)
+            .slice()
+            .sort((a: any, b: any) => Number((a.item_type || 'material') === 'labor') - Number((b.item_type || 'material') === 'labor'));
+          if (!lineItems.some((li: any) => (li.item_type || 'material') !== 'labor')) continue;
 
           let subtotal = 0;
-          const rows: MaterialListRow[] = matLines.map((li: any) => {
+          const rows: MaterialListRow[] = lineItems.map((li: any) => {
+            const isLabor = (li.item_type || 'material') === 'labor';
             const sell = (Number(li.total_price) || 0) * (1 + estMarkup / 100);
             const qty = Number(li.quantity) || 1;
             const pricePerUnit = qty > 0 ? sell / qty : sell;
             subtotal += sell;
-            if ((li as any).taxable !== false) taxableTotal += sell;
+            if (!isLabor && (li as any).taxable !== false) taxableTotal += sell;
             return {
               material_name: li.description || est.scope_of_work || '',
-              usage: '',
+              usage: isLabor ? 'Labor' : '',
               length: '',
               quantity: qty,
               color: '',
               pricePerUnit,
               total: sell,
-              category: est.company_name || 'Subcontractor',
+              category: isLabor ? 'Labor' : 'Materials',
             };
           });
 
@@ -14075,7 +14083,12 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
       });
 
       setShowExportDialog(false);
-      openLineBreakdownPrintWindow(html);
+      // Open the in-app preview (same viewer as the proposal) instead of jumping straight to a
+      // print tab, so the material list can be reviewed before printing / saving as PDF.
+      openPdfViewInApp(
+        html,
+        `Material_List_${String(proposalNumber).replace(/[^a-zA-Z0-9_-]/g, '_')}.pdf`,
+      );
     } catch (error: any) {
       console.error('Error exporting material list PDF:', error);
       toast.error(`Failed to export material list: ${error.message || 'Unknown error'}`);
@@ -14376,11 +14389,12 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
               grandTotal: estimatePdfGrand,
             }
           : {
-              materials: proposalMaterialsTotalWithSubcontractors,
-              labor: proposalLaborPrice,
-              subtotal: proposalSubtotal,
-              tax: proposalTotalTax,
-              grandTotal: proposalGrandTotal,
+              // Match the in-app proposal summary (excludes optional scope).
+              materials: effectiveProposalMaterials,
+              labor: effectiveProposalLabor,
+              subtotal: effectiveProposalSubtotal,
+              tax: effectiveProposalTax,
+              grandTotal: effectiveProposalGrandTotal,
             },
         bidSpec: isBidSpec
           ? {
@@ -14962,11 +14976,12 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
               grandTotal: estimatePdfGrand,
             }
           : {
-              materials: proposalMaterialsTotalWithSubcontractors,
-              labor: proposalLaborPrice,
-              subtotal: proposalSubtotal,
-              tax: proposalTotalTax,
-              grandTotal: proposalGrandTotal,
+              // Match the in-app proposal summary (excludes optional scope).
+              materials: effectiveProposalMaterials,
+              labor: effectiveProposalLabor,
+              subtotal: effectiveProposalSubtotal,
+              tax: effectiveProposalTax,
+              grandTotal: effectiveProposalGrandTotal,
             },
         taxExempt: taxExemptChecked,
       });
