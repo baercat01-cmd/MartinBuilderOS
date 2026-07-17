@@ -800,12 +800,18 @@ export function generateProposalHTML(data: {
               const isFirstSection = sectionIndex === 0;
               const sectionTitleMargin = isFirstSection ? '0' : '8px';
               let content = '<div class="section-wrapper">';
+              // Required header price = Materials (same as program Materials column).
+              const materialsDisplay =
+                section.materialsPrice != null && !isNaN(Number(section.materialsPrice))
+                  ? Number(section.materialsPrice)
+                  : Number(section.price || 0);
+              const sectionTotalDisplay = pdfSectionLineTotal(section);
               
               if (showInternalDetails) {
                 content += '<div class="section-title" style="margin-top: ' + sectionTitleMargin + ';">';
                 content += '<span style="font-weight: bold; font-size: ' + (sectionTitleSize + 1) + 'pt;">' + section.name + '</span>';
-                if (section.price) {
-                  content += '<span class="section-price" style="font-weight: bold; font-size: ' + (sectionTitleSize + 1) + 'pt;">$' + section.price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '</span>';
+                if (materialsDisplay) {
+                  content += '<span class="section-price" style="font-weight: bold; font-size: ' + (sectionTitleSize + 1) + 'pt;">$' + materialsDisplay.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '</span>';
                 }
                 content += '</div>';
                 
@@ -837,16 +843,16 @@ export function generateProposalHTML(data: {
                   
                   content += '<tr class="total-row">';
                   content += '<td colspan="3" style="text-align: right; font-weight: bold; padding: 10px 8px; background: #f0f0f0;">Section Total:</td>';
-                  content += '<td style="text-align: right; font-weight: bold; padding: 10px 8px; background: #f0f0f0; font-size: ' + bodyFontSize + 'pt;">$' + (section.price || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '</td>';
+                  content += '<td style="text-align: right; font-weight: bold; padding: 10px 8px; background: #f0f0f0; font-size: ' + bodyFontSize + 'pt;">$' + (sectionTotalDisplay || materialsDisplay || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '</td>';
                   content += '</tr>';
                   content += '</tbody></table>';
                   content += '</div>';
                 }
               } else {
-                if (showSectionPrices && section.price) {
+                if (showSectionPrices && materialsDisplay) {
                   content += '<div class="section-title" style="margin-top: ' + sectionTitleMargin + ';">';
                   content += '<span>' + section.name + '</span>';
-                  content += '<span class="section-price">$' + section.price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '</span>';
+                  content += '<span class="section-price">$' + materialsDisplay.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '</span>';
                   content += '</div>';
                 } else {
                   content += '<div class="section-title" style="display: block; margin-top: ' + sectionTitleMargin + ';">' + section.name + '</div>';

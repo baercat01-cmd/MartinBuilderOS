@@ -1370,6 +1370,158 @@ function lookupSyncedCategoryBasePrice(
   return undefined;
 }
 
+/**
+ * Materials / labor / section total for one material sheet — same math as the proposal panel
+ * (SortableRow) and line-breakdown export. Used by PDF export so section prices match the program.
+ */
+function computeMaterialSheetSectionPrices(args: {
+  sheet: any;
+  materialsBreakdown: { sheetBreakdowns?: any[] } | null | undefined;
+  externalPriceLookup: Map<string, Record<string, number>>;
+  categoryMarkups: Record<string, number>;
+  customRows: any[];
+  customRowLineItems: Record<string, any[]>;
+  linkedSubcontractors: Record<string, any[]>;
+  subcontractorLineItems: Record<string, any[]>;
+  sheetLabor: Record<string, any>;
+  materialSheets: { id?: string; sheet_name?: string }[];
+  sheetMetaById?: Record<string, string>;
+}): { materialsPrice: number; laborPrice: number; sectionTotal: number } {
+  const {
+    sheet,
+    materialsBreakdown,
+    externalPriceLookup,
+    categoryMarkups,
+    customRows,
+    customRowLineItems,
+    linkedSubcontractors,
+    subcontractorLineItems,
+    sheetLabor,
+    materialSheets,
+    sheetMetaById = {},
+  } = args;
+
+  const sectionSheetId = String(sheet?.sheetId ?? sheet?.id ?? '').trim();
+  const sheetIdForMatch = sectionSheetId;
+  const sheetNameForMatch = String(sheet?.sheetName ?? sheet?.sheet_name ?? '').trim().toLowerCase();
+  const breakdownSheets = materialsBreakdown?.sheetBreakdowns || [];
+  const breakdownSheet =
+    breakdownSheets.find((s: any) => String(s?.sheetId ?? s?.id ?? '').trim() === sheetIdForMatch) ||
+    breakdownSheets.find(
+      (s: any) => String(s?.sheetName ?? s?.sheet_name ?? '').trim().toLowerCase() === sheetNameForMatch,
+    );
+
+  const linkedRows = customRows.filter((r: any) => String(r.sheet_id ?? '').trim() === sectionSheetId);
+  const linkedSubs = linkedSubcontractors[sectionSheetId] || [];
+  const linkedRowTotals = sumLinkedRowTotals(linkedRows, customRowLineItems);
+  const linkedSubsMaterialsTotal = sumLinkedSubMaterialsFromSubs(linkedSubs, subcontractorLineItems);
+  const linkedSubsLaborTotal = sumLinkedSubLaborFromSubs(linkedSubs, subcontractorLineItems);
+
+  const sheetLaborRow = resolveSheetLaborForSection(
+    sheetLabor,
+    sectionSheetId,
+    sheet?.sheetName ?? sheet?.sheet_name,
+    materialSheets,
+    breakdownSheets,
+    sheetMetaById,
+  );
+  const sheetLaborTotal = sheetLaborRow ? effectiveSheetLaborTotal(sheetLaborRow) : 0;
+
+  const resolvedSheetLineItems = resolveCustomRowLineItemsForSheet(
+    customRowLineItems,
+    materialSheets,
+    sectionSheetId,
+    sheet?.sheetName,
+    breakdownSheets,
+    sheetMetaById,
+  );
+  const sheetLaborLineItemsTotal = resolvedSheetLineItems
+    .filter((item: any) => (item.item_type || 'material') === 'labor')
+    .reduce((sum: number, item: any) => {
+      const itemMarkup = item.markup_percent ?? 0;
+      return sum + effectiveCustomRowLineItemBase(item) * (1 + itemMarkup / 100);
+    }, 0);
+  const sheetMaterialLineItemsTotal = resolvedSheetLineItems
+    .filter((item: any) => (item.item_type || 'material') === 'material')
+    .reduce((sum: number, item: any) => {
+      const itemMarkup = item.markup_percent ?? 0;
+      return sum + effectiveCustomRowLineItemBase(item) * (1 + itemMarkup / 100);
+    }, 0);
+
+  const categorySource = ((breakdownSheet as any)?.categories?.length ? (breakdownSheet as any).categories : sheet.categories) || [];
+  const normalizeCategoryName = (name: unknown) => String(name ?? '').trim().toLowerCase();
+  const breakdownCategories = (((breakdownSheet as any)?.categories || []) as any[]);
+  const breakdownCategoryPriceByName = new Map<string, number>(
+    breakdownCategories.map((cat: any) => [normalizeCategoryName(cat?.name), Number(cat?.totalPrice) || 0]),
+  );
+
+  const getCategoryBreakdownPrice = (cat: any) => {
+    const catKey = normalizeCategoryName(cat?.name);
+    const synced = lookupSyncedCategoryBasePrice(
+      externalPriceLookup,
+      sheetIdForMatch,
+      sheetNameForMatch,
+      cat?.name,
+    );
+    if (synced !== undefined) return synced;
+
+    const itemsPrice = ((cat?.items || []) as any[]).reduce((sum: number, item: any) => {
+      return sum + getMaterialLineSellAndCost(item).price;
+    }, 0);
+    if (itemsPrice > 0) return itemsPrice;
+
+    const directTotalPrice = Number(cat?.totalPrice);
+    if (Number.isFinite(directTotalPrice) && directTotalPrice > 0) return directTotalPrice;
+
+    if (breakdownCategoryPriceByName.has(catKey)) return breakdownCategoryPriceByName.get(catKey) || 0;
+    return 0;
+  };
+
+  const displayCategoriesForMaterialsSum =
+    breakdownCategories.length > 0 ? breakdownCategories : categorySource;
+  let materialsSubtotalFromCategories = 0;
+  let laborSubtotalFromCategories = 0;
+  for (const cat of displayCategoriesForMaterialsSum) {
+    const catSheetId = String(sheet?.sheetId ?? sheet?.id ?? '').trim();
+    const categoryMarkup = lookupCategoryMarkup(
+      categoryMarkups,
+      catSheetId,
+      cat?.name,
+      sheet.markup_percent ?? 10,
+    );
+    const synced = lookupSyncedCategoryBasePrice(
+      externalPriceLookup,
+      sheetIdForMatch,
+      sheetNameForMatch,
+      cat?.name,
+    );
+    const price = synced !== undefined ? synced : getCategoryBreakdownPrice(cat);
+    const lineTotal = price * (1 + (Number(categoryMarkup) || 0) / 100);
+    if (isWorkbookLaborCategoryName(cat?.name)) laborSubtotalFromCategories += lineTotal;
+    else materialsSubtotalFromCategories += lineTotal;
+  }
+
+  const materialsPrice =
+    materialsSubtotalFromCategories +
+    sheetMaterialLineItemsTotal +
+    linkedRowTotals.materialTotal +
+    linkedSubsMaterialsTotal;
+
+  const dedupedSheetLaborTotal = laborSubtotalFromCategories > 0 ? 0 : sheetLaborTotal;
+  const laborPrice =
+    dedupedSheetLaborTotal +
+    sheetLaborLineItemsTotal +
+    linkedRowTotals.laborTotal +
+    linkedSubsLaborTotal +
+    laborSubtotalFromCategories;
+
+  return {
+    materialsPrice,
+    laborPrice,
+    sectionTotal: materialsPrice + laborPrice,
+  };
+}
+
 type SheetCategoryBreakdown = {
   name: string;
   itemCount: number;
@@ -1626,14 +1778,7 @@ function SortableRow({
         || materialsBreakdown.sheetBreakdowns.find((s: any) => String(s?.sheetName ?? s?.sheet_name ?? '').trim().toLowerCase() === sheetNameForMatch);
       const linkedRows = customRows.filter((r: any) => String(r.sheet_id ?? '').trim() === sectionSheetId);
       const linkedSubs = linkedSubcontractors[sectionSheetId] || [];
-      
-      const linkedRowTotals = sumLinkedRowTotals(linkedRows, customRowLineItems);
-      
-      // Linked subcontractors: materials vs labor (item_type), same as breakdown totals & sub UI
-      const linkedSubsMaterialsTotal = sumLinkedSubMaterialsFromSubs(linkedSubs, subcontractorLineItems);
-      const linkedSubsLaborTotal = sumLinkedSubLaborFromSubs(linkedSubs, subcontractorLineItems);
-      
-      // Sheet labor: tolerate map key mismatch; use hours×rate when total_labor_cost is missing/zero
+
       const sheetLaborRow = resolveSheetLaborForSection(
         sheetLabor,
         sectionSheetId,
@@ -1642,29 +1787,6 @@ function SortableRow({
         materialsBreakdown?.sheetBreakdowns,
         sheetMetaById,
       );
-      const sheetLaborTotal = sheetLaborRow ? effectiveSheetLaborTotal(sheetLaborRow) : 0;
-      
-      // Calculate labor from sheet line items (with markup, same as line item display)
-      const resolvedSheetLineItems = resolveCustomRowLineItemsForSheet(
-        customRowLineItems,
-        materialSheets,
-        sectionSheetId,
-        sheet.sheetName,
-        materialsBreakdown?.sheetBreakdowns,
-        sheetMetaById,
-      );
-      const sheetLaborItems = resolvedSheetLineItems.filter((item: any) => (item.item_type || 'material') === 'labor') || [];
-      const sheetLaborLineItemsTotal = sheetLaborItems.reduce((sum: number, item: any) => {
-        const itemMarkup = item.markup_percent ?? 0;
-        return sum + effectiveCustomRowLineItemBase(item) * (1 + itemMarkup / 100);
-      }, 0);
-
-      // Sheet-level material line items (Add Material Row from section) — include in section total
-      const sheetMaterialItems = resolvedSheetLineItems.filter((item: any) => (item.item_type || 'material') === 'material') || [];
-      const sheetMaterialLineItemsTotal = sheetMaterialItems.reduce((sum: number, item: any) => {
-        const itemMarkup = item.markup_percent ?? 0;
-        return sum + effectiveCustomRowLineItemBase(item) * (1 + itemMarkup / 100);
-      }, 0);
       
       const categorySource = ((breakdownSheet as any)?.categories?.length ? (breakdownSheet as any).categories : sheet.categories) || [];
       const normalizeCategoryName = (name: unknown) => String(name ?? '').trim().toLowerCase();
@@ -1711,42 +1833,24 @@ function SortableRow({
         return { price: getCategoryBreakdownPrice(cat), isFinal: false };
       };
 
-      // Materials vs labor: categories named "Labor" (common workbook layout) count in the Labor column, not Materials.
-      const displayCategoriesForMaterialsSum =
-        breakdownCategories.length > 0 ? breakdownCategories : categorySource;
-      let materialsSubtotalFromCategories = 0;
-      let laborSubtotalFromCategories = 0;
-      for (const cat of displayCategoriesForMaterialsSum) {
-        const catSheetId = String(sheet?.sheetId ?? sheet?.id ?? '').trim();
-        const categoryMarkup = lookupCategoryMarkup(
-          categoryMarkups,
-          catSheetId,
-          cat?.name,
-          (sheet.markup_percent ?? 10)
-        );
-        const { price, isFinal } = getCategoryDisplayPrice(cat);
-        const lineTotal = isFinal ? price : price * (1 + (Number(categoryMarkup) || 0) / 100);
-        if (isWorkbookLaborCategoryName(cat?.name)) laborSubtotalFromCategories += lineTotal;
-        else materialsSubtotalFromCategories += lineTotal;
-      }
-      const sheetFinalPrice =
-        materialsSubtotalFromCategories +
-        sheetMaterialLineItemsTotal +
-        linkedRowTotals.materialTotal +
-        linkedSubsMaterialsTotal;
-      
-      // Total labor: DB sheet labor + line items + linked rows/subs + workbook "Labor" category.
-      // The workbook "Labor" category and the material_sheet_labor row are both synced from the
-      // locked workbook and represent the SAME labor, so adding both double-counts. When the
-      // section already carries labor as a "Labor" category, ignore the duplicate sheet-labor row.
-      const dedupedSheetLaborTotal = laborSubtotalFromCategories > 0 ? 0 : sheetLaborTotal;
-      const totalLaborCost =
-        dedupedSheetLaborTotal +
-        sheetLaborLineItemsTotal +
-        linkedRowTotals.laborTotal +
-        linkedSubsLaborTotal +
-        laborSubtotalFromCategories;
-      const sectionTotal = sheetFinalPrice + totalLaborCost;
+      // Same math as PDF export / line-breakdown (computeMaterialSheetSectionPrices).
+      const {
+        materialsPrice: sheetFinalPrice,
+        laborPrice: totalLaborCost,
+        sectionTotal,
+      } = computeMaterialSheetSectionPrices({
+        sheet,
+        materialsBreakdown,
+        externalPriceLookup,
+        categoryMarkups,
+        customRows,
+        customRowLineItems,
+        linkedSubcontractors,
+        subcontractorLineItems,
+        sheetLabor,
+        materialSheets,
+        sheetMetaById,
+      });
 
       return (
         <Collapsible
@@ -14159,65 +14263,44 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
         : allItemsUnsorted.map((item, index) => {
         if (item.type === 'material') {
           const sheet = item.data;
-          const linkedRows = customRows.filter((r: any) => r.sheet_id === sheet.sheetId);
-          const linkedSubs = linkedSubcontractors[sheet.sheetId] || [];
-          
-          const linkedRowTotals = sumLinkedRowTotals(linkedRows, displayCustomRowLineItems);
-          
-          const linkedSubsMaterialsTotal = sumLinkedSubMaterialsFromSubs(linkedSubs, subcontractorLineItems);
-          
-          const sheetBaseCost = sheet.totalPrice + linkedRowTotals.materialTotal + linkedSubsMaterialsTotal;
-          const sheetMarkup = sheet.markup_percent || 10;
-          const sheetFinalPrice = sheetBaseCost * (1 + sheetMarkup / 100);
+          const {
+            materialsPrice: sheetFinalPrice,
+            laborPrice: totalLaborCost,
+            sectionTotal,
+          } = computeMaterialSheetSectionPrices({
+            sheet,
+            materialsBreakdown,
+            externalPriceLookup,
+            categoryMarkups,
+            customRows,
+            customRowLineItems: displayCustomRowLineItems,
+            linkedSubcontractors,
+            subcontractorLineItems,
+            sheetLabor,
+            materialSheets,
+            sheetMetaById,
+          });
 
           // Build comparison data for optional sections that have a linked base section
           let comparisonData: any = undefined;
           if (!isBidSpec && (sheet as any).isOptional && (sheet as any).compareToSheetId) {
             const baseSheetBd = materialsBreakdown.sheetBreakdowns.find((s: any) => s.sheetId === (sheet as any).compareToSheetId);
             if (baseSheetBd) {
-              const baseLinkedRows2 = customRows.filter((r: any) => r.sheet_id === baseSheetBd.sheetId);
-              const baseLinkedRowTotals2 = sumLinkedRowTotals(baseLinkedRows2, displayCustomRowLineItems);
-              const baseLinkedSubs2 = linkedSubcontractors[baseSheetBd.sheetId] || [];
-              const baseLinkedSubsTotal2 = sumLinkedSubMaterialsFromSubs(baseLinkedSubs2, subcontractorLineItems);
-              const baseCatTotals2 = (baseSheetBd.categories || []).reduce((s2: number, cat: any) => {
-                const sellingPrice = Number(cat.totalPrice);
-                if (sellingPrice > 0) return s2 + sellingPrice;
-                const mu = categoryMarkups[`${baseSheetBd.sheetId}_${cat.name}`] ?? 10;
-                const baseCategoryCost = (cat.items || []).reduce((itemSum: number, item: any) => {
-                  const extended = Number(item.extended_cost) || 0;
-                  if (extended > 0) return itemSum + extended;
-                  return itemSum + ((Number(item.cost_per_unit) || 0) * (Number(item.quantity) || 0));
-                }, 0) || (Number(cat.totalCost) || 0);
-                return s2 + baseCategoryCost * (1 + mu / 100);
-              }, 0);
-              const baseMaterialsPrice = baseCatTotals2 + baseLinkedRowTotals2.materialTotal + baseLinkedSubsTotal2;
-              const baseSheetLaborData = sheetLabor[baseSheetBd.sheetId];
-              const baseSheetLaborTotal2 =
-                baseSheetLaborData && sheetLaborCountsForDisplayedSection(baseSheetLaborData, baseSheetBd.sheetId)
-                  ? Number(baseSheetLaborData.total_labor_cost) ||
-                    Number(baseSheetLaborData.estimated_hours || 0) * Number(baseSheetLaborData.hourly_rate || 0)
-                  : 0;
-              const baseSheetLaborLineItems2 = displayCustomRowLineItems[baseSheetBd.sheetId]?.filter((it: any) => (it.item_type || 'material') === 'labor') || [];
-              const baseSheetLaborLineItemsTotal2 = baseSheetLaborLineItems2.reduce((s2: number, it: any) => s2 + (it.total_cost * (1 + (it.markup_percent || 0) / 100)), 0);
-              const baseNonTaxable2 = baseLinkedSubs2.reduce((s2: number, sub: any) => {
-                const li2 = subcontractorLineItems[sub.id] || [];
-                const nt = li2.filter((it: any) => !it.excluded && !it.taxable).reduce((ss: number, it: any) => ss + it.total_price, 0);
-                return s2 + (nt * (1 + (sub.markup_percent || 0) / 100));
-              }, 0);
-              const baseLaborPrice = baseSheetLaborTotal2 + baseSheetLaborLineItemsTotal2 + baseLinkedRowTotals2.laborTotal + baseNonTaxable2;
-
-              // Option sheet labor
-              const optSheetLaborData = sheetLabor[sheet.sheetId];
-              const optSheetLaborTotal =
-                optSheetLaborData && sheetLaborCountsForDisplayedSection(optSheetLaborData, sheet.sheetId)
-                  ? Number(optSheetLaborData.total_labor_cost) ||
-                    Number(optSheetLaborData.estimated_hours || 0) * Number(optSheetLaborData.hourly_rate || 0)
-                  : 0;
-              const optSheetLaborLineItems = displayCustomRowLineItems[sheet.sheetId]?.filter((it: any) => (it.item_type || 'material') === 'labor') || [];
-              const optSheetLaborLineItemsTotal = optSheetLaborLineItems.reduce((s2: number, it: any) => s2 + (it.total_cost * (1 + (it.markup_percent || 0) / 100)), 0);
-              const optLinkedSubs2 = linkedSubcontractors[sheet.sheetId] || [];
-              const optSubLabor = sumLinkedSubLaborFromSubs(optLinkedSubs2, subcontractorLineItems);
-              const optLaborPrice = optSheetLaborTotal + optSheetLaborLineItemsTotal + linkedRowTotals.laborTotal + optSubLabor;
+              const basePrices = computeMaterialSheetSectionPrices({
+                sheet: baseSheetBd,
+                materialsBreakdown,
+                externalPriceLookup,
+                categoryMarkups,
+                customRows,
+                customRowLineItems: displayCustomRowLineItems,
+                linkedSubcontractors,
+                subcontractorLineItems,
+                sheetLabor,
+                materialSheets,
+                sheetMetaById,
+              });
+              const baseMaterialsPrice = basePrices.materialsPrice;
+              const baseLaborPrice = basePrices.laborPrice;
 
               // Category-level comparison rows
               const allCatNames = Array.from(new Set([
@@ -14227,12 +14310,56 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
               const categoryRows = allCatNames.map((catName: string) => {
                 const baseCat = (baseSheetBd.categories || []).find((c: any) => c.name === catName);
                 const optCat = (sheet.categories || []).find((c: any) => c.name === catName);
-                const baseMu = categoryMarkups[`${baseSheetBd.sheetId}_${catName}`] ?? 10;
-                const optMu = categoryMarkups[`${sheet.sheetId}_${catName}`] ?? 10;
+                const baseMu = lookupCategoryMarkup(
+                  categoryMarkups,
+                  baseSheetBd.sheetId,
+                  catName,
+                  10,
+                );
+                const optMu = lookupCategoryMarkup(
+                  categoryMarkups,
+                  sheet.sheetId,
+                  catName,
+                  sheet.markup_percent ?? 10,
+                );
+                const baseSynced = lookupSyncedCategoryBasePrice(
+                  externalPriceLookup,
+                  String(baseSheetBd.sheetId ?? '').trim(),
+                  String(baseSheetBd.sheetName ?? '').trim().toLowerCase(),
+                  catName,
+                );
+                const optSynced = lookupSyncedCategoryBasePrice(
+                  externalPriceLookup,
+                  String(sheet.sheetId ?? '').trim(),
+                  String(sheet.sheetName ?? '').trim().toLowerCase(),
+                  catName,
+                );
+                const baseCatBase =
+                  baseSynced !== undefined
+                    ? baseSynced
+                    : baseCat
+                      ? ((baseCat.items || []).reduce(
+                          (itemSum: number, item: any) => itemSum + getMaterialLineSellAndCost(item).price,
+                          0,
+                        ) ||
+                          Number(baseCat.totalPrice) ||
+                          0)
+                      : 0;
+                const optCatBase =
+                  optSynced !== undefined
+                    ? optSynced
+                    : optCat
+                      ? ((optCat.items || []).reduce(
+                          (itemSum: number, item: any) => itemSum + getMaterialLineSellAndCost(item).price,
+                          0,
+                        ) ||
+                          Number(optCat.totalPrice) ||
+                          0)
+                      : 0;
                 return {
                   name: catName,
-                  basePrice: baseCat ? baseCat.totalCost * (1 + baseMu / 100) : 0,
-                  optionPrice: optCat ? optCat.totalCost * (1 + optMu / 100) : 0,
+                  basePrice: baseCatBase * (1 + baseMu / 100),
+                  optionPrice: optCatBase * (1 + optMu / 100),
                 };
               });
 
@@ -14242,9 +14369,9 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
                 baseMaterialsPrice,
                 optionMaterialsPrice: sheetFinalPrice,
                 baseLaborPrice,
-                optionLaborPrice: optLaborPrice,
+                optionLaborPrice: totalLaborCost,
                 baseTotal: baseMaterialsPrice + baseLaborPrice,
-                optionTotal: sheetFinalPrice + optLaborPrice,
+                optionTotal: sheetFinalPrice + totalLaborCost,
                 categoryRows,
               };
             }
@@ -14270,31 +14397,45 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
                     }))
                   : undefined;
             } else {
-              materialPdfItems = sheet.categories?.map((cat: any) => ({
-                description: cat.name,
-                quantity: cat.itemCount,
-                unit: 'items',
-                price: cat.totalPrice,
-              }));
+              const sheetId = String(sheet.sheetId ?? sheet.id ?? '').trim();
+              const sheetNameLower = String(sheet.sheetName ?? sheet.sheet_name ?? '').trim().toLowerCase();
+              const defaultSheetMarkup = Number(sheet.markup_percent ?? 10) || 10;
+              materialPdfItems = sheet.categories?.map((cat: any) => {
+                const categoryMarkup = lookupCategoryMarkup(
+                  categoryMarkups,
+                  sheetId,
+                  cat.name,
+                  defaultSheetMarkup,
+                );
+                const synced = lookupSyncedCategoryBasePrice(
+                  externalPriceLookup,
+                  sheetId,
+                  sheetNameLower,
+                  cat.name,
+                );
+                let categoryBase: number;
+                if (synced !== undefined) {
+                  categoryBase = synced;
+                } else {
+                  const itemsPrice = (cat.items || []).reduce(
+                    (sum: number, it: any) => sum + getMaterialLineSellAndCost(it).price,
+                    0,
+                  );
+                  if (itemsPrice > 0) categoryBase = itemsPrice;
+                  else {
+                    const directTotal = Number(cat.totalPrice);
+                    categoryBase = Number.isFinite(directTotal) && directTotal > 0 ? directTotal : 0;
+                  }
+                }
+                return {
+                  description: cat.name,
+                  quantity: cat.itemCount,
+                  unit: 'items',
+                  price: categoryBase * (1 + categoryMarkup / 100),
+                };
+              });
             }
           }
-
-          const exportSheetLaborRow = sheetLabor[sheet.sheetId];
-          const exportSheetLaborTotal =
-            exportSheetLaborRow && sheetLaborCountsForDisplayedSection(exportSheetLaborRow, sheet.sheetId)
-              ? Number(exportSheetLaborRow.total_labor_cost) ||
-                Number(exportSheetLaborRow.estimated_hours || 0) * Number(exportSheetLaborRow.hourly_rate || 0)
-              : 0;
-          const exportLaborLineItems =
-            displayCustomRowLineItems[sheet.sheetId]?.filter((it: any) => (it.item_type || 'material') === 'labor') || [];
-          const exportSheetLaborLineItemsTotal = exportLaborLineItems.reduce(
-            (s2: number, it: any) => s2 + effectiveCustomRowLineItemBase(it) * (1 + (it.markup_percent || 0) / 100),
-            0
-          );
-          const exportLinkedSubsLabor = sumLinkedSubLaborFromSubs(linkedSubs, subcontractorLineItems);
-          const totalLaborCost =
-            exportSheetLaborTotal + exportSheetLaborLineItemsTotal + linkedRowTotals.laborTotal + exportLinkedSubsLabor;
-          const sectionTotal = sheetFinalPrice + totalLaborCost;
 
           return {
             name: sheet.sheetName,
