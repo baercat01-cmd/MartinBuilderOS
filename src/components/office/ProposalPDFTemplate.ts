@@ -800,18 +800,15 @@ export function generateProposalHTML(data: {
               const isFirstSection = sectionIndex === 0;
               const sectionTitleMargin = isFirstSection ? '0' : '8px';
               let content = '<div class="section-wrapper">';
-              // Required header price = Materials (same as program Materials column).
-              const materialsDisplay =
-                section.materialsPrice != null && !isNaN(Number(section.materialsPrice))
-                  ? Number(section.materialsPrice)
-                  : Number(section.price || 0);
+              // Required header = Materials + Labor (same as program section total). Hide when $0.
               const sectionTotalDisplay = pdfSectionLineTotal(section);
+              const showPrice = sectionTotalDisplay > 0.005;
               
               if (showInternalDetails) {
                 content += '<div class="section-title" style="margin-top: ' + sectionTitleMargin + ';">';
                 content += '<span style="font-weight: bold; font-size: ' + (sectionTitleSize + 1) + 'pt;">' + section.name + '</span>';
-                if (materialsDisplay) {
-                  content += '<span class="section-price" style="font-weight: bold; font-size: ' + (sectionTitleSize + 1) + 'pt;">$' + materialsDisplay.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '</span>';
+                if (showPrice) {
+                  content += '<span class="section-price" style="font-weight: bold; font-size: ' + (sectionTitleSize + 1) + 'pt;">$' + sectionTotalDisplay.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '</span>';
                 }
                 content += '</div>';
                 
@@ -843,16 +840,16 @@ export function generateProposalHTML(data: {
                   
                   content += '<tr class="total-row">';
                   content += '<td colspan="3" style="text-align: right; font-weight: bold; padding: 10px 8px; background: #f0f0f0;">Section Total:</td>';
-                  content += '<td style="text-align: right; font-weight: bold; padding: 10px 8px; background: #f0f0f0; font-size: ' + bodyFontSize + 'pt;">$' + (sectionTotalDisplay || materialsDisplay || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '</td>';
+                  content += '<td style="text-align: right; font-weight: bold; padding: 10px 8px; background: #f0f0f0; font-size: ' + bodyFontSize + 'pt;">$' + sectionTotalDisplay.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '</td>';
                   content += '</tr>';
                   content += '</tbody></table>';
                   content += '</div>';
                 }
               } else {
-                if (showSectionPrices && materialsDisplay) {
+                if (showSectionPrices && showPrice) {
                   content += '<div class="section-title" style="margin-top: ' + sectionTitleMargin + ';">';
                   content += '<span>' + section.name + '</span>';
-                  content += '<span class="section-price">$' + materialsDisplay.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '</span>';
+                  content += '<span class="section-price">$' + sectionTotalDisplay.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '</span>';
                   content += '</div>';
                 } else {
                   content += '<div class="section-title" style="display: block; margin-top: ' + sectionTitleMargin + ';">' + section.name + '</div>';
@@ -891,7 +888,7 @@ export function generateProposalHTML(data: {
                 const optTot = pdfSectionLineTotal(section);
                 content += '<div class="section-title" style="margin-top: ' + sectionTitleMargin + ';">';
                 content += '<span style="font-weight: bold; font-size: ' + (sectionTitleSize + 1) + 'pt;">' + section.name + '</span>';
-                if (optTot > 0) {
+                if (optTot > 0.005) {
                   content +=
                     '<span class="section-price" style="font-weight: bold; font-size: ' +
                     (sectionTitleSize + 1) +
@@ -941,7 +938,7 @@ export function generateProposalHTML(data: {
                 }
               } else {
                 const tot = pdfSectionLineTotal(section);
-                const optShowCustomerPricing = tot > 0;
+                const optShowCustomerPricing = tot > 0.005;
 
                 if (optShowCustomerPricing) {
                   content += '<div class="section-title" style="margin-top: ' + sectionTitleMargin + '; display: flex; justify-content: space-between; align-items: baseline; gap: 8px;">';
@@ -950,11 +947,6 @@ export function generateProposalHTML(data: {
                     '<span class="section-price">$' +
                     tot.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) +
                     '</span>';
-                  content += '</div>';
-                } else if (showSectionPrices && section.price) {
-                  content += '<div class="section-title" style="margin-top: ' + sectionTitleMargin + ';">';
-                  content += '<span>' + section.name + '</span>';
-                  content += '<span class="section-price">$' + section.price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '</span>';
                   content += '</div>';
                 } else {
                   content += '<div class="section-title" style="display: block; margin-top: ' + sectionTitleMargin + ';">' + section.name + '</div>';

@@ -14440,8 +14440,8 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
           return {
             name: sheet.sheetName,
             description: sheet.sheetDescription || '',
-            price: sheetFinalPrice,
-            /** Optional sheets: PDF shows Materials / Labor / Sect. total like the proposal panel. */
+            /** Customer PDF section header: materials + labor (hide when 0 in template). */
+            price: sectionTotal,
             materialsPrice: sheetFinalPrice,
             laborPrice: totalLaborCost,
             sectionTotalPrice: sectionTotal,
