@@ -14273,7 +14273,9 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
             externalPriceLookup,
             categoryMarkups,
             customRows,
-            customRowLineItems: displayCustomRowLineItems,
+            // Merge both maps so sheet-keyed labor lines and row-keyed lines both count
+            // (matches what the section cards can resolve).
+            customRowLineItems: { ...customRowLineItems, ...displayCustomRowLineItems },
             linkedSubcontractors,
             subcontractorLineItems,
             sheetLabor,
@@ -14292,7 +14294,7 @@ UPDATE material_workbooks SET status = 'locked', updated_at = now() WHERE quote_
                 externalPriceLookup,
                 categoryMarkups,
                 customRows,
-                customRowLineItems: displayCustomRowLineItems,
+                customRowLineItems,
                 linkedSubcontractors,
                 subcontractorLineItems,
                 sheetLabor,

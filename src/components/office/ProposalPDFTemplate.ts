@@ -8,23 +8,23 @@ function escapeHtmlBid(s: string): string {
     .replace(/"/g, '&quot;');
 }
 
-/** Sell total for one PDF section (matches optional/required header math). */
+/** Sell total for one PDF section = materials + labor (matches program section total). */
 function pdfSectionLineTotal(section: {
   price?: number;
   materialsPrice?: number;
   laborPrice?: number;
   sectionTotalPrice?: number;
 }): number {
+  const hasMat = section.materialsPrice != null && !isNaN(Number(section.materialsPrice));
+  const hasLab = section.laborPrice != null && !isNaN(Number(section.laborPrice));
+  // Prefer explicit split when present so labor is never dropped from the header price.
+  if (hasMat || hasLab) {
+    return (hasMat ? Number(section.materialsPrice) : 0) + (hasLab ? Number(section.laborPrice) : 0);
+  }
   if (section.sectionTotalPrice != null && !isNaN(Number(section.sectionTotalPrice))) {
     return Number(section.sectionTotalPrice);
   }
-  const mat =
-    section.materialsPrice != null && !isNaN(Number(section.materialsPrice))
-      ? Number(section.materialsPrice)
-      : Number(section.price || 0);
-  const lab =
-    section.laborPrice != null && !isNaN(Number(section.laborPrice)) ? Number(section.laborPrice) : 0;
-  return mat + lab;
+  return Number(section.price || 0);
 }
 
 function renderBidSpecScopeSection(
@@ -194,6 +194,12 @@ export function generateProposalHTML(data: {
     name: string;
     description: string;
     price?: number;
+    /** Materials sell total for this section (program Materials column). */
+    materialsPrice?: number;
+    /** Labor sell total for this section (program Labor column). */
+    laborPrice?: number;
+    /** materialsPrice + laborPrice — preferred section header amount. */
+    sectionTotalPrice?: number;
     optional?: boolean;
     comparisonData?: {
       baseName: string;
