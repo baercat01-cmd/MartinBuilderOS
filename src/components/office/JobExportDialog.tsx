@@ -2,12 +2,13 @@
  * JobExportDialog — downloads all data connected to a job as a structured JSON package.
  *
  * Sections exported:
- *   job_info, proposals, materials (workbooks → sheets → items / labor / markups),
- *   financial_rows (custom rows + line items), subcontractors (estimates + line items),
- *   time_entries, daily_logs, photos, documents, tasks, calendar_events,
+ *   job_info, proposals (full financial breakdown per quote: workbooks→sheets→items/labor/markups,
+ *   custom financial rows + line items, subcontractor estimates + line items, computed grand totals,
+ *   full proposal_versions snapshots), materials (job-level workbooks), financial_rows,
+ *   subcontractors, time_entries, daily_logs, photos, documents, tasks, calendar_events,
  *   customer_payments, components, job_assignments
  *
- * Plus: CSV files for time-entries and materials (useful for payroll / Smartbuild).
+ * Plus: CSV files for time-entries, materials, and proposal financial summary.
  */
 
 import { useState } from 'react';
@@ -23,7 +24,6 @@ import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Progress } from '@/components/ui/progress';
 import { Checkbox } from '@/components/ui/checkbox';
-import { Label } from '@/components/ui/label';
 import {
   Download,
   FileJson,
@@ -73,7 +73,7 @@ interface SectionMeta {
 
 interface ExportState {
   step: 'idle' | 'fetching' | 'building' | 'done' | 'error';
-  progress: number;            // 0–100
+  progress: number;
   currentLabel: string;
   errorMessage?: string;
   result?: ExportResult;
@@ -92,28 +92,31 @@ const SECTIONS: SectionMeta[] = [
   {
     id: 'proposals',
     label: 'Proposals & Quotes',
-    description: 'All quotes, proposal numbers, totals, signed status, and snapshot versions',
+    description:
+      'Full financial breakdown per quote: material sheets + items, labor rows, custom rows + line items, subcontractor estimates + line items, computed grand totals, and all version snapshots',
     icon: DollarSign,
     color: 'text-emerald-600',
   },
   {
     id: 'materials',
     label: 'Materials Workbook',
-    description: 'All workbooks → sheets → line items, labor rows, and category markups',
+    description: 'All job-level workbooks → sheets → line items, labor rows, and category markups',
     icon: Package,
     color: 'text-blue-600',
   },
   {
     id: 'financial_rows',
     label: 'Financial Rows & Line Items',
-    description: 'Custom financial rows (materials, labor, subcontractor) with individual line items',
+    description:
+      'All custom financial rows (job-level) with line items and markup — quote-specific rows are also nested inside Proposals',
     icon: LayoutList,
     color: 'text-violet-600',
   },
   {
     id: 'subcontractors',
     label: 'Subcontractor Estimates',
-    description: 'Uploaded sub PDFs, extracted totals, scope, and per-estimate line items',
+    description:
+      'All subcontractor estimate PDFs, totals, scope, and line items — quote-specific estimates also nested inside Proposals',
     icon: Briefcase,
     color: 'text-orange-600',
   },
@@ -234,6 +237,164 @@ function materialItemsToCsvRows(items: any[]): Record<string, unknown>[] {
   }));
 }
 
+/** Flat CSV view of every line contributing to each proposal's grand total */
+function proposalFinancialsToCsvRows(quotes: any[]): Record<string, unknown>[] {
+  const rows: Record<string, unknown>[] = [];
+
+  for (const q of quotes) {
+    const quoteLabel = q.proposal_number || q.quote_number || q.id.slice(0, 8);
+    const fb = q.financial_breakdown;
+    if (!fb) continue;
+
+    // ── Material sheet rows ──
+    for (const wb of fb.workbooks || []) {
+      for (const sh of wb.sheets || []) {
+        rows.push({
+          quote: quoteLabel,
+          section_type: 'Materials Sheet',
+          description: `Sheet: ${sh.sheet_name}${sh.is_option ? ' (OPTION)' : ''}`,
+          quantity: sh.items?.length ?? '',
+          unit_cost: '',
+          markup_pct: sh.markup_percent ?? '',
+          subtotal_cost: sh._computed?.materials_cost?.toFixed(2) ?? '',
+          subtotal_selling: sh._computed?.materials_selling?.toFixed(2) ?? '',
+          taxable: 'yes',
+          is_option: sh.is_option ? 'yes' : 'no',
+          notes: sh.description || '',
+        });
+        // Individual items
+        for (const it of sh.items || []) {
+          rows.push({
+            quote: quoteLabel,
+            section_type: 'Material Item',
+            description: `  ${sh.sheet_name} › ${it.category || ''} › ${it.material_name}`,
+            quantity: it.quantity ?? '',
+            unit_cost: it.cost_per_unit ?? '',
+            markup_pct: it.markup_percent ?? '',
+            subtotal_cost: it.extended_cost ?? '',
+            subtotal_selling: it.extended_price ?? '',
+            taxable: it.taxable ? 'yes' : 'no',
+            is_option: sh.is_option ? 'yes' : 'no',
+            notes: it.notes || '',
+          });
+        }
+        // Sheet labor rows
+        for (const lab of sh.labor || []) {
+          const laborSelling =
+            (parseFloat(lab.total_labor_cost) || 0) * (1 + (parseFloat(lab.markup_percent) || 0) / 100);
+          rows.push({
+            quote: quoteLabel,
+            section_type: 'Labor',
+            description: `  ${sh.sheet_name} › ${lab.description || 'Labor & Installation'}`,
+            quantity: lab.estimated_hours ?? '',
+            unit_cost: lab.hourly_rate ?? '',
+            markup_pct: lab.markup_percent ?? '',
+            subtotal_cost: lab.total_labor_cost ?? '',
+            subtotal_selling: laborSelling.toFixed(2),
+            taxable: 'no',
+            is_option: sh.is_option ? 'yes' : 'no',
+            notes: lab.notes || '',
+          });
+        }
+      }
+    }
+
+    // ── Custom financial rows ──
+    for (const row of fb.custom_rows || []) {
+      rows.push({
+        quote: quoteLabel,
+        section_type: `Custom / ${row.category || 'Row'}`,
+        description: row.description,
+        quantity: row.quantity ?? '',
+        unit_cost: row.unit_cost ?? '',
+        markup_pct: row.markup_percent ?? '',
+        subtotal_cost: row.total_cost ?? '',
+        subtotal_selling: row.selling_price ?? '',
+        taxable: row.taxable ? 'yes' : 'no',
+        is_option: row.is_option ? 'yes' : 'no',
+        notes: row.notes || '',
+      });
+      // Custom row line items
+      for (const item of row.line_items || []) {
+        rows.push({
+          quote: quoteLabel,
+          section_type: `  Custom Line Item`,
+          description: `    ${row.description} › ${item.description}`,
+          quantity: item.quantity ?? '',
+          unit_cost: item.unit_cost ?? '',
+          markup_pct: item.markup_percent ?? '',
+          subtotal_cost: item.total_cost ?? '',
+          subtotal_selling: item.total_cost ?? '',
+          taxable: item.taxable ? 'yes' : 'no',
+          is_option: 'no',
+          notes: item.notes || '',
+        });
+      }
+    }
+
+    // ── Subcontractor estimates ──
+    for (const est of fb.subcontractor_estimates || []) {
+      const estSelling =
+        (parseFloat(est.total_amount) || 0) * (1 + (parseFloat(est.markup_percent) || 0) / 100);
+      rows.push({
+        quote: quoteLabel,
+        section_type: 'Subcontractor',
+        description: est.company_name || est.file_name || 'Sub Estimate',
+        quantity: '',
+        unit_cost: '',
+        markup_pct: est.markup_percent ?? '',
+        subtotal_cost: est.total_amount ?? '',
+        subtotal_selling: estSelling.toFixed(2),
+        taxable: 'no',
+        is_option: 'no',
+        notes: est.scope_of_work || '',
+      });
+      // Sub estimate line items
+      for (const item of est.line_items || []) {
+        rows.push({
+          quote: quoteLabel,
+          section_type: '  Sub Line Item',
+          description: `    ${est.company_name || 'Sub'} › ${item.description}`,
+          quantity: item.quantity ?? '',
+          unit_cost: item.unit_price ?? '',
+          markup_pct: item.markup_percent ?? '',
+          subtotal_cost: item.total_price ?? '',
+          subtotal_selling: item.total_price ?? '',
+          taxable: item.taxable ? 'yes' : 'no',
+          is_option: item.excluded ? 'excluded' : 'no',
+          notes: item.notes || '',
+        });
+      }
+    }
+
+    // ── Grand total summary row ──
+    const totals = fb.computed_totals;
+    if (totals) {
+      rows.push({
+        quote: quoteLabel,
+        section_type: '═══ GRAND TOTAL ═══',
+        description: `Grand Total (tax_exempt: ${q.tax_exempt ? 'YES' : 'no'})`,
+        quantity: '',
+        unit_cost: '',
+        markup_pct: '',
+        subtotal_cost: totals.total_cost?.toFixed(2) ?? '',
+        subtotal_selling: (totals.stored_grand_total ?? totals.grand_total)?.toFixed(2) ?? '',
+        taxable: '',
+        is_option: '',
+        notes: [
+          `Stored DB subtotal: $${q.proposal_subtotal ?? 'N/A'}`,
+          `Stored DB tax: $${q.proposal_tax ?? '0'}`,
+          `Stored DB grand total: $${q.proposal_grand_total ?? 'N/A'}`,
+          `Computed gross profit: $${totals.gross_profit?.toFixed(2) ?? 'N/A'}`,
+          `Gross margin: ${totals.gross_margin_pct ?? 'N/A'}`,
+        ].join(' | '),
+      });
+    }
+  }
+
+  return rows;
+}
+
 /* ─── Main fetch logic ──────────────────────────────────────────────────── */
 
 async function fetchAllJobData(
@@ -261,29 +422,212 @@ async function fetchAllJobData(
     onProgress(Math.round((done / steps) * 90), label);
   };
 
-  /* ── Proposals ── */
+  /* ── Proposals (full financial breakdown per quote) ── */
   if (selectedSections.has('proposals')) {
-    tick('Loading proposals…');
+    tick('Loading proposals & financial breakdowns…');
     const { data: quotes } = await supabase
       .from('quotes')
       .select('*')
       .eq('job_id', job.id)
       .order('created_at', { ascending: false });
 
-    const quotesWithVersions: any[] = [];
+    const quotesWithFullData: any[] = [];
     for (const q of quotes || []) {
+      /* Full proposal_versions — ALL columns including workbook_snapshot, financial_rows_snapshot, etc. */
       const { data: versions } = await supabase
         .from('proposal_versions')
-        .select('id, version_number, is_signed, signed_at, created_at, change_notes, customer_name, estimated_price')
+        .select('*')
         .eq('quote_id', q.id)
         .order('version_number', { ascending: false });
-      quotesWithVersions.push({ ...q, versions: versions || [] });
+
+      /* Workbooks tied to this quote via quote_id */
+      const { data: wbs } = await supabase
+        .from('material_workbooks')
+        .select('*')
+        .eq('quote_id', q.id)
+        .order('version_number', { ascending: true });
+
+      const workbooksWithSheets: any[] = [];
+      for (const wb of wbs || []) {
+        const { data: sheets } = await supabase
+          .from('material_sheets')
+          .select('*')
+          .eq('workbook_id', wb.id)
+          .order('order_index');
+
+        const fullSheets: any[] = [];
+        for (const sh of sheets || []) {
+          const [items, labor, markups] = await Promise.all([
+            supabase.from('material_items').select('*').eq('sheet_id', sh.id).order('order_index'),
+            supabase.from('material_sheet_labor').select('*').eq('sheet_id', sh.id),
+            supabase.from('material_category_markups').select('*').eq('sheet_id', sh.id),
+          ]);
+          const shItems = items.data || [];
+          const shLabor = labor.data || [];
+
+          /* Per-sheet computed totals */
+          const materialsCost = shItems.reduce(
+            (s: number, it: any) => s + (parseFloat(it.extended_cost) || 0),
+            0,
+          );
+          const materialsSelling = shItems.reduce(
+            (s: number, it: any) => s + (parseFloat(it.extended_price) || 0),
+            0,
+          );
+          const laborCost = shLabor.reduce(
+            (s: number, l: any) => s + (parseFloat(l.total_labor_cost) || 0),
+            0,
+          );
+          const laborSelling = shLabor.reduce((s: number, l: any) => {
+            const base = parseFloat(l.total_labor_cost) || 0;
+            const mu = 1 + (parseFloat(l.markup_percent) || 0) / 100;
+            return s + base * mu;
+          }, 0);
+
+          fullSheets.push({
+            ...sh,
+            items: shItems,
+            labor: shLabor,
+            category_markups: markups.data || [],
+            _computed: {
+              materials_cost: materialsCost,
+              materials_selling: materialsSelling,
+              labor_cost: laborCost,
+              labor_selling: laborSelling,
+              sheet_total_cost: materialsCost + laborCost,
+              sheet_total_selling: materialsSelling + laborSelling,
+            },
+          });
+        }
+        workbooksWithSheets.push({ ...wb, sheets: fullSheets });
+      }
+
+      /* Custom financial rows tied to this quote */
+      const { data: customRows } = await supabase
+        .from('custom_financial_rows')
+        .select('*')
+        .eq('quote_id', q.id)
+        .order('order_index');
+
+      const customRowsWithItems: any[] = [];
+      for (const row of customRows || []) {
+        const { data: rowItems } = await supabase
+          .from('custom_financial_row_items')
+          .select('*')
+          .eq('row_id', row.id)
+          .order('order_index');
+        customRowsWithItems.push({ ...row, line_items: rowItems || [] });
+      }
+
+      /* Subcontractor estimates tied to this quote */
+      const { data: subEsts } = await supabase
+        .from('subcontractor_estimates')
+        .select('*')
+        .eq('quote_id', q.id)
+        .order('order_index');
+
+      const subEstsWithItems: any[] = []
+      for (const est of subEsts || []) {
+        const { data: estItems } = await supabase
+          .from('subcontractor_estimate_line_items')
+          .select('*')
+          .eq('estimate_id', est.id)
+          .order('order_index');
+        subEstsWithItems.push({ ...est, line_items: estItems || [] });
+      }
+
+      /* Compute grand total breakdown from active (non-option) sheets */
+      const activeSheets = workbooksWithSheets
+        .flatMap((wb: any) => wb.sheets)
+        .filter((sh: any) => !sh.is_option);
+
+      const totalMaterialsCost = activeSheets.reduce(
+        (s: number, sh: any) => s + (sh._computed?.materials_cost || 0),
+        0,
+      );
+      const totalMaterialsSelling = activeSheets.reduce(
+        (s: number, sh: any) => s + (sh._computed?.materials_selling || 0),
+        0,
+      );
+      const totalLaborCost = activeSheets.reduce(
+        (s: number, sh: any) => s + (sh._computed?.labor_cost || 0),
+        0,
+      );
+      const totalLaborSelling = activeSheets.reduce(
+        (s: number, sh: any) => s + (sh._computed?.labor_selling || 0),
+        0,
+      );
+
+      const activeCustomRows = customRowsWithItems.filter((r: any) => !r.is_option);
+      const totalCustomCost = activeCustomRows.reduce(
+        (s: number, r: any) => s + (parseFloat(r.total_cost) || 0),
+        0,
+      );
+      const totalCustomSelling = activeCustomRows.reduce(
+        (s: number, r: any) => s + (parseFloat(r.selling_price) || 0),
+        0,
+      );
+
+      const totalSubCost = subEstsWithItems.reduce(
+        (s: number, e: any) => s + (parseFloat(e.total_amount) || 0),
+        0,
+      );
+      const totalSubSelling = subEstsWithItems.reduce((s: number, e: any) => {
+        const base = parseFloat(e.total_amount) || 0;
+        const mu = 1 + (parseFloat(e.markup_percent) || 0) / 100;
+        return s + base * mu;
+      }, 0);
+
+      const totalCost = totalMaterialsCost + totalLaborCost + totalCustomCost + totalSubCost;
+      const grandTotalBeforeTax = totalMaterialsSelling + totalLaborSelling + totalCustomSelling + totalSubSelling;
+
+      /* Stored totals are most accurate — set when proposal is generated or signed */
+      const storedSubtotal = q.proposal_subtotal != null ? parseFloat(q.proposal_subtotal) : null;
+      const storedTax = q.proposal_tax != null ? parseFloat(q.proposal_tax) : 0;
+      const storedGrandTotal = q.proposal_grand_total != null ? parseFloat(q.proposal_grand_total) : null;
+
+      quotesWithFullData.push({
+        ...q,
+        versions: versions || [],
+        financial_breakdown: {
+          workbooks: workbooksWithSheets,
+          custom_rows: customRowsWithItems,
+          subcontractor_estimates: subEstsWithItems,
+          computed_totals: {
+            /* Cost-side (what the company pays) */
+            materials_cost: totalMaterialsCost,
+            labor_cost: totalLaborCost,
+            custom_rows_cost: totalCustomCost,
+            subcontractor_cost: totalSubCost,
+            total_cost: totalCost,
+            /* Selling-side (what the customer pays) */
+            materials_selling: totalMaterialsSelling,
+            labor_selling: totalLaborSelling,
+            custom_rows_selling: totalCustomSelling,
+            subcontractor_selling: totalSubSelling,
+            grand_total_before_tax: grandTotalBeforeTax,
+            /* Stored DB totals (authoritative — computed when proposal is saved/sent) */
+            stored_subtotal: storedSubtotal,
+            stored_tax: storedTax,
+            stored_grand_total: storedGrandTotal,
+            grand_total: storedGrandTotal ?? grandTotalBeforeTax + storedTax,
+            tax_exempt: q.tax_exempt,
+            /* Profitability */
+            gross_profit: grandTotalBeforeTax - totalCost,
+            gross_margin_pct:
+              grandTotalBeforeTax > 0
+                ? (((grandTotalBeforeTax - totalCost) / grandTotalBeforeTax) * 100).toFixed(1) + '%'
+                : 'N/A',
+          },
+        },
+      });
     }
-    data.proposals = quotesWithVersions;
-    stats.proposals = quotesWithVersions.length;
+
+    data.proposals = quotesWithFullData;
+    stats.proposals = quotesWithFullData.length;
   }
 
-  /* ── Materials ── */
+  /* ── Materials (job-level workbooks) ── */
   if (selectedSections.has('materials')) {
     tick('Loading materials workbooks…');
     const { data: wbs } = await supabase
@@ -317,13 +661,11 @@ async function fetchAllJobData(
       fullWbs.push({ ...wb, sheets: fullSheets });
     }
     data.materials = { workbooks: fullWbs };
-    const itemCount = fullWbs
-      .flatMap((w) => w.sheets)
-      .flatMap((s) => s.items).length;
+    const itemCount = fullWbs.flatMap((w) => w.sheets).flatMap((s) => s.items).length;
     stats.materials = itemCount;
   }
 
-  /* ── Financial rows ── */
+  /* ── Financial rows (job-level) ── */
   if (selectedSections.has('financial_rows')) {
     tick('Loading financial rows…');
     const { data: rows } = await supabase
@@ -345,7 +687,7 @@ async function fetchAllJobData(
     stats.financial_rows = rowsWithItems.length;
   }
 
-  /* ── Subcontractors ── */
+  /* ── Subcontractors (job-level) ── */
   if (selectedSections.has('subcontractors')) {
     tick('Loading subcontractor estimates…');
     const { data: ests } = await supabase
@@ -372,11 +714,7 @@ async function fetchAllJobData(
     tick('Loading time entries…');
     const { data: entries } = await supabase
       .from('time_entries')
-      .select(`
-        *,
-        components(name),
-        user_profiles(username, email)
-      `)
+      .select(`*, components(name), user_profiles(username, email)`)
       .eq('job_id', job.id)
       .order('start_time', { ascending: false });
 
@@ -396,10 +734,7 @@ async function fetchAllJobData(
     tick('Loading daily logs…');
     const { data: logs } = await supabase
       .from('daily_logs')
-      .select(`
-        *,
-        user_profiles(username)
-      `)
+      .select(`*, user_profiles(username)`)
       .eq('job_id', job.id)
       .order('log_date', { ascending: false });
 
@@ -417,10 +752,7 @@ async function fetchAllJobData(
     tick('Loading photos…');
     const { data: photos } = await supabase
       .from('photos')
-      .select(`
-        *,
-        user_profiles(username)
-      `)
+      .select(`*, user_profiles(username)`)
       .eq('job_id', job.id)
       .order('photo_date', { ascending: false });
 
@@ -438,10 +770,7 @@ async function fetchAllJobData(
     tick('Loading documents…');
     const { data: docs } = await supabase
       .from('job_documents')
-      .select(`
-        *,
-        job_document_revisions(*)
-      `)
+      .select(`*, job_document_revisions(*)`)
       .eq('job_id', job.id)
       .order('created_at', { ascending: false });
 
@@ -509,10 +838,7 @@ async function fetchAllJobData(
 
     let components: any[] = [];
     if (compIds.length) {
-      const { data: comps } = await supabase
-        .from('components')
-        .select('*')
-        .in('id', compIds);
+      const { data: comps } = await supabase.from('components').select('*').in('id', compIds);
       components = (comps || []).map((c) => {
         const meta = jobComponents.find((jc: any) => jc.id === c.id) || {};
         return { ...c, job_meta: meta };
@@ -533,10 +859,7 @@ async function fetchAllJobData(
     tick('Loading job assignments…');
     const { data: assignments } = await supabase
       .from('job_assignments')
-      .select(`
-        *,
-        user:user_profiles!job_assignments_user_id_fkey(username, role)
-      `)
+      .select(`*, user:user_profiles!job_assignments_user_id_fkey(username, role)`)
       .eq('job_id', job.id);
 
     const enriched = (assignments || []).map((a: any) => ({
@@ -557,10 +880,9 @@ async function fetchAllJobData(
 
   if (selectedSections.has('time_entries') && (data.time_entries as any[])?.length) {
     const rows = timeEntriesToCsvRows(data.time_entries as any[]);
-    const csv = toCsv(rows);
     csvFiles.push({
       filename: `${safeName}_time_entries.csv`,
-      blob: new Blob([csv], { type: 'text/csv;charset=utf-8' }),
+      blob: new Blob([toCsv(rows)], { type: 'text/csv;charset=utf-8' }),
     });
   }
 
@@ -575,11 +897,20 @@ async function fetchAllJobData(
       ),
     );
     if (allItems.length) {
-      const rows = materialItemsToCsvRows(allItems);
-      const csv = toCsv(rows);
       csvFiles.push({
         filename: `${safeName}_materials.csv`,
-        blob: new Blob([csv], { type: 'text/csv;charset=utf-8' }),
+        blob: new Blob([toCsv(materialItemsToCsvRows(allItems))], { type: 'text/csv;charset=utf-8' }),
+      });
+    }
+  }
+
+  /* Proposal financials CSV — flat view of every line contributing to grand total */
+  if (selectedSections.has('proposals') && (data.proposals as any[])?.length) {
+    const financialRows = proposalFinancialsToCsvRows(data.proposals as any[]);
+    if (financialRows.length) {
+      csvFiles.push({
+        filename: `${safeName}_proposal_financials.csv`,
+        blob: new Blob([toCsv(financialRows)], { type: 'text/csv;charset=utf-8' }),
       });
     }
   }
@@ -633,48 +964,23 @@ export function JobExportDialog({ job, open, onOpenChange }: JobExportDialogProp
       toast.error('Select at least one section to export.');
       return;
     }
-
     setState({ step: 'fetching', progress: 5, currentLabel: 'Starting export…' });
-
     try {
       const result = await fetchAllJobData(job, selected, (pct, label) => {
         setState((prev) => ({ ...prev, progress: pct, currentLabel: label }));
       });
-
-      setState({
-        step: 'done',
-        progress: 100,
-        currentLabel: 'Export ready!',
-        result,
-      });
+      setState({ step: 'done', progress: 100, currentLabel: 'Export ready!', result });
     } catch (err: any) {
       console.error('Export error:', err);
-      setState({
-        step: 'error',
-        progress: 0,
-        currentLabel: '',
-        errorMessage: err?.message || 'Unknown error',
-      });
+      setState({ step: 'error', progress: 0, currentLabel: '', errorMessage: err?.message || 'Unknown error' });
     }
   };
 
-  const downloadJson = () => {
-    if (!state.result) return;
-    const url = URL.createObjectURL(state.result.jsonBlob);
+  const downloadBlob = (blob: Blob, filename: string) => {
+    const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = state.result.jsonFilename;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    setTimeout(() => URL.revokeObjectURL(url), 2000);
-  };
-
-  const downloadCsv = (file: { filename: string; blob: Blob }) => {
-    const url = URL.createObjectURL(file.blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = file.filename;
+    a.download = filename;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -682,10 +988,8 @@ export function JobExportDialog({ job, open, onOpenChange }: JobExportDialogProp
   };
 
   const handleClose = (open: boolean) => {
-    if (state.step === 'fetching') return; // block accidental close while loading
-    if (!open) {
-      setState({ step: 'idle', progress: 0, currentLabel: '' });
-    }
+    if (state.step === 'fetching') return;
+    if (!open) setState({ step: 'idle', progress: 0, currentLabel: '' });
     onOpenChange(open);
   };
 
@@ -711,13 +1015,10 @@ export function JobExportDialog({ job, open, onOpenChange }: JobExportDialogProp
         {/* Content */}
         <div className="flex-1 overflow-y-auto px-6 py-4 space-y-5 bg-white">
 
-          {/* Idle: section selector */}
           {state.step === 'idle' && (
             <>
               <div className="flex items-center justify-between">
-                <p className="text-sm text-slate-600">
-                  Choose which sections to include in the export.
-                </p>
+                <p className="text-sm text-slate-600">Choose which sections to include.</p>
                 <div className="flex gap-2">
                   <Button variant="outline" size="sm" onClick={selectAll}>All</Button>
                   <Button variant="outline" size="sm" onClick={clearAll}>None</Button>
@@ -732,9 +1033,7 @@ export function JobExportDialog({ job, open, onOpenChange }: JobExportDialogProp
                     <label
                       key={sec.id}
                       className={`flex items-start gap-3 rounded-lg border p-3 cursor-pointer transition-colors ${
-                        checked
-                          ? 'border-slate-400 bg-slate-50'
-                          : 'border-slate-200 bg-white hover:bg-slate-50/60'
+                        checked ? 'border-slate-400 bg-slate-50' : 'border-slate-200 bg-white hover:bg-slate-50/60'
                       }`}
                     >
                       <Checkbox
@@ -757,21 +1056,19 @@ export function JobExportDialog({ job, open, onOpenChange }: JobExportDialogProp
               <div className="rounded-lg border border-blue-200 bg-blue-50 p-3 text-xs text-blue-800 space-y-1">
                 <p className="font-semibold">What you get</p>
                 <ul className="list-disc list-inside space-y-0.5">
+                  <li><strong>JSON file</strong> — full structured export of all selected sections</li>
+                  <li><strong>Time entries CSV</strong> — ready for payroll or analysis</li>
+                  <li><strong>Materials CSV</strong> — all line items flat for Smartbuild / Excel</li>
                   <li>
-                    <strong>JSON file</strong> — full structured export of all selected sections (job info always included)
-                  </li>
-                  <li>
-                    <strong>Time entries CSV</strong> — ready for payroll or analysis (when section selected)
-                  </li>
-                  <li>
-                    <strong>Materials CSV</strong> — all line items flat for Smartbuild / Excel (when section selected)
+                    <strong>Proposal Financials CSV</strong> — per-quote breakdown with every
+                    material item, labor row, custom row, subcontractor line, and grand total
+                    (when Proposals selected)
                   </li>
                 </ul>
               </div>
             </>
           )}
 
-          {/* In-progress */}
           {isBusy && (
             <div className="py-8 flex flex-col items-center gap-6">
               <Loader2 className="w-12 h-12 animate-spin text-yellow-600" />
@@ -783,37 +1080,35 @@ export function JobExportDialog({ job, open, onOpenChange }: JobExportDialogProp
             </div>
           )}
 
-          {/* Done */}
           {state.step === 'done' && state.result && (
             <div className="space-y-5">
               <div className="flex items-center gap-3 p-4 rounded-lg bg-emerald-50 border border-emerald-200">
                 <CheckCircle2 className="w-8 h-8 text-emerald-600 shrink-0" />
                 <div>
                   <p className="font-bold text-emerald-900 text-base">Export ready!</p>
-                  <p className="text-sm text-emerald-700">
-                    Click below to download your files.
-                  </p>
+                  <p className="text-sm text-emerald-700">Click below to download your files.</p>
                 </div>
               </div>
 
-              {/* JSON download */}
+              {/* JSON */}
               <div className="rounded-lg border border-slate-200 bg-slate-50 p-4 flex items-center justify-between gap-4">
                 <div className="flex items-center gap-3">
                   <FileJson className="w-8 h-8 text-blue-600 shrink-0" />
                   <div>
                     <p className="font-semibold text-slate-900 text-sm">{state.result.jsonFilename}</p>
-                    <p className="text-xs text-slate-500 mt-0.5">
-                      Full structured export — all selected sections
-                    </p>
+                    <p className="text-xs text-slate-500 mt-0.5">Full structured export — all selected sections</p>
                   </div>
                 </div>
-                <Button onClick={downloadJson} className="bg-blue-600 hover:bg-blue-700 shrink-0">
+                <Button
+                  onClick={() => downloadBlob(state.result!.jsonBlob, state.result!.jsonFilename)}
+                  className="bg-blue-600 hover:bg-blue-700 shrink-0"
+                >
                   <Download className="w-4 h-4 mr-2" />
                   Download JSON
                 </Button>
               </div>
 
-              {/* CSV downloads */}
+              {/* CSVs */}
               {state.result.csvFiles.map((f) => (
                 <div
                   key={f.filename}
@@ -824,12 +1119,16 @@ export function JobExportDialog({ job, open, onOpenChange }: JobExportDialogProp
                     <div>
                       <p className="font-semibold text-slate-900 text-sm">{f.filename}</p>
                       <p className="text-xs text-slate-500 mt-0.5">
-                        {f.filename.includes('time') ? 'Payroll-ready time entries' : 'Flat material items table'}
+                        {f.filename.includes('time_entries')
+                          ? 'Payroll-ready time entries'
+                          : f.filename.includes('proposal_financials')
+                          ? 'Per-quote financial breakdown: all rows, labor, subs, grand total'
+                          : 'Flat material items table for Smartbuild / Excel'}
                       </p>
                     </div>
                   </div>
                   <Button
-                    onClick={() => downloadCsv(f)}
+                    onClick={() => downloadBlob(f.blob, f.filename)}
                     variant="outline"
                     className="border-emerald-400 text-emerald-800 hover:bg-emerald-50 shrink-0"
                   >
@@ -863,7 +1162,6 @@ export function JobExportDialog({ job, open, onOpenChange }: JobExportDialogProp
             </div>
           )}
 
-          {/* Error */}
           {state.step === 'error' && (
             <div className="flex flex-col items-center gap-4 py-8 text-center">
               <AlertCircle className="w-12 h-12 text-red-500" />
@@ -871,10 +1169,7 @@ export function JobExportDialog({ job, open, onOpenChange }: JobExportDialogProp
                 <p className="font-bold text-red-900 text-base">Export failed</p>
                 <p className="text-sm text-red-700 mt-1">{state.errorMessage}</p>
               </div>
-              <Button
-                variant="outline"
-                onClick={() => setState({ step: 'idle', progress: 0, currentLabel: '' })}
-              >
+              <Button variant="outline" onClick={() => setState({ step: 'idle', progress: 0, currentLabel: '' })}>
                 Try again
               </Button>
             </div>
@@ -883,14 +1178,9 @@ export function JobExportDialog({ job, open, onOpenChange }: JobExportDialogProp
 
         {/* Footer */}
         <div className="shrink-0 border-t px-6 py-4 flex justify-between items-center bg-slate-50">
-          <Button
-            variant="outline"
-            onClick={() => handleClose(false)}
-            disabled={isBusy}
-          >
+          <Button variant="outline" onClick={() => handleClose(false)} disabled={isBusy}>
             {state.step === 'done' ? 'Close' : 'Cancel'}
           </Button>
-
           {(state.step === 'idle' || state.step === 'error') && (
             <Button
               onClick={handleExport}
@@ -901,12 +1191,8 @@ export function JobExportDialog({ job, open, onOpenChange }: JobExportDialogProp
               Export {selected.size} section{selected.size !== 1 ? 's' : ''}
             </Button>
           )}
-
           {state.step === 'done' && (
-            <Button
-              variant="outline"
-              onClick={() => setState({ step: 'idle', progress: 0, currentLabel: '' })}
-            >
+            <Button variant="outline" onClick={() => setState({ step: 'idle', progress: 0, currentLabel: '' })}>
               Export again
             </Button>
           )}
