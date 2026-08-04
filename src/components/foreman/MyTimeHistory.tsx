@@ -69,6 +69,7 @@ export function MyTimeHistory({ userId, onBack }: MyTimeHistoryProps) {
   const [monthGroups, setMonthGroups] = useState<MonthGroup[]>([]);
   const [editingEntry, setEditingEntry] = useState<TimeEntry | null>(null);
   const [editForm, setEditForm] = useState({
+    date: '',
     startTime: '',
     endTime: '',
     notes: '',
@@ -177,14 +178,16 @@ export function MyTimeHistory({ userId, onBack }: MyTimeHistoryProps) {
   }
 
   function openEditDialog(entry: TimeEntry) {
-    // Format times to HH:MM for input
+    // Format date and times for inputs
+    const date = entry.start_time ? format(parseISO(entry.start_time), 'yyyy-MM-dd') : '';
     const startTime = entry.start_time ? format(parseISO(entry.start_time), 'HH:mm') : '';
     const endTime = entry.end_time ? format(parseISO(entry.end_time), 'HH:mm') : '';
 
     setEditForm({
+      date,
       startTime,
       endTime,
-      notes: '',
+      notes: entry.notes || '',
     });
     setEditingEntry(entry);
   }
@@ -192,14 +195,17 @@ export function MyTimeHistory({ userId, onBack }: MyTimeHistoryProps) {
   async function saveEdit() {
     if (!editingEntry) return;
 
+    if (!editForm.date) {
+      toast.error('Please select a date');
+      return;
+    }
+
     if (!editForm.startTime || !editForm.endTime) {
       toast.error('Please enter both start and end times');
       return;
     }
 
-    // Parse the date from the original entry
-    const entryDate = parseISO(editingEntry.start_time);
-    const dateStr = format(entryDate, 'yyyy-MM-dd');
+    const dateStr = editForm.date;
 
     // Create new timestamps
     const newStartTime = `${dateStr}T${editForm.startTime}:00`;
@@ -473,11 +479,16 @@ export function MyTimeHistory({ userId, onBack }: MyTimeHistoryProps) {
                   </div>
                 )}
 
-                <div>
-                  <Label className="text-muted-foreground">Date</Label>
-                  <p className="font-medium">
-                    {format(parseISO(editingEntry.start_time), 'EEEE, MMM d, yyyy')}
-                  </p>
+                <div className="space-y-2">
+                  <Label htmlFor="edit-date">Date</Label>
+                  <Input
+                    id="edit-date"
+                    type="date"
+                    value={editForm.date}
+                    onChange={(e) =>
+                      setEditForm({ ...editForm, date: e.target.value })
+                    }
+                  />
                 </div>
 
                 <div className="space-y-2">
@@ -510,11 +521,9 @@ export function MyTimeHistory({ userId, onBack }: MyTimeHistoryProps) {
                       />
                     </div>
                   </div>
-                  {editForm.startTime && editForm.endTime && (() => {
-                    const entryDate = editingEntry ? parseISO(editingEntry.start_time) : new Date();
-                    const dateStr = format(entryDate, 'yyyy-MM-dd');
-                    const start = new Date(`${dateStr}T${editForm.startTime}:00`);
-                    const end = new Date(`${dateStr}T${editForm.endTime}:00`);
+                  {editForm.date && editForm.startTime && editForm.endTime && (() => {
+                    const start = new Date(`${editForm.date}T${editForm.startTime}:00`);
+                    const end = new Date(`${editForm.date}T${editForm.endTime}:00`);
                     const diffMs = end.getTime() - start.getTime();
                     const hours = diffMs > 0 ? (diffMs / (1000 * 60 * 60)).toFixed(2) : '0.00';
                     return (
