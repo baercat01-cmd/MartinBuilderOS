@@ -91,6 +91,8 @@ export function JobsView({
   const [loading, setLoading] = useState(true);
   const [showCreateDialog, setShowCreateDialog] = useState(false);
   const [showEditDialog, setShowEditDialog] = useState(false);
+  /** Job targeted by an "Edit job info" action on a card/list row (independent of the open job dialog). */
+  const [editingJob, setEditingJob] = useState<Job | null>(null);
   const [selectedJob, setSelectedJob] = useState<Job | null>(null);
   /** Single source of truth for which job the detail dialog is for. Used for portal link so it never points at the wrong job. */
   const initialOpenJobId = (() => {
@@ -1650,6 +1652,17 @@ export function JobsView({
                                 <DropdownMenuItem
                                   onClick={(e) => {
                                     e.stopPropagation();
+                                    setEditingJob(job);
+                                    setShowEditDialog(true);
+                                  }}
+                                >
+                                  <Edit className="w-4 h-4 mr-2" />
+                                  Edit job info
+                                </DropdownMenuItem>
+                                <DropdownMenuSeparator />
+                                <DropdownMenuItem
+                                  onClick={(e) => {
+                                    e.stopPropagation();
                                     setJobOnHold(job.id);
                                   }}
                                 >
@@ -1902,6 +1915,17 @@ export function JobsView({
                                 <DropdownMenuItem
                                   onClick={(e) => {
                                     e.stopPropagation();
+                                    setEditingJob(job);
+                                    setShowEditDialog(true);
+                                  }}
+                                >
+                                  <Edit className="w-4 h-4 mr-2" />
+                                  Edit job info
+                                </DropdownMenuItem>
+                                <DropdownMenuSeparator />
+                                <DropdownMenuItem
+                                  onClick={(e) => {
+                                    e.stopPropagation();
                                     activateJob(job.id);
                                   }}
                                 >
@@ -2132,6 +2156,17 @@ export function JobsView({
                                 </Button>
                               </DropdownMenuTrigger>
                               <DropdownMenuContent align="end">
+                                <DropdownMenuItem
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setEditingJob(job);
+                                    setShowEditDialog(true);
+                                  }}
+                                >
+                                  <Edit className="w-4 h-4 mr-2" />
+                                  Edit job info
+                                </DropdownMenuItem>
+                                <DropdownMenuSeparator />
                                 <DropdownMenuItem
                                   onClick={(e) => {
                                     e.stopPropagation();
@@ -2379,6 +2414,17 @@ export function JobsView({
                                 <DropdownMenuItem
                                   onClick={(e) => {
                                     e.stopPropagation();
+                                    setEditingJob(job);
+                                    setShowEditDialog(true);
+                                  }}
+                                >
+                                  <Edit className="w-4 h-4 mr-2" />
+                                  Edit job info
+                                </DropdownMenuItem>
+                                <DropdownMenuSeparator />
+                                <DropdownMenuItem
+                                  onClick={(e) => {
+                                    e.stopPropagation();
                                     setJobQuoting(job.id);
                                   }}
                                 >
@@ -2568,10 +2614,20 @@ export function JobsView({
 
       <EditJobDialog
         open={showEditDialog}
-        job={detailDialogJobId ? (jobs.find(j => j.id === detailDialogJobId) ?? selectedJob) : selectedJob}
-        onClose={() => setShowEditDialog(false)}
+        job={
+          editingJob
+            ? (jobs.find(j => j.id === editingJob.id) ?? editingJob)
+            : detailDialogJobId
+              ? (jobs.find(j => j.id === detailDialogJobId) ?? selectedJob)
+              : selectedJob
+        }
+        onClose={() => {
+          setShowEditDialog(false);
+          setEditingJob(null);
+        }}
         onSuccess={() => {
           setShowEditDialog(false);
+          setEditingJob(null);
           loadJobs();
           reloadSelectedJob();
         }}

@@ -118,6 +118,7 @@ export function EditJobDialog({ open, job, onClose, onSuccess }: EditJobDialogPr
     description: '',
     notes: '',
     status: 'active',
+    quote_number: '',
     job_number: '',
     estimated_hours: '',
     projected_start_date: '',
@@ -135,6 +136,7 @@ export function EditJobDialog({ open, job, onClose, onSuccess }: EditJobDialogPr
         description: job.description || '',
         notes: job.notes || '',
         status: job.status || 'active',
+        quote_number: job.quote_number || '',
         job_number: job.job_number || '',
         estimated_hours: job.estimated_hours?.toString() || '',
         projected_start_date: job.projected_start_date || '',
@@ -151,7 +153,7 @@ export function EditJobDialog({ open, job, onClose, onSuccess }: EditJobDialogPr
     if (!job) return;
 
     // Office role validation
-    if (profile?.role !== 'office') {
+    if (profile?.role !== 'office' && !profile?.is_admin) {
       toast.error('Only office staff can edit jobs');
       return;
     }
@@ -167,23 +169,31 @@ export function EditJobDialog({ open, job, onClose, onSuccess }: EditJobDialogPr
         ? parseFloat(formData.estimated_hours) 
         : 0;
 
+      const updates: Record<string, unknown> = {
+        name: formData.name.trim(),
+        client_name: formData.client_name.trim(),
+        customer_email: formData.customer_email.trim() || null,
+        customer_phone: formData.customer_phone.trim() || null,
+        address: formData.address.trim(),
+        description: formData.description.trim() || null,
+        notes: formData.notes.trim() || null,
+        status: formData.status,
+        job_number: formData.job_number.trim() || null,
+        estimated_hours: estimatedHours,
+        projected_start_date: formData.projected_start_date || null,
+        projected_end_date: formData.projected_end_date || null,
+        updated_at: new Date().toISOString(),
+      };
+
+      // Quote number is unique across jobs - only send it when the user actually changed it.
+      const nextQuoteNumber = formData.quote_number.trim() || null;
+      if (nextQuoteNumber !== (job.quote_number || null)) {
+        updates.quote_number = nextQuoteNumber;
+      }
+
       const { error } = await supabase
         .from('jobs')
-        .update({
-          name: formData.name.trim(),
-          client_name: formData.client_name.trim(),
-          customer_email: formData.customer_email.trim() || null,
-          customer_phone: formData.customer_phone.trim() || null,
-          address: formData.address.trim(),
-          description: formData.description.trim() || null,
-          notes: formData.notes.trim() || null,
-          status: formData.status,
-          job_number: formData.job_number.trim() || null,
-          estimated_hours: estimatedHours,
-          projected_start_date: formData.projected_start_date || null,
-          projected_end_date: formData.projected_end_date || null,
-          updated_at: new Date().toISOString(),
-        })
+        .update(updates)
         .eq('id', job.id);
 
       if (error) {
@@ -289,7 +299,20 @@ export function EditJobDialog({ open, job, onClose, onSuccess }: EditJobDialogPr
 
           <div className="grid grid-cols-2 gap-4">
             <div className="space-y-2">
-              <Label htmlFor="edit-job-number">Job Number</Label>
+              <Label htmlFor="edit-quote-number">Quote / Job #</Label>
+              <Input
+                id="edit-quote-number"
+                value={formData.quote_number}
+                onChange={(e) => setFormData({ ...formData, quote_number: e.target.value })}
+                placeholder="26001"
+                disabled={loading}
+              />
+              <p className="text-xs text-muted-foreground">
+                Shown on job cards and proposals
+              </p>
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="edit-job-number">Legacy Job Number</Label>
               <Input
                 id="edit-job-number"
                 value={formData.job_number}
@@ -366,6 +389,8 @@ export function EditJobDialog({ open, job, onClose, onSuccess }: EditJobDialogPr
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
+                <SelectItem value="quoting">Quoting</SelectItem>
+                <SelectItem value="prepping">Prepping</SelectItem>
                 <SelectItem value="active">Active</SelectItem>
                 <SelectItem value="completed">Completed</SelectItem>
                 <SelectItem value="on_hold">On Hold</SelectItem>
