@@ -52,6 +52,7 @@ import { JobDetailMaterialsToolbarSlotContext } from '@/contexts/JobDetailMateri
 import { ProposalSummaryProvider } from '@/contexts/ProposalSummaryContext';
 import { JobProposalBudgetBreakdownPanel } from '@/components/office/JobProposalBudgetBreakdownPanel';
 import { JobExportDialog } from '@/components/office/JobExportDialog';
+import { EditJobDialog } from '@/components/office/EditJobDialog';
 
 interface JobDetailedViewProps {
   job: Job;
@@ -450,6 +451,7 @@ export function JobDetailedView({ job, portalJobId, getPortalJobId, onBack, onEd
   const [emailStats, setEmailStats] = useState({ total: 0, customer: 0, vendor: 0, subcontractor: 0, unread: 0 });
   const [showEmailDialog, setShowEmailDialog] = useState(false);
   const [exporting, setExporting] = useState(false);
+  const [showEditJobDialog, setShowEditJobDialog] = useState(false);
   const [activeTab, setActiveTab] = useState(() => {
     const persistedTab = readPersistedOpenJobId() === job.id ? readPersistedOpenJobTab() : null;
     const tab = persistedTab || initialTab;
@@ -460,6 +462,18 @@ export function JobDetailedView({ job, portalJobId, getPortalJobId, onBack, onEd
     setActiveTab(tab);
     persistOpenJobTab(tab);
     onTabChange?.(tab);
+  }
+
+  /**
+   * Open the job editor. Parents may supply their own dialog via `onEdit`; when they
+   * don't, this view opens its own so job info stays editable from every tab.
+   */
+  function handleEditJob() {
+    if (onEdit) {
+      onEdit();
+      return;
+    }
+    setShowEditJobDialog(true);
   }
   const [proposalToolbarContent, setProposalToolbarContent] = useState<React.ReactNode>(null);
   type ProposalViewMode = ProposalMaterialsLayoutMode;
@@ -1575,6 +1589,16 @@ export function JobDetailedView({ job, portalJobId, getPortalJobId, onBack, onEd
             <h1 className="text-lg font-bold text-yellow-500 truncate shrink-0 max-w-[180px] sm:max-w-[240px]">
               {job.name}
             </h1>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={handleEditJob}
+              className="text-yellow-100 hover:text-yellow-400 hover:bg-green-900/50 shrink-0 h-8 px-2"
+              title="Edit job name and details"
+            >
+              <Edit className="w-4 h-4 sm:mr-1" />
+              <span className="hidden lg:inline text-xs">Edit job</span>
+            </Button>
             <button
               type="button"
               onClick={() => handleActiveTabChange('job-budget')}
@@ -1874,12 +1898,10 @@ export function JobDetailedView({ job, portalJobId, getPortalJobId, onBack, onEd
                     <Badge variant={job.status === 'active' ? 'default' : 'secondary'} className="text-sm">
                       {job.status}
                     </Badge>
-                    {onEdit && (
-                      <Button variant="outline" size="sm" onClick={onEdit}>
-                        <Edit className="w-4 h-4 mr-2" />
-                        Edit Job
-                      </Button>
-                    )}
+                    <Button variant="outline" size="sm" onClick={handleEditJob}>
+                      <Edit className="w-4 h-4 mr-2" />
+                      Edit Job
+                    </Button>
                     <Button
                       variant="outline"
                       size="sm"
@@ -2485,6 +2507,17 @@ export function JobDetailedView({ job, portalJobId, getPortalJobId, onBack, onEd
         job={job}
         open={showExportDialog}
         onOpenChange={setShowExportDialog}
+      />
+
+      {/* Own job editor - used whenever the parent doesn't provide one via onEdit */}
+      <EditJobDialog
+        open={showEditJobDialog}
+        job={job}
+        onClose={() => setShowEditJobDialog(false)}
+        onSuccess={() => {
+          setShowEditJobDialog(false);
+          onJobUpdate?.();
+        }}
       />
 
       <Dialog

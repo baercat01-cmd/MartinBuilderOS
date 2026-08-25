@@ -10,6 +10,7 @@ import {
 import { Button } from '@/components/ui/button';
 import { Edit } from 'lucide-react';
 import { JobDetailedView } from './JobDetailedView';
+import { EditJobDialog } from './EditJobDialog';
 import { isAbortLikeError } from '@/lib/error-handler';
 import { agentLog } from '@/lib/officeViewPersistence';
 
@@ -31,6 +32,7 @@ export function OfficeOpenJobDialog({
 }: OfficeOpenJobDialogProps) {
   const [job, setJob] = useState<Job | null>(null);
   const [loading, setLoading] = useState(false);
+  const [showEditDialog, setShowEditDialog] = useState(false);
   const portalJobIdRef = useRef<string | null>(jobId);
 
   const loadJob = useCallback(async (targetId: string) => {
@@ -69,6 +71,7 @@ export function OfficeOpenJobDialog({
   const dialogOpen = visible && !!jobId;
 
   return (
+    <>
     <Dialog
       open={dialogOpen}
       onOpenChange={(open) => {
@@ -91,7 +94,7 @@ export function OfficeOpenJobDialog({
           <div className="flex items-center justify-between">
             <DialogTitle className="text-xl">{job?.name ?? 'Loading job…'}</DialogTitle>
             {job ? (
-              <Button variant="outline" size="sm" disabled>
+              <Button variant="outline" size="sm" onClick={() => setShowEditDialog(true)}>
                 <Edit className="w-4 h-4 mr-2" />
                 Edit Job
               </Button>
@@ -107,6 +110,7 @@ export function OfficeOpenJobDialog({
               portalJobId={jobId}
               getPortalJobId={() => portalJobIdRef.current ?? jobId}
               onBack={onClose}
+              onEdit={() => setShowEditDialog(true)}
               onJobUpdate={() => jobId && loadJob(jobId)}
               initialTab={jobTab}
               onTabChange={onTabChange}
@@ -115,5 +119,16 @@ export function OfficeOpenJobDialog({
         )}
       </DialogContent>
     </Dialog>
+
+    <EditJobDialog
+      open={showEditDialog}
+      job={job}
+      onClose={() => setShowEditDialog(false)}
+      onSuccess={() => {
+        setShowEditDialog(false);
+        if (jobId) loadJob(jobId);
+      }}
+    />
+    </>
   );
 }
